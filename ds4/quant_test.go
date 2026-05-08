@@ -43,14 +43,14 @@ func TestDotQ8_0F32(t *testing.T) {
 			}
 		}
 		scale := amax / 127.0
-		*(*float32)(unsafe.Pointer(&q8[off])) = scale
+		*(*uint16)(unsafe.Pointer(&q8[off])) = F32ToF16(scale)
 		invScale := float32(0)
 		if scale != 0 {
 			invScale = 1.0 / scale
 		}
 		for i := 0; i < 32; i++ {
 			q := int8(math.Round(float64(x[xOff+i] * invScale)))
-			q8[off+4+i] = byte(q)
+			q8[off+2+i] = byte(q)
 		}
 	}
 
@@ -159,11 +159,13 @@ func BenchmarkDotQ8_0F32_4096(b *testing.B) {
 	nBlocks := n / 32
 	wq8 := make([]byte, nBlocks*BlockQ8_0Size)
 	x := make([]float32, n)
-	for i := range x { x[i] = float32(i%17-8) * 0.01 }
+	for i := range x {
+		x[i] = float32(i%17-8) * 0.01
+	}
 	for i := 0; i < nBlocks; i++ {
-		*(*float32)(unsafe.Pointer(&wq8[i*BlockQ8_0Size])) = 0.01
+		*(*uint16)(unsafe.Pointer(&wq8[i*BlockQ8_0Size])) = F32ToF16(0.01)
 		for j := 0; j < 32; j++ {
-			wq8[i*BlockQ8_0Size+4+j] = byte(int8(j - 16))
+			wq8[i*BlockQ8_0Size+2+j] = byte(int8(j - 16))
 		}
 	}
 	b.ResetTimer()
@@ -176,8 +178,12 @@ func BenchmarkDotF16F32_4096(b *testing.B) {
 	n := 4096
 	wf16 := make([]uint16, n)
 	x := make([]float32, n)
-	for i := range x { x[i] = float32(i%17-8) * 0.01 }
-	for i := range wf16 { wf16[i] = F32ToF16(x[i]) }
+	for i := range x {
+		x[i] = float32(i%17-8) * 0.01
+	}
+	for i := range wf16 {
+		wf16[i] = F32ToF16(x[i])
+	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		DotF16(wf16, x)
@@ -187,8 +193,12 @@ func BenchmarkDotF16F32_4096(b *testing.B) {
 func BenchmarkDotI8_256(b *testing.B) {
 	a := make([]int8, 256)
 	bb := make([]int8, 256)
-	for i := range a { a[i] = int8(i%17-8) }
-	for i := range bb { bb[i] = int8(i%13-6) }
+	for i := range a {
+		a[i] = int8(i%17 - 8)
+	}
+	for i := range bb {
+		bb[i] = int8(i%13 - 6)
+	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		simd.DotI8(unsafe.Pointer(&a[0]), unsafe.Pointer(&bb[0]), 256)

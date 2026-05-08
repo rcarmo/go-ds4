@@ -14,7 +14,8 @@ type DecodeState struct {
 	NextHC []float32 // [NHC * NEmbd] next HC state
 
 	// Attention
-	AttnNormed []float32 // [NEmbd] normed input
+	AttnCur    []float32 // [NEmbd] HC-pre attention input
+	AttnNormed []float32 // [NEmbd] normed attention input
 	QR         []float32 // [NLoraQ] Q LoRA bottleneck
 	QRNorm     []float32 // [NLoraQ] Q LoRA normed
 	Q          []float32 // [NHead * NHeadDim] full Q
@@ -40,7 +41,8 @@ type DecodeState struct {
 	IndexAllowed    []bool    // [ctx/4+2]
 
 	// FFN / MoE
-	FfnNormed   []float32     // [NEmbd]
+	FfnCur      []float32     // [NEmbd] HC-pre FFN input
+	FfnNormed   []float32     // [NEmbd] normed FFN input
 	RoutedXQ    []byte        // Q8_K quantized activation for experts
 	RoutedMidQ  []byte        // Q8_K quantized expert hidden
 	RoutedOut   []float32     // [NEmbd] routed expert output
@@ -49,6 +51,10 @@ type DecodeState struct {
 	SharedUp    []float32     // [NFFExp] shared expert up scratch
 	RouteLogits []float32     // [NExpert] routing logits scratch
 	RouteScores []expertScore // [NExpert] routing score scratch
+	ExpertMidQ  []byte        // [NExpertUsed, (NFFExp/QK_K)*BlockQ8KSize]
+	ExpertGate  []float32     // [NExpertUsed, NFFExp]
+	ExpertUp    []float32     // [NExpertUsed, NFFExp]
+	ExpertOut   []float32     // [NExpertUsed, NEmbd]
 
 	// HC/output scratch
 	AttnResidual []float32 // [NHC*NEmbd]
@@ -69,6 +75,7 @@ func NewDecodeState(ctxSize int) *DecodeState {
 	return &DecodeState{
 		CurHC:           make([]float32, hcDim),
 		NextHC:          make([]float32, hcDim),
+		AttnCur:         make([]float32, NEmbd),
 		AttnNormed:      make([]float32, NEmbd),
 		QR:              make([]float32, NLoraQ),
 		QRNorm:          make([]float32, NLoraQ),
@@ -91,6 +98,7 @@ func NewDecodeState(ctxSize int) *DecodeState {
 		IndexWeights:    make([]float32, NIndexerHead),
 		IndexScores:     make([]float32, ctxSize/4+2),
 		IndexAllowed:    make([]bool, ctxSize/4+2),
+		FfnCur:          make([]float32, NEmbd),
 		FfnNormed:       make([]float32, NEmbd),
 		RoutedXQ:        make([]byte, (NEmbd/QK_K)*BlockQ8KSize),
 		RoutedMidQ:      make([]byte, NExpertUsed*(NFFExp/QK_K)*BlockQ8KSize),
@@ -100,6 +108,10 @@ func NewDecodeState(ctxSize int) *DecodeState {
 		SharedUp:        make([]float32, NFFExp),
 		RouteLogits:     make([]float32, NExpert),
 		RouteScores:     make([]expertScore, NExpert),
+		ExpertMidQ:      make([]byte, NExpertUsed*(NFFExp/QK_K)*BlockQ8KSize),
+		ExpertGate:      make([]float32, NExpertUsed*NFFExp),
+		ExpertUp:        make([]float32, NExpertUsed*NFFExp),
+		ExpertOut:       make([]float32, NExpertUsed*NEmbd),
 		AttnResidual:    make([]float32, hcDim),
 		FfnResidual:     make([]float32, hcDim),
 		OutFlat:         make([]float32, hcDim),
@@ -121,9 +133,9 @@ func layerAttnDecode(
 	model *GGUFModel,
 	pos, il int,
 ) {
-	// 1. RMSNorm attention input
+	// 1. RMSNorm attention input (from HC-pre output)
 	normW := tensorF32Unsafe(layer.AttnNorm)
-	copy(ds.AttnNormed, ds.CurHC[:NEmbd]) // extract stream 0
+	copy(ds.AttnNormed, ds.AttnCur)
 	rmsNorm(ds.AttnNormed, normW)
 
 	// 2. Q projection: low-rank LoRA
@@ -184,7 +196,7 @@ func layerAttnDecode(
 				NIndexerHeadDim, ratio, il, pos, false) {
 				cache.PushIndexCompKV(ds.IndexCompOut)
 			}
-			compAllowed = indexerAllowedDecodeOne(ds, layer, ds.AttnNormed, ds.QRNorm, cache.IndexCompKV, cache.NIndexComp, il, pos)
+			compAllowed = indexerAllowedDecodeOne(ds, layer, ds.AttnCur, ds.QRNorm, cache.IndexCompKV, cache.NIndexComp, il, pos)
 		}
 	}
 

@@ -64,7 +64,7 @@ func (t *GGUFTensor) DataBytes() uint64 {
 
 // GGUFModel holds a memory-mapped GGUF file and its parsed directory.
 type GGUFModel struct {
-	data    []byte              // full mmap
+	data    []byte                 // full mmap
 	Tensors map[string]*GGUFTensor // name → tensor descriptor
 	Meta    map[string]interface{} // metadata key-values (selected)
 }
@@ -202,7 +202,7 @@ func (m *GGUFModel) parse() error {
 			t.Dims[d] = c.u64()
 		}
 		t.Type = c.u32()
-		relOffset := c.u64() // relative to data section start
+		relOffset := c.u64()    // relative to data section start
 		t.AbsOffset = relOffset // will be fixed up below
 		if c.err != nil {
 			return fmt.Errorf("gguf: tensor %d: %w", i, c.err)
@@ -210,8 +210,13 @@ func (m *GGUFModel) parse() error {
 		m.Tensors[t.Name] = t
 	}
 
-	// Data section starts at current cursor position, aligned to 64 bytes
-	dataStart := (c.pos + 63) & ^uint64(63)
+	// Data section starts at current cursor position, aligned to GGUF alignment.
+	// GGUF default alignment is 32 when metadata key is absent (matches ds4.c).
+	alignment := uint64(32)
+	if a, ok := m.MetaU32("general.alignment"); ok && a != 0 {
+		alignment = uint64(a)
+	}
+	dataStart := (c.pos + alignment - 1) & ^(alignment - 1)
 
 	// Fix up relative offsets → absolute
 	for i := range tensors {

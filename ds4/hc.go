@@ -1,6 +1,7 @@
 package ds4
 
 import (
+	"math"
 	"unsafe"
 )
 
@@ -41,38 +42,82 @@ func hcPreFromState(
 		mix[j] = DotF16(row, flat)
 	}
 
-	// 3. Apply scale + base + sigmoid
+	// 3. Sinkhorn split (matches ds4.c hc_split_sinkhorn_one)
 	scale := unsafe.Slice((*float32)(unsafe.Pointer(&scaleTensor[0])), 3)
 	base := unsafe.Slice((*float32)(unsafe.Pointer(&baseTensor[0])), hcMixDim)
+	preScale, postScale, combScale := scale[0], scale[1], scale[2]
+	eps := float32(HCEps)
 
-	for i := 0; i < hcMixDim; i++ {
-		var s float32
-		if i < NHC {
-			s = scale[0]
-		} else if i < 2*NHC {
-			s = scale[1]
-		} else {
-			s = scale[2]
-		}
-		mix[i] = sigmoid(s*mix[i]) + base[i]
-	}
-
-	// Extract pre, post, comb from mix
 	pre := mix[0:NHC]
-	copy(post, mix[NHC:2*NHC])
-	copy(comb, mix[2*NHC:2*NHC+NHC*NHC])
+	for i := 0; i < NHC; i++ {
+		z := mix[i]*preScale + base[i]
+		pre[i] = sigmoid(z) + eps
+	}
+	for i := 0; i < NHC; i++ {
+		off := NHC + i
+		z := mix[off]*postScale + base[off]
+		post[i] = 2 * sigmoid(z)
+	}
 
-	// Clamp pre and post
-	for i := range pre {
-		if pre[i] < HCEps {
-			pre[i] = HCEps
+	// comb matrix c[src + dst*NHC]
+	var c [NHC * NHC]float32
+	for dst := 0; dst < NHC; dst++ {
+		rowMax := float32(-1e30)
+		for src := 0; src < NHC; src++ {
+			idx := src + dst*NHC
+			off := 2*NHC + idx
+			v := mix[off]*combScale + base[off]
+			c[idx] = v
+			if v > rowMax {
+				rowMax = v
+			}
+		}
+		rowSum := float32(0)
+		for src := 0; src < NHC; src++ {
+			idx := src + dst*NHC
+			v := float32(math.Exp(float64(c[idx] - rowMax)))
+			c[idx] = v
+			rowSum += v
+		}
+		inv := float32(1.0) / rowSum
+		for src := 0; src < NHC; src++ {
+			idx := src + dst*NHC
+			c[idx] = c[idx]*inv + eps
 		}
 	}
-	for i := range post {
-		if post[i] < HCEps {
-			post[i] = HCEps
+	for src := 0; src < NHC; src++ {
+		sum := float32(0)
+		for dst := 0; dst < NHC; dst++ {
+			sum += c[src+dst*NHC]
+		}
+		inv := float32(1.0) / (sum + eps)
+		for dst := 0; dst < NHC; dst++ {
+			c[src+dst*NHC] *= inv
 		}
 	}
+	for iter := 1; iter < NHCSinkhornIter; iter++ {
+		for dst := 0; dst < NHC; dst++ {
+			sum := float32(0)
+			for src := 0; src < NHC; src++ {
+				sum += c[src+dst*NHC]
+			}
+			inv := float32(1.0) / (sum + eps)
+			for src := 0; src < NHC; src++ {
+				c[src+dst*NHC] *= inv
+			}
+		}
+		for src := 0; src < NHC; src++ {
+			sum := float32(0)
+			for dst := 0; dst < NHC; dst++ {
+				sum += c[src+dst*NHC]
+			}
+			inv := float32(1.0) / (sum + eps)
+			for dst := 0; dst < NHC; dst++ {
+				c[src+dst*NHC] *= inv
+			}
+		}
+	}
+	copy(comb, c[:])
 
 	// 4. out = Σ_s (pre[s] * residualHC[s*NEmbd : (s+1)*NEmbd])
 	for i := range out[:NEmbd] {

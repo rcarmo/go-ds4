@@ -23,10 +23,9 @@ func layerFFNDecode(
 	streamer *DiskStreamer,
 	il, tokenID int,
 ) {
-	// 1. RMSNorm FFN input
+	// 1. RMSNorm FFN input (from HC-pre output)
 	normW := tensorF32Unsafe(layer.FfnNorm)
-	// Extract stream 0 from current HC
-	copy(ds.FfnNormed, ds.CurHC[:NEmbd])
+	copy(ds.FfnNormed, ds.FfnCur)
 	rmsNorm(ds.FfnNormed, normW)
 
 	// 2. Quantize normed input to Q8_K for expert dot products
@@ -49,30 +48,28 @@ func layerFFNDecode(
 	}
 
 	if len(experts) > 1 {
-		// Parallel: each expert writes to its own buffer, then merge
-		type expertResult struct {
-			out [NEmbd]float32
-		}
-		results := make([]expertResult, len(experts))
+		// Parallel with preallocated per-expert scratch (no per-token allocs)
+		midQStride := (NFFExp / QK_K) * BlockQ8KSize
 		var wg sync.WaitGroup
 		for i, exp := range experts {
 			wg.Add(1)
 			go func(idx int, e expertScore) {
 				defer wg.Done()
-				localXQ := make([]byte, len(ds.RoutedXQ))
-				copy(localXQ, ds.RoutedXQ)
-				localMidQ := make([]byte, (NFFExp/QK_K)*BlockQ8KSize)
-				gate := make([]float32, NFFExp)
-				up := make([]float32, NFFExp)
-				expertForwardFast(results[idx].out[:], localXQ, localMidQ,
-					gate, up, layer, e.idx, e.score, streamer, model, il)
+				out := ds.ExpertOut[idx*NEmbd : (idx+1)*NEmbd]
+				for j := range out {
+					out[j] = 0
+				}
+				midQ := ds.ExpertMidQ[idx*midQStride : (idx+1)*midQStride]
+				gate := ds.ExpertGate[idx*NFFExp : (idx+1)*NFFExp]
+				up := ds.ExpertUp[idx*NFFExp : (idx+1)*NFFExp]
+				expertForwardFast(out, ds.RoutedXQ, midQ, gate, up, layer, e.idx, e.score, streamer, model, il)
 			}(i, exp)
 		}
 		wg.Wait()
-		// Merge results
-		for i := range results {
+		for i := range experts {
+			out := ds.ExpertOut[i*NEmbd : (i+1)*NEmbd]
 			for j := 0; j < NEmbd; j++ {
-				ds.RoutedOut[j] += results[i].out[j]
+				ds.RoutedOut[j] += out[j]
 			}
 		}
 	} else if len(experts) == 1 {
@@ -398,7 +395,7 @@ func layerForwardDecode(
 
 	// HC pre → attention input
 	hcPreFromState(
-		ds.AttnNormed, ds.Post, ds.Comb,
+		ds.AttnCur, ds.Post, ds.Comb,
 		attnResidual,
 		layer.HCAttnFn, layer.HCAttnScale, layer.HCAttnBase,
 		ds.HCFlat, ds.HCMix,
@@ -416,7 +413,7 @@ func layerForwardDecode(
 
 	// HC pre → FFN input
 	hcPreFromState(
-		ds.FfnNormed, ds.Post, ds.Comb,
+		ds.FfnCur, ds.Post, ds.Comb,
 		ffnResidual,
 		layer.HCFfnFn, layer.HCFfnScale, layer.HCFfnBase,
 		ds.HCFlat, ds.HCMix,

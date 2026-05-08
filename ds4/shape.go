@@ -10,32 +10,32 @@ const (
 	NHeadKV         = 1
 	NHeadDim        = 512
 	NValueDim       = 512
-	NRot            = 64     // RoPE-rotated dims per head tail
-	NOutGroup       = 8     // grouped output LoRA
-	NLoraQ          = 1024  // Q low-rank bottleneck
-	NLoraO          = 1024  // O low-rank bottleneck
+	NRot            = 64   // RoPE-rotated dims per head tail
+	NOutGroup       = 8    // grouped output LoRA
+	NLoraQ          = 1024 // Q low-rank bottleneck
+	NLoraO          = 1024 // O low-rank bottleneck
 	NExpert         = 256
 	NExpertUsed     = 6
 	NExpertShared   = 1
-	NFFExp          = 2048  // expert FFN hidden width
+	NFFExp          = 2048 // expert FFN hidden width
 	NHashLayer      = 3    // layers with token-ID→expert-ID hash routing
 	NSWA            = 128  // sliding-window attention capacity
 	NIndexerHead    = 64
 	NIndexerHeadDim = 128
 	NIndexerTopK    = 512
-	NHC             = 4    // hyper-connection streams
+	NHC             = 4 // hyper-connection streams
 	NHCSinkhornIter = 20
 
-	RMSEps             = 1e-6
-	HCEps              = 1e-6
-	ExpertWeightScale   = 1.5
-	SwiGLUClampExp      = 10.0
-	RoPEFreqBase        = 10000.0
-	RoPEScaleFactor     = 16.0
-	RoPEYarnBetaFast    = 32.0
-	RoPEYarnBetaSlow    = 1.0
+	RMSEps               = 1e-6
+	HCEps                = 1e-6
+	ExpertWeightScale    = 1.5
+	SwiGLUClampExp       = 10.0
+	RoPEFreqBase         = 10000.0
+	RoPEScaleFactor      = 16.0
+	RoPEYarnBetaFast     = 32.0
+	RoPEYarnBetaSlow     = 1.0
 	CompressRoPEFreqBase = 160000.0
-	RoPEOrigCtx         = 65536
+	RoPEOrigCtx          = 65536
 
 	// Quantization block sizes
 	QK_K = 256 // superblock size for K-quants
@@ -54,11 +54,11 @@ const (
 
 // Block sizes in bytes per QK_K=256 elements
 const (
-	BlockQ2KSize   = 84  // 16 scales + 64 qs + 2 d + 2 dmin
-	BlockQ4KSize   = 144 // 2 d + 2 dmin + 12 scales + 128 qs
-	BlockIQ2XXSSize = 66 // 2 d + 64 qs (codebook indices)
-	BlockQ8KSize   = 292 // 4 d + 256 qs + 32 bsums
-	BlockQ8_0Size  = 36  // 4 d + 32 qs (per 32 elements)
+	BlockQ2KSize    = 84  // 16 scales + 64 qs + 2 d + 2 dmin
+	BlockQ4KSize    = 144 // 2 d + 2 dmin + 12 scales + 128 qs
+	BlockIQ2XXSSize = 66  // 2 d + 64 qs (codebook indices)
+	BlockQ8KSize    = 292 // 4 d + 256 qs + 32 bsums
+	BlockQ8_0Size   = 34  // 2 d(F16) + 32 qs (per 32 elements)
 )
 
 // TensorTypeSize returns bytes per element (or per-block info) for a GGUF type.
