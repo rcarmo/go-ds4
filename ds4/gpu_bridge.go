@@ -357,17 +357,15 @@ func (e *Engine) cacheExpertsOnDemand(ce *CUDAEngine, il int, expertIdxs []int) 
 	}
 }
 
-// gpuFusedAttnQAKV dispatches fused attn_q_a + attn_kv on GPU.
-// Returns true if dispatched, false for CPU fallback.
+// gpuFusedAttnQAKV dispatches fused attn_q_a + attn_kv on GPU (sync).
 func (e *Engine) gpuFusedAttnQAKV(qr, kv, x []float32, il int) bool {
 	ce, ok := e.GPU.(*CUDAEngine)
 	if !ok || !ce.ready || ce.fusedLayers[il] == nil {
 		return false
 	}
-	fused := ce.fusedLayers[il]
+	fused := ce.fusedLayers[il].AttnQAKV
+	fused.DispatchAsync(x, ce.stream)
 	results := [][]float32{qr, kv}
-	if err := fused.AttnQAKV.Dispatch(x, results, ce.stream); err != nil {
-		return false
-	}
+	fused.Collect(results, ce.stream)
 	return true
 }

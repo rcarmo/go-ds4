@@ -142,7 +142,7 @@ func layerAttnDecode(
 	copy(ds.AttnNormed, ds.AttnCur)
 	rmsNorm(ds.AttnNormed, normW)
 
-	// 2. Q + KV projection: try fused GPU dispatch (one kernel for both)
+	// 2. Q + KV projection: fused GPU dispatch
 	fusedOK := false
 	if ds.Engine != nil {
 		if eng, ok := ds.Engine.(*Engine); ok {
@@ -150,7 +150,6 @@ func layerAttnDecode(
 		}
 	}
 	if !fusedOK {
-		// CPU fallback: two separate matmuls
 		matvecQ8_0GPULayer(ds.QR, layer.AttnQA, ds.AttnNormed, NEmbd, NLoraQ, ds, "attn_q_a.weight")
 		matvecQ8_0GPULayer(ds.KV, layer.AttnKV, ds.AttnNormed, NEmbd, NHeadDim, ds, "attn_kv.weight")
 	}
@@ -169,9 +168,9 @@ func layerAttnDecode(
 		rmsNormNoScale(head)
 	}
 
-	// Apply RoPE to Q tails
 	freqBase := layerRoPEFreqBase(il)
 	freqScale := layerRoPEFreqScale(il)
+	// Apply RoPE to Q tails
 	ropeYaRNTailInplace(ds.Q, pos, NHead, NHeadDim, NRot, freqBase, freqScale, false)
 
 	// 3. KV post-processing (already computed in fused step above)

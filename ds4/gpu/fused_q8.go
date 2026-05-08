@@ -71,8 +71,8 @@ func NewFusedQ8Buf(inDim int, weights [][]byte, outDims []int) (*FusedQ8Buf, err
 	}, nil
 }
 
-// Dispatch runs the fused Q8_0 GEMV and splits output into multiple result slices.
-func (f *FusedQ8Buf) Dispatch(x []float32, results [][]float32, stream CUstream) error {
+// DispatchAsync launches the fused GEMV without syncing. Call Collect() to get results.
+func (f *FusedQ8Buf) DispatchAsync(x []float32, stream CUstream) {
 	f.ActBuf.UploadAsync(x, stream)
 
 	rowBytes := (f.InDim / 32) * 34
@@ -92,16 +92,14 @@ func (f *FusedQ8Buf) Dispatch(x []float32, results [][]float32, stream CUstream)
 		unsafe.Pointer(&rowBytesU),
 	}
 
-	if err := LaunchKernelStream(cudaGemvQ8_0, uint32(f.OutDim), 1, 1, 256, 1, 1, 256*4, stream, args...); err != nil {
-		return err
-	}
+	LaunchKernelStream(cudaGemvQ8_0, uint32(f.OutDim), 1, 1, 256, 1, 1, 256*4, stream, args...)
+}
 
+// Collect syncs the stream and downloads split results.
+func (f *FusedQ8Buf) Collect(results [][]float32, stream CUstream) {
 	StreamSync(stream)
-
-	// Download and split
 	allOut := make([]float32, f.OutDim)
 	f.OutBuf.Download(allOut)
-
 	offset := 0
 	for i, dim := range f.Splits {
 		if i < len(results) {
@@ -109,7 +107,6 @@ func (f *FusedQ8Buf) Dispatch(x []float32, results [][]float32, stream CUstream)
 		}
 		offset += dim
 	}
-	return nil
 }
 
 // Free releases GPU memory.
