@@ -231,6 +231,18 @@ func CuMemAllocRaw(ptr *CUdeviceptr, size uint64) error {
 	return nil
 }
 
+// CuMemcpyHtoDRaw copies host bytes to device.
+func CuMemcpyHtoDRaw(dst CUdeviceptr, src unsafe.Pointer, size uint64) {
+	EnsureContext()
+	cuMemcpyHtoD(dst, src, size)
+}
+
+// CuMemFreeRaw frees device memory.
+func CuMemFreeRaw(ptr CUdeviceptr) {
+	EnsureContext()
+	cuMemFree(ptr)
+}
+
 // Sync waits for all GPU operations to complete.
 func Sync() {
 	EnsureContext()

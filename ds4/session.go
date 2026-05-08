@@ -109,7 +109,10 @@ func OpenEngineWithOptions(opts EngineOptions) (*Engine, error) {
 // Close releases the model memory mapping, streamer, and GPU resources.
 func (e *Engine) Close() {
 	if e.GPU != nil {
-		if g, ok := e.GPU.(*gpu.GPUEngine); ok {
+		switch g := e.GPU.(type) {
+		case *CUDAEngine:
+			g.Close()
+		case *gpu.GPUEngine:
 			g.Close()
 		}
 		e.GPU = nil
