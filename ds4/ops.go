@@ -364,13 +364,17 @@ func matvecAuto(out []float32, w []byte, x []float32, inDim, outDim int) {
 			})
 			return
 		}
-		// Try IQ4_NL
+		// Try IQ4_NL (use Q8K-quantized activation for int8 dot)
 		iq4RowBytes := ((inDim + QK4_NL - 1) / QK4_NL) * BlockIQ4NLSize
 		if bytesPerRow == iq4RowBytes {
+			xQ8K := make([]byte, ((inDim+QK_K-1)/QK_K)*BlockQ8KSize)
+			padded := make([]float32, ((inDim+QK_K-1)/QK_K)*QK_K)
+			copy(padded, x)
+			QuantizeRowQ8K(padded, xQ8K)
 			parallelFor(outDim, func(start, end int) {
 				for o := start; o < end; o++ {
 					row := w[o*bytesPerRow : (o+1)*bytesPerRow]
-					out[o] = VecDotIQ4NLF32(row, x, inDim)
+					out[o] = VecDotIQ4NLQ8K(inDim, row, xQ8K)
 				}
 			})
 			return
