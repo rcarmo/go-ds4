@@ -4,12 +4,12 @@
 
 A pure Go inference engine for [DeepSeek V4 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V3), ported from [@antirez's excellent single-file C implementation](https://github.com/antirez/ds4).
 
-**Single static binary. AVX2 + CUDA PTX. 1.83 tok/s GPU-accelerated, pure Go.**
+**Single static binary. AVX2 + CUDA PTX. 2.13 tok/s GPU-accelerated, pure Go.**
 
 | Mode | tok/s (decode) | Hardware | VRAM | Notes |
 |---|---|---|---|---|
-| **GPU CUDA** (cached experts) | **1.83** | RTX 3060 12GB | 8 GB | Top-16 experts/layer in VRAM |
-| **CPU AVX2** (top-4 fast) | **1.14** | i7-12700, 6 cores | 0 | Pure Go + hand-written assembly |
+| **GPU CUDA** (batched experts) | **2.13** | RTX 3060 12GB | ~8 GB | Batched 4-expert dispatch, demand-filled cache |
+| **CPU AVX2** (top-4 fast) | **1.24** | i7-12700, 6 cores | 0 | Pure Go + hand-written assembly |
 | CPU AVX2 (top-6) | 1.09 | i7-12700, 6 cores | 0 | Default expert count |
 
 The default build produces a **fully self-contained static binary** with no C dependencies. All hot paths use hand-written SIMD assembly (AVX2+FMA on amd64, NEON stubs on arm64). GPU acceleration via CUDA PTX is opt-in and loaded at runtime via `purego` (no CGo, no CUDA toolkit dependency).
@@ -113,11 +113,16 @@ Each layer:
 
 | Configuration | tok/s | VRAM | Strategy |
 |---|---|---|---|
-| CPU only (top-4) | 1.14 | 0 | AVX2 SIMD, parallel experts |
+| CPU only (top-4) | 1.24 | 0 | AVX2 SIMD, parallel experts |
 | GPU Q8_0 only | 2.12 | 3.8 GB | Output head + large projections |
-| **GPU + expert cache** | **1.83** | **8.0 GB** | Top-16 experts/layer resident in VRAM |
+| **GPU batched experts** | **2.13** | **~8 GB** | 4 experts batched per layer, demand-filled cache |
 
-The expert cache pre-loads 688 experts (top-16 per layer × 43 layers = 4.5 GB) into VRAM at init time. Cache hits dispatch IQ2_XXS + Q2_K kernels with zero PCIe transfer. Cache misses fall back to CPU.
+The GPU pipeline batches all 4 active experts into single kernel launches:
+1. DtoD copy: concatenate expert weights contiguously (~70µs)
+2. One IQ2 gate launch (8192 rows) → One IQ2 up launch → One SwiGLU launch → One Q2K down launch
+3. Single sync + download per layer (43 syncs/token total)
+
+Expert weights are demand-cached in VRAM on first route — no PCIe transfer after warmup.
 
 ### End-to-End Decode Profile
 
@@ -152,9 +157,13 @@ The expert cache pre-loads 688 experts (top-16 per layer × 43 layers = 4.5 GB) 
 - CUDA PTX Q8_0 GEMV kernel (per-row cooperative reduction, F16 native decode)
 - CUDA PTX IQ2_XXS GEMV kernel (grid table in VRAM, per-block decode + dot)
 - CUDA PTX Q2_K GEMV kernel (2-bit extraction, per-group scale application)
-- Expert VRAM cache (top-16/layer resident, zero PCIe transfer on hit)
+- CUDA PTX SwiGLU kernel (ex2.approx + rcp.approx, fused silu×mul)
+- Batched expert dispatch (DtoD concatenate + single kernel launch for 4 experts)
+- Demand-filled expert VRAM cache (upload on first route, no static pre-load)
+- Expert VRAM cache (demand-filled, zero PCIe transfer after warmup)
 - GLSL/SPIR-V Q8_0 GEMV shader (Vulkan compute, software F16 decode)
 - Logical ring KV cache (raw + compressed + indexer, no memmove)
+- TurboQuant KV compression (FWHT rotation + uniform scalar quantization, WIP)
 - FastExperts mode (top-4 selection with weight renormalization)
 - Session save/load v4 format with ring cursor persistence
 - OpenAI-compatible HTTP server with SSE streaming
@@ -196,24 +205,25 @@ cmd/ds4server/    — OpenAI-compatible HTTP server
 ds4/              — Core inference engine
   attention.go    — MLA attention + compressor + indexer
   compressor.go   — KV compression decode path
-  gpu_bridge.go   — GPU dispatch bridge (CUDA/Vulkan) + expert cache
+  gpu_bridge.go   — GPU dispatch bridge + batched expert pipeline
   hc.go           — Hyper-connection Sinkhorn split
   kvcache.go      — Logical ring KV cache (raw + compressed)
-  moe.go          — MoE routing + parallel expert execution + GPU dispatch
+  moe.go          — MoE routing + GPU/CPU expert dispatch
   ops.go          — Matmul, RMSNorm, RoPE, softmax, SiLU
   quant.go        — Q8_0, Q2_K, IQ2_XXS dot products
   session.go      — Engine, session lifecycle, sampling
   shape.go        — Model constants (43 layers, 256 experts, etc.)
   tokenizer.go    — GPT-2 BPE with JoyAI pre-tokenizer
+  turboquant.go   — TurboQuant KV compression (FWHT + quantize, WIP)
   simd/           — Hand-written AVX2 + NEON assembly kernels
   gpu/            — CUDA PTX + Vulkan SPIR-V compute backends
-    cuda.go       — CUDA driver API via purego (no CGo)
-    cuda_gemv_q8_0.go  — Q8_0 GEMV PTX kernel
-    cuda_gemv_iq2.go   — IQ2_XXS GEMV PTX kernel  
-    cuda_gemv_q2k.go   — Q2_K GEMV PTX kernel
-    expert_cache.go    — Permanent expert VRAM cache
-    expert_pool.go     — Reusable streaming expert buffers
-    vulkan*.go         — Vulkan compute backend (portable)
+    cuda.go             — CUDA driver API via purego (no CGo)
+    cuda_gemv_q8_0.go   — Q8_0 GEMV + SwiGLU PTX kernels
+    cuda_gemv_iq2.go    — IQ2_XXS GEMV PTX kernel
+    cuda_gemv_q2k.go    — Q2_K GEMV PTX kernel
+    expert_cache.go     — Demand-filled expert VRAM cache
+    expert_pool.go      — Batched expert weight buffers
+    vulkan*.go          — Vulkan compute backend (portable)
 ```
 
 ## License
