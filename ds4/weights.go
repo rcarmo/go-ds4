@@ -102,27 +102,27 @@ func BindWeights(m *GGUFModel) (*Weights, error) {
 
 	// Global tensors
 	bind(&w.TokenEmbd, "token_embd.weight")
-	bind(&w.OutputHCBase, "output_hc_head.base")
-	bind(&w.OutputHCFn, "output_hc_head.fn")
-	bind(&w.OutputHCScale, "output_hc_head.scale")
+	bind(&w.OutputHCBase, "output_hc_base.weight")
+	bind(&w.OutputHCFn, "output_hc_fn.weight")
+	bind(&w.OutputHCScale, "output_hc_scale.weight")
 	bind(&w.OutputNorm, "output_norm.weight")
-	bind(&w.Output, "output.weight")
+	bindOpt(&w.Output, "output.weight")
 
 	// Per-layer tensors
 	for il := 0; il < NLayer; il++ {
 		l := &w.Layer[il]
 		p := fmt.Sprintf("blk.%d.", il)
 
-		bind(&l.HCAttnFn, p+"hc_attn.fn")
-		bind(&l.HCAttnScale, p+"hc_attn.scale")
-		bind(&l.HCAttnBase, p+"hc_attn.base")
+		bind(&l.HCAttnFn, p+"hc_attn_fn.weight")
+		bind(&l.HCAttnScale, p+"hc_attn_scale.weight")
+		bind(&l.HCAttnBase, p+"hc_attn_base.weight")
 		bind(&l.AttnNorm, p+"attn_norm.weight")
 
 		bind(&l.AttnQA, p+"attn_q_a.weight")
 		bind(&l.AttnQANorm, p+"attn_q_a_norm.weight")
 		bind(&l.AttnQB, p+"attn_q_b.weight")
 
-		bind(&l.AttnKV, p+"attn_kv_a_mqa.weight")
+		bind(&l.AttnKV, p+"attn_kv.weight")
 		bind(&l.AttnKVANorm, p+"attn_kv_a_norm.weight")
 		bindOpt(&l.AttnSinks, p+"attn_sinks.weight")
 
@@ -130,10 +130,10 @@ func BindWeights(m *GGUFModel) (*Weights, error) {
 		bind(&l.AttnOutputB, p+"attn_output_b.weight")
 
 		// Compressor (optional, only compressed-KV layers)
-		bindOpt(&l.CompressorAPE, p+"attn_compressor.ape.weight")
-		bindOpt(&l.CompressorKV, p+"attn_compressor.kv.weight")
-		bindOpt(&l.CompressorGate, p+"attn_compressor.gate.weight")
-		bindOpt(&l.CompressorNorm, p+"attn_compressor.norm.weight")
+		bindOpt(&l.CompressorAPE, p+"attn_compressor_ape.weight")
+		bindOpt(&l.CompressorKV, p+"attn_compressor_kv.weight")
+		bindOpt(&l.CompressorGate, p+"attn_compressor_gate.weight")
+		bindOpt(&l.CompressorNorm, p+"attn_compressor_norm.weight")
 
 		// Indexer (optional, only ratio-4 layers)
 		bindOpt(&l.IndexerQB, p+"indexer_attn_q_b.weight")
@@ -143,15 +143,15 @@ func BindWeights(m *GGUFModel) (*Weights, error) {
 		bindOpt(&l.IndexerCompGate, p+"indexer_compressor.gate.weight")
 		bindOpt(&l.IndexerCompNorm, p+"indexer_compressor.norm.weight")
 
-		bind(&l.HCFfnFn, p+"hc_ffn.fn")
-		bind(&l.HCFfnScale, p+"hc_ffn.scale")
-		bind(&l.HCFfnBase, p+"hc_ffn.base")
+		bind(&l.HCFfnFn, p+"hc_ffn_fn.weight")
+		bind(&l.HCFfnScale, p+"hc_ffn_scale.weight")
+		bind(&l.HCFfnBase, p+"hc_ffn_base.weight")
 		bind(&l.FfnNorm, p+"ffn_norm.weight")
 
 		// Routing: hash table (optional, only hash layers)
 		bindOpt(&l.FfnGateTid2Eid, p+"ffn_gate_tid2eid.weight")
 		bind(&l.FfnGateInp, p+"ffn_gate_inp.weight")
-		bind(&l.FfnExpProbsB, p+"ffn_exp_probs_b.weight")
+		bindOpt(&l.FfnExpProbsB, p+"exp_probs_b.bias")
 
 		// Experts
 		bind(&l.FfnGateExps, p+"ffn_gate_exps.weight")

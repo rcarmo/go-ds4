@@ -34,7 +34,8 @@ func (m *GGUFModel) ApplyMmapHints() {
 		alignedEnd := (start + size + uint64(pageSize) - 1) & ^uint64(pageSize-1)
 		alignedSize := alignedEnd - alignedStart
 
-		if alignedStart >= uint64(len(m.data)) || alignedSize == 0 {
+		if alignedStart >= uint64(len(m.data)) || alignedSize == 0 ||
+			alignedStart+alignedSize > uint64(len(m.data)) {
 			continue
 		}
 
