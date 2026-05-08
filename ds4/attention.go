@@ -137,46 +137,71 @@ func layerAttnDecode(
 	model *GGUFModel,
 	pos, il int,
 ) {
-	// 1. RMSNorm attention input (from HC-pre output)
+	// 1. RMSNorm attention input
 	normW := tensorF32Unsafe(layer.AttnNorm)
 	copy(ds.AttnNormed, ds.AttnCur)
 	rmsNorm(ds.AttnNormed, normW)
 
-	// 2. Q + KV projection: fused GPU dispatch
-	fusedOK := false
-	if ds.Engine != nil {
-		if eng, ok := ds.Engine.(*Engine); ok {
-			fusedOK = eng.gpuFusedAttnQAKV(ds.QR, ds.KV, ds.AttnNormed, il)
+	cfg := ds.Cfg()
+	isV2 := len(layer.AttnQ) > 0 // V2 uses direct AttnQ, V4 uses AttnQA+AttnQB
+
+	if isV2 {
+		// V2 Lite: direct Q projection + split KV
+		// Q: [NEmbd, NHead*NHeadDim]
+		matvecQ8_0(ds.Q, layer.AttnQ, ds.AttnNormed, cfg.NEmbd, cfg.NHead*(cfg.NHeadDim))
+
+		// KV: two-stage: kv_a_mqa [NEmbd, kv_lora_rank+NRot] then kv_b [kv_lora_rank, NHead*NHeadDim]
+		// For simplicity: compute KV_A, norm, then KV_B
+		kvLoraRank := cfg.NLoraQ // reuse lora rank field
+		if kvLoraRank == 0 {
+			kvLoraRank = 512
 		}
+		kvA := make([]float32, kvLoraRank+cfg.NRot)
+		matvecQ8_0(kvA, layer.AttnKVA_MQA, ds.AttnNormed, cfg.NEmbd, kvLoraRank+cfg.NRot)
+
+		// Norm the non-RoPE part
+		if len(layer.AttnKVANorm) > 0 {
+			kvNormW := tensorF32Unsafe(layer.AttnKVANorm)
+			rmsNorm(kvA[:kvLoraRank], kvNormW)
+		}
+
+		// KV_B: expand [kvLoraRank] -> [NHead*NHeadDim]
+		matvecQ8_0(ds.KV, layer.AttnKVB, kvA[:kvLoraRank], kvLoraRank, cfg.NHeadDim)
+
+		// Per-head RMSNorm on Q
+		for h := 0; h < cfg.NHead; h++ {
+			head := ds.Q[h*cfg.NHeadDim : (h+1)*cfg.NHeadDim]
+			rmsNormNoScale(head)
+		}
+	} else {
+		// V4 Flash: LoRA Q projection
+		fusedOK := false
+		if ds.Engine != nil {
+			if eng, ok := ds.Engine.(*Engine); ok {
+				fusedOK = eng.gpuFusedAttnQAKV(ds.QR, ds.KV, ds.AttnNormed, il)
+			}
+		}
+		if !fusedOK {
+			matvecQ8_0GPULayer(ds.QR, layer.AttnQA, ds.AttnNormed, NEmbd, NLoraQ, ds, "attn_q_a.weight")
+			matvecQ8_0GPULayer(ds.KV, layer.AttnKV, ds.AttnNormed, NEmbd, NHeadDim, ds, "attn_kv.weight")
+		}
+		qrNormW := tensorF32Unsafe(layer.AttnQANorm)
+		copy(ds.QRNorm, ds.QR)
+		rmsNorm(ds.QRNorm, qrNormW)
+		matvecQ8_0GPULayer(ds.Q, layer.AttnQB, ds.QRNorm, NLoraQ, NHead*NHeadDim, ds, "attn_q_b.weight")
+		for h := 0; h < NHead; h++ {
+			rmsNormNoScale(ds.Q[h*NHeadDim : (h+1)*NHeadDim])
+		}
+
+		// KV norm
+		kvNormW := tensorF32Unsafe(layer.AttnKVANorm)
+		rmsNorm(ds.KV, kvNormW)
 	}
-	if !fusedOK {
-		matvecQ8_0GPULayer(ds.QR, layer.AttnQA, ds.AttnNormed, NEmbd, NLoraQ, ds, "attn_q_a.weight")
-		matvecQ8_0GPULayer(ds.KV, layer.AttnKV, ds.AttnNormed, NEmbd, NHeadDim, ds, "attn_kv.weight")
-	}
 
-	// RMSNorm on qr
-	qrNormW := tensorF32Unsafe(layer.AttnQANorm)
-	copy(ds.QRNorm, ds.QR)
-	rmsNorm(ds.QRNorm, qrNormW)
-
-	// attn_q_b: Q8_0 [NLoraQ, NHead*NHeadDim] → q[NHead*NHeadDim] — GPU if available
-	matvecQ8_0GPULayer(ds.Q, layer.AttnQB, ds.QRNorm, NLoraQ, NHead*NHeadDim, ds, "attn_q_b.weight")
-
-	// Per-head RMSNorm
-	for h := 0; h < NHead; h++ {
-		head := ds.Q[h*NHeadDim : (h+1)*NHeadDim]
-		rmsNormNoScale(head)
-	}
-
+	// Common: RoPE on Q and KV
 	freqBase := layerRoPEFreqBase(il)
 	freqScale := layerRoPEFreqScale(il)
-	// Apply RoPE to Q tails
-	ropeYaRNTailInplace(ds.Q, pos, NHead, NHeadDim, NRot, freqBase, freqScale, false)
-
-	// 3. KV post-processing (already computed in fused step above)
-	// RMSNorm on KV
-	kvNormW := tensorF32Unsafe(layer.AttnKVANorm)
-	rmsNorm(ds.KV, kvNormW)
+	ropeYaRNTailInplace(ds.Q, pos, cfg.NHead, cfg.NHeadDim, cfg.NRot, freqBase, freqScale, false)
 
 	// Apply RoPE to KV tail
 	ropeYaRNTailInplace(ds.KV, pos, 1, NHeadDim, NRot, freqBase, freqScale, false)
@@ -234,8 +259,13 @@ func layerAttnDecode(
 		// CPU fallback
 		rawStart := cache.rawStart()
 		compStart := cache.compStart()
-		sinks := tensorF32Unsafe(layer.AttnSinks)
-		scale := float32(1.0 / math.Sqrt(float64(NHeadDim)))
+		var sinks []float32
+		if len(layer.AttnSinks) > 0 {
+			sinks = tensorF32Unsafe(layer.AttnSinks)
+		} else {
+			sinks = make([]float32, NHead) // zero sinks for V2
+		}
+		scale := float32(1.0 / math.Sqrt(float64(cfg.NHeadDim)))
 
 		for h := 0; h < NHead; h++ {
 			qHead := ds.Q[h*NHeadDim : (h+1)*NHeadDim]
@@ -310,15 +340,17 @@ func layerAttnDecode(
 		}
 	} // end if !gpuAttnOK
 
-	// 5. Output projection (de-RoPE → grouped LoRA)
-	// Inverse RoPE on head tails
-	ropeYaRNTailInplace(ds.Heads, pos, NHead, NHeadDim, NRot, freqBase, freqScale, true)
+	// 5. Output projection
+	ropeYaRNTailInplace(ds.Heads, pos, cfg.NHead, cfg.NHeadDim, cfg.NRot, freqBase, freqScale, true)
 
-	// attn_output_a: Q8_0 [NHead*NValueDim, NLoraO] → tmp[NLoraO]
-	matvecQ8_0Grouped(ds.TmpLoRA, layer.AttnOutputA, ds.Heads, NHead*NValueDim, NLoraO, NOutGroup)
-
-	// attn_output_b: Q8_0 [NLoraO, NEmbd] → attn_out[NEmbd]
-	matvecQ8_0GPULayer(ds.AttnOut, layer.AttnOutputB, ds.TmpLoRA, NLoraO, NEmbd, ds, "attn_output_b.weight")
+	if isV2 {
+		// V2: direct output projection
+		matvecQ8_0(ds.AttnOut, layer.AttnOutput, ds.Heads, cfg.NHead*cfg.NHeadDim, cfg.NEmbd)
+	} else {
+		// V4: grouped LoRA output
+		matvecQ8_0Grouped(ds.TmpLoRA, layer.AttnOutputA, ds.Heads, NHead*NValueDim, NLoraO, NOutGroup)
+		matvecQ8_0GPULayer(ds.AttnOut, layer.AttnOutputB, ds.TmpLoRA, NLoraO, NEmbd, ds, "attn_output_b.weight")
+	}
 }
 
 // layerRoPEFreqBase returns the RoPE frequency base for this layer.

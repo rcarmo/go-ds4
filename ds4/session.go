@@ -63,7 +63,15 @@ func OpenEngineWithOptions(opts EngineOptions) (*Engine, error) {
 		return nil, fmt.Errorf("open model: %w", err)
 	}
 
-	w, err := BindWeights(m)
+	cfg := DetectModelConfig(m)
+
+	var w *Weights
+	if cfg.NHC == 0 {
+		// V2 Lite: different tensor layout
+		w, err = BindWeightsV2(m, cfg.NLayer)
+	} else {
+		w, err = BindWeights(m)
+	}
 	if err != nil {
 		m.Close()
 		return nil, fmt.Errorf("bind weights: %w", err)
@@ -85,7 +93,7 @@ func OpenEngineWithOptions(opts EngineOptions) (*Engine, error) {
 		return nil, fmt.Errorf("apply budget: %w", err)
 	}
 
-	e := &Engine{Model: m, Weights: w, Vocab: v, Budget: budget, Config: DetectModelConfig(m), FastExperts: opts.FastExperts}
+	e := &Engine{Model: m, Weights: w, Vocab: v, Budget: budget, Config: cfg, FastExperts: opts.FastExperts}
 	fmt.Printf("[model] Detected: %s\n", e.Config)
 
 	// Open disk streamer if requested

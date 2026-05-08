@@ -29,6 +29,16 @@ func layerFFNDecode(
 	copy(ds.FfnNormed, ds.FfnCur)
 	rmsNorm(ds.FfnNormed, normW)
 
+	// Dense layer (no experts): just run shared expert as standard FFN
+	if len(layer.FfnGateInp) == 0 && len(layer.FfnGateExps) == 0 {
+		sharedExpertForward(ds, layer)
+		copy(ds.RoutedOut, ds.SharedOut)
+		for i := range ds.SharedOut {
+			ds.SharedOut[i] = 0
+		}
+		return
+	}
+
 	// 2. Quantize normed input to Q8_K for expert dot products
 	QuantizeRowQ8K(ds.FfnNormed, ds.RoutedXQ)
 
@@ -133,18 +143,36 @@ func routeExperts(ds *DecodeState, normed []float32, layer *LayerWeights, il, to
 		return top
 	}
 
-	// Standard routing: F16 matmul normed → 256 expert logits
-	logits := ds.RouteLogits
-	gateU16 := unsafe.Slice((*uint16)(unsafe.Pointer(&layer.FfnGateInp[0])), NExpert*NEmbd)
-	for e := 0; e < NExpert; e++ {
-		row := gateU16[e*NEmbd : (e+1)*NEmbd]
-		logits[e] = DotF16(row, normed)
+	// Standard routing: gate logits from normed activation
+	cfg := ds.Cfg()
+	nExp := cfg.NExpert
+	logits := ds.RouteLogits[:nExp]
+
+	// V2 Lite uses F32 gate weights, V4 uses F16
+	if len(layer.FfnGateInp) == nExp*cfg.NEmbd*4 {
+		// F32 gate
+		gateF32 := tensorF32Unsafe(layer.FfnGateInp)
+		for e := 0; e < nExp; e++ {
+			row := gateF32[e*cfg.NEmbd : (e+1)*cfg.NEmbd]
+			dot := float32(0)
+			for i := 0; i < cfg.NEmbd; i++ {
+				dot += row[i] * normed[i]
+			}
+			logits[e] = dot
+		}
+	} else {
+		// F16 gate (V4)
+		gateU16 := unsafe.Slice((*uint16)(unsafe.Pointer(&layer.FfnGateInp[0])), nExp*cfg.NEmbd)
+		for e := 0; e < nExp; e++ {
+			row := gateU16[e*cfg.NEmbd : (e+1)*cfg.NEmbd]
+			logits[e] = DotF16(row, normed)
+		}
 	}
 
 	// Add bias
 	if layer.FfnExpProbsB != nil {
 		bias := tensorF32Unsafe(layer.FfnExpProbsB)
-		for e := 0; e < NExpert; e++ {
+		for e := 0; e < nExp; e++ {
 			logits[e] += bias[e]
 		}
 	}
@@ -153,13 +181,13 @@ func routeExperts(ds *DecodeState, normed []float32, layer *LayerWeights, il, to
 	softmax(logits)
 
 	// Scale
-	for e := range logits {
+	for e := range logits[:nExp] {
 		logits[e] *= ExpertWeightScale
 	}
 
 	// Top-K selection
-	scores := ds.RouteScores
-	for i := range scores {
+	scores := ds.RouteScores[:nExp]
+	for i := range scores[:nExp] {
 		scores[i] = expertScore{idx: i, score: logits[i]}
 	}
 	sort.Slice(scores, func(i, j int) bool {
@@ -422,44 +450,52 @@ func layerForwardDecode(
 	pos, il, tokenID, nExperts int,
 ) {
 	ds.LayerIdx = il
-	// Prefetch non-expert weights for this layer
 	model.PrefetchLayer(il)
 
-	// Save residual HC for attention sublayer
-	attnResidual := ds.AttnResidual
-	copy(attnResidual, ds.CurHC[:hcDim])
+	cfg := ds.Cfg()
+	useHC := cfg.NHC > 0
 
-	// HC pre → attention input
-	hcPreFromState(
-		ds.AttnCur, ds.Post, ds.Comb,
-		attnResidual,
-		layer.HCAttnFn, layer.HCAttnScale, layer.HCAttnBase,
-		ds.HCFlat, ds.HCMix,
-	)
-
-	// Run MLA attention
-	layerAttnDecode(ds, layer, cache, model, pos, il)
-
-	// HC post (attention output → HC state)
-	hcPostOne(ds.NextHC, ds.AttnOut, attnResidual, ds.Post, ds.Comb)
-
-	// Save FFN residual
-	ffnResidual := ds.FfnResidual
-	copy(ffnResidual, ds.NextHC[:hcDim])
-
-	// HC pre → FFN input
-	hcPreFromState(
-		ds.FfnCur, ds.Post, ds.Comb,
-		ffnResidual,
-		layer.HCFfnFn, layer.HCFfnScale, layer.HCFfnBase,
-		ds.HCFlat, ds.HCMix,
-	)
-
-	// Run MoE FFN
-	layerFFNDecode(ds, layer, model, budget, streamer, il, tokenID, nExperts)
-
-	// HC post (routed + shared → HC state)
-	hcPostSumOne(ds.CurHC, ds.RoutedOut, ds.SharedOut, ffnResidual, ds.Post, ds.Comb, ds.HCSumTmp)
+	if useHC {
+		attnResidual := ds.AttnResidual
+		copy(attnResidual, ds.CurHC[:hcDim])
+		hcPreFromState(
+			ds.AttnCur, ds.Post, ds.Comb,
+			attnResidual,
+			layer.HCAttnFn, layer.HCAttnScale, layer.HCAttnBase,
+			ds.HCFlat, ds.HCMix,
+		)
+		layerAttnDecode(ds, layer, cache, model, pos, il)
+		hcPostOne(ds.NextHC, ds.AttnOut, attnResidual, ds.Post, ds.Comb)
+		ffnResidual := ds.FfnResidual
+		copy(ffnResidual, ds.NextHC[:hcDim])
+		hcPreFromState(
+			ds.FfnCur, ds.Post, ds.Comb,
+			ffnResidual,
+			layer.HCFfnFn, layer.HCFfnScale, layer.HCFfnBase,
+			ds.HCFlat, ds.HCMix,
+		)
+		layerFFNDecode(ds, layer, model, budget, streamer, il, tokenID, nExperts)
+		hcPostSumOne(ds.CurHC, ds.RoutedOut, ds.SharedOut, ffnResidual, ds.Post, ds.Comb, ds.HCSumTmp)
+	} else {
+		// Standard residual (V2 Lite)
+		normW := tensorF32Unsafe(layer.AttnNorm)
+		copy(ds.AttnCur, ds.CurHC[:NEmbd])
+		rmsNorm(ds.AttnCur, normW)
+		copy(ds.AttnNormed, ds.AttnCur)
+		rmsNorm(ds.AttnNormed, normW)
+		layerAttnDecode(ds, layer, cache, model, pos, il)
+		for i := 0; i < NEmbd; i++ {
+			ds.CurHC[i] += ds.AttnOut[i]
+		}
+		ffnNormW := tensorF32Unsafe(layer.FfnNorm)
+		copy(ds.FfnCur, ds.CurHC[:NEmbd])
+		copy(ds.FfnNormed, ds.CurHC[:NEmbd])
+		rmsNorm(ds.FfnNormed, ffnNormW)
+		layerFFNDecode(ds, layer, model, budget, streamer, il, tokenID, nExperts)
+		for i := 0; i < NEmbd; i++ {
+			ds.CurHC[i] += ds.RoutedOut[i] + ds.SharedOut[i]
+		}
+	}
 }
 
 // outputLogits computes the LM head: HC collapse → RMSNorm → Q8_0 matmul → logits.

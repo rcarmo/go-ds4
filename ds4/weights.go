@@ -21,9 +21,15 @@ type LayerWeights struct {
 	AttnKVANorm []byte // F32  [NHeadDim]
 	AttnSinks   []byte // attention sink vectors
 
-	// MLA: output projection (grouped LoRA)
-	AttnOutputA []byte // Q8_0 [NHead*NValueDim, NLoraO]
-	AttnOutputB []byte // Q8_0 [NLoraO, NEmbd] grouped
+	// MLA: output projection (grouped LoRA for V4, direct for V2)
+	AttnOutputA []byte // Q8_0 [NHead*NValueDim, NLoraO] (V4 only)
+	AttnOutputB []byte // Q8_0 [NLoraO, NEmbd] grouped (V4 only)
+	AttnOutput  []byte // direct output projection (V2 only)
+
+	// V2 Lite: split KV projection
+	AttnQ       []byte // direct Q projection (V2 only, replaces AttnQA+AttnQB)
+	AttnKVA_MQA []byte // KV projection part A (V2 only)
+	AttnKVB     []byte // KV projection part B (V2 only)
 
 	// Compressor (compressed-KV layers only, nil for others)
 	CompressorAPE  []byte
@@ -162,6 +168,83 @@ func BindWeights(m *GGUFModel) (*Weights, error) {
 		bind(&l.FfnGateShexp, p+"ffn_gate_shexp.weight")
 		bind(&l.FfnUpShexp, p+"ffn_up_shexp.weight")
 		bind(&l.FfnDownShexp, p+"ffn_down_shexp.weight")
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	return w, nil
+}
+
+// BindWeightsV2 resolves tensor names for DeepSeek-V2-Lite GGUF layout.
+func BindWeightsV2(m *GGUFModel, nLayers int) (*Weights, error) {
+	w := &Weights{}
+	var err error
+
+	bind := func(dst *[]byte, name string) {
+		if err != nil {
+			return
+		}
+		d, e := m.TensorData(name)
+		if e != nil {
+			err = fmt.Errorf("bind %s: %w", name, e)
+			return
+		}
+		*dst = d
+	}
+	bindOpt := func(dst *[]byte, name string) {
+		if err != nil {
+			return
+		}
+		d, e := m.TensorData(name)
+		if e == nil {
+			*dst = d
+		}
+	}
+
+	bind(&w.TokenEmbd, "token_embd.weight")
+	bind(&w.OutputNorm, "output_norm.weight")
+	bindOpt(&w.Output, "output.weight")
+	// V2 has no HC output tensors — OutputHCBase/Fn/Scale stay nil
+
+	for il := 0; il < nLayers; il++ {
+		l := &w.Layer[il]
+		p := fmt.Sprintf("blk.%d.", il)
+
+		bind(&l.AttnNorm, p+"attn_norm.weight")
+
+		// V2 attention: direct Q (not LoRA), split KV, direct output
+		bind(&l.AttnQ, p+"attn_q.weight")
+		bind(&l.AttnKVA_MQA, p+"attn_kv_a_mqa.weight")
+		bindOpt(&l.AttnKVANorm, p+"attn_kv_a_norm.weight")
+		bind(&l.AttnKVB, p+"attn_kv_b.weight")
+		bind(&l.AttnOutput, p+"attn_output.weight")
+
+		// FFN norm
+		bind(&l.FfnNorm, p+"ffn_norm.weight")
+
+		// Routing (optional — layer 0 is dense in V2 Lite)
+		bindOpt(&l.FfnGateInp, p+"ffn_gate_inp.weight")
+		bindOpt(&l.FfnExpProbsB, p+"exp_probs_b.bias")
+
+		// Experts (optional — layer 0 has no experts)
+		bindOpt(&l.FfnGateExps, p+"ffn_gate_exps.weight")
+		bindOpt(&l.FfnUpExps, p+"ffn_up_exps.weight")
+		bindOpt(&l.FfnDownExps, p+"ffn_down_exps.weight")
+
+		// Shared expert
+		bindOpt(&l.FfnGateShexp, p+"ffn_gate_shexp.weight")
+		bindOpt(&l.FfnUpShexp, p+"ffn_up_shexp.weight")
+		bindOpt(&l.FfnDownShexp, p+"ffn_down_shexp.weight")
+
+		// Dense FFN (layer 0 in V2 Lite — uses ffn_gate/up/down without _shexp suffix)
+		// Only bind if expert weights not found (to avoid overwriting shared expert)
+		if l.FfnGateExps == nil {
+			bindOpt(&l.FfnGateShexp, p+"ffn_gate.weight")
+			bindOpt(&l.FfnUpShexp, p+"ffn_up.weight")
+			bindOpt(&l.FfnDownShexp, p+"ffn_down.weight")
+		}
+
 	}
 
 	if err != nil {
