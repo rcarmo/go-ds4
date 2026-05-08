@@ -1,0 +1,337 @@
+package ds4
+
+import (
+	"unsafe"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"math"
+	"math/rand/v2"
+)
+
+// Session holds the mutable inference state for one generation timeline.
+type Session struct {
+	Engine   *Engine
+	KV       *KVCache
+	Decode   *DecodeState
+	Tokens   []int // full token history
+	Pos      int   // current position in sequence
+	CtxSize  int
+	Logits   []float32 // [NVocab] last logits
+}
+
+// Engine holds the loaded model and weights.
+type Engine struct {
+	Model   *GGUFModel
+	Weights *Weights
+	Vocab   *Vocab
+}
+
+// OpenEngine loads a GGUF model and prepares the inference engine.
+func OpenEngine(modelPath string) (*Engine, error) {
+	m, err := OpenGGUF(modelPath)
+	if err != nil {
+		return nil, fmt.Errorf("open model: %w", err)
+	}
+
+	w, err := BindWeights(m)
+	if err != nil {
+		m.Close()
+		return nil, fmt.Errorf("bind weights: %w", err)
+	}
+
+	v, err := LoadVocab(m)
+	if err != nil {
+		m.Close()
+		return nil, fmt.Errorf("load vocab: %w", err)
+	}
+
+	return &Engine{Model: m, Weights: w, Vocab: v}, nil
+}
+
+// Close releases the model memory mapping.
+func (e *Engine) Close() {
+	if e.Model != nil {
+		e.Model.Close()
+	}
+}
+
+// NewSession creates a new inference session with the given context size.
+func (e *Engine) NewSession(ctxSize int) *Session {
+	return &Session{
+		Engine:  e,
+		KV:      NewKVCache(ctxSize),
+		Decode:  NewDecodeState(ctxSize),
+		Tokens:  make([]int, 0, ctxSize),
+		CtxSize: ctxSize,
+		Logits:  make([]float32, NVocab),
+	}
+}
+
+// Eval processes one token: runs the full forward pass and produces logits.
+func (s *Session) Eval(token int) {
+	s.Tokens = append(s.Tokens, token)
+
+	// Embed token: look up in token_embd (F16)
+	embF16 := s.Engine.Weights.TokenEmbd
+	embRowBytes := NEmbd * 2 // F16 = 2 bytes per element
+	embOff := token * embRowBytes
+	embRow := embF16[embOff : embOff+embRowBytes]
+
+	// Dequantize F16 → F32 into HC stream 0
+	embU16 := tensorU16Unsafe(embRow)
+	for i := 0; i < NEmbd; i++ {
+		s.Decode.CurHC[i] = F16ToF32(embU16[i])
+	}
+	// Zero other HC streams
+	for i := NEmbd; i < hcDim; i++ {
+		s.Decode.CurHC[i] = 0
+	}
+
+	// Run all 43 layers
+	for il := 0; il < NLayer; il++ {
+		layerForwardDecode(
+			s.Decode,
+			&s.Engine.Weights.Layer[il],
+			&s.KV.Layer[il],
+			s.Engine.Model,
+			s.Pos, il, token,
+		)
+	}
+
+	// Output logits
+	outputLogits(s.Logits, s.Decode.CurHC, s.Engine.Weights)
+
+	s.Pos++
+}
+
+// Generate runs autoregressive generation for n tokens.
+// Calls emit for each generated token. Returns on EOS or n tokens.
+func (s *Session) Generate(prompt []int, n int, temperature float32, topK int,
+	emit func(token int)) {
+
+	// Prefill: eval all prompt tokens
+	for _, t := range prompt {
+		s.Eval(t)
+	}
+
+	// Decode
+	for i := 0; i < n; i++ {
+		token := Sample(s.Logits, temperature, topK, 0, 0)
+		if token == s.Engine.Vocab.EOS {
+			break
+		}
+		emit(token)
+		s.Eval(token)
+	}
+}
+
+// scored holds a token index and its score for sampling.
+type scored struct {
+	idx int
+	val float32
+}
+
+// Sample selects a token from logits with temperature, top-k, top-p, min-p.
+func Sample(logits []float32, temperature float32, topK int, topP, minP float32) int {
+	if temperature <= 0 {
+		return Argmax(logits)
+	}
+
+	// Top-K
+	n := len(logits)
+	if topK <= 0 || topK > n {
+		topK = n
+	}
+
+	all := make([]scored, n)
+	for i, v := range logits {
+		all[i] = scored{i, v}
+	}
+
+	// Partial sort: find top-K
+	if topK < n {
+		partialTopK(all, topK)
+		all = all[:topK]
+	}
+
+	// Temperature scaling + softmax
+	maxV := all[0].val
+	for _, s := range all[1:] {
+		if s.val > maxV {
+			maxV = s.val
+		}
+	}
+	sum := float32(0)
+	for i := range all {
+		e := float32(math.Exp(float64((all[i].val - maxV) / temperature)))
+		all[i].val = e
+		sum += e
+	}
+	for i := range all {
+		all[i].val /= sum
+	}
+
+	// Min-P filtering
+	if minP > 0 {
+		threshold := all[0].val * minP // relative to max prob
+		filtered := all[:0]
+		for _, s := range all {
+			if s.val >= threshold {
+				filtered = append(filtered, s)
+			}
+		}
+		if len(filtered) > 0 {
+			all = filtered
+		}
+	}
+
+	// Top-P (nucleus) filtering
+	if topP > 0 && topP < 1 {
+		cumul := float32(0)
+		cutoff := len(all)
+		for i, s := range all {
+			cumul += s.val
+			if cumul >= topP {
+				cutoff = i + 1
+				break
+			}
+		}
+		all = all[:cutoff]
+	}
+
+	// Re-normalize
+	sum = 0
+	for _, s := range all {
+		sum += s.val
+	}
+
+	// Sample
+	r := rand.Float32() * sum
+	cumul := float32(0)
+	for _, s := range all {
+		cumul += s.val
+		if cumul >= r {
+			return s.idx
+		}
+	}
+	return all[len(all)-1].idx
+}
+
+// partialTopK partially sorts so that the top-K elements are at the front.
+func partialTopK(all []scored, k int) {
+	// Simple approach: nth_element-like partial sort
+	// For production, use introselect. For now, just sort the top.
+	for i := 0; i < k && i < len(all); i++ {
+		bestIdx := i
+		for j := i + 1; j < len(all); j++ {
+			if all[j].val > all[bestIdx].val {
+				bestIdx = j
+			}
+		}
+		all[i], all[bestIdx] = all[bestIdx], all[i]
+	}
+}
+
+
+// Rewind resets the session to a given position (for prefix reuse).
+func (s *Session) Rewind(pos int) {
+	if pos < s.Pos {
+		s.Pos = pos
+		s.Tokens = s.Tokens[:pos]
+	}
+}
+
+// Invalidate resets the session completely.
+func (s *Session) Invalidate() {
+	s.Pos = 0
+	s.Tokens = s.Tokens[:0]
+	s.KV = NewKVCache(s.CtxSize)
+}
+
+// SavePayload writes the session KV state to a writer.
+func (s *Session) SavePayload(w io.Writer) error {
+	// Header
+	binary.Write(w, binary.LittleEndian, uint32(0x34565344)) // "DSV4"
+	binary.Write(w, binary.LittleEndian, uint32(1))           // version
+	binary.Write(w, binary.LittleEndian, uint32(s.Pos))
+	binary.Write(w, binary.LittleEndian, uint32(s.CtxSize))
+
+	// Per-layer KV data
+	for il := 0; il < NLayer; il++ {
+		lc := &s.KV.Layer[il]
+		binary.Write(w, binary.LittleEndian, uint32(lc.NRaw))
+		binary.Write(w, binary.LittleEndian, lc.RawKV)
+		if lc.CompressRatio > 0 {
+			binary.Write(w, binary.LittleEndian, uint32(lc.NComp))
+			binary.Write(w, binary.LittleEndian, lc.CompKV)
+			binary.Write(w, binary.LittleEndian, lc.CompStateKV)
+			binary.Write(w, binary.LittleEndian, lc.CompStateScore)
+		}
+	}
+
+	// Token history
+	binary.Write(w, binary.LittleEndian, uint32(len(s.Tokens)))
+	for _, t := range s.Tokens {
+		binary.Write(w, binary.LittleEndian, int32(t))
+	}
+
+	return nil
+}
+
+// LoadPayload restores session KV state from a reader.
+func (s *Session) LoadPayload(r io.Reader) error {
+	var magic, version, pos, ctxSize uint32
+	binary.Read(r, binary.LittleEndian, &magic)
+	if magic != 0x34565344 {
+		return fmt.Errorf("bad session magic 0x%08x", magic)
+	}
+	binary.Read(r, binary.LittleEndian, &version)
+	binary.Read(r, binary.LittleEndian, &pos)
+	binary.Read(r, binary.LittleEndian, &ctxSize)
+
+	s.Pos = int(pos)
+	s.CtxSize = int(ctxSize)
+
+	for il := 0; il < NLayer; il++ {
+		lc := &s.KV.Layer[il]
+		var nRaw uint32
+		binary.Read(r, binary.LittleEndian, &nRaw)
+		lc.NRaw = int(nRaw)
+		binary.Read(r, binary.LittleEndian, lc.RawKV)
+		if lc.CompressRatio > 0 {
+			var nComp uint32
+			binary.Read(r, binary.LittleEndian, &nComp)
+			lc.NComp = int(nComp)
+			binary.Read(r, binary.LittleEndian, lc.CompKV)
+			binary.Read(r, binary.LittleEndian, lc.CompStateKV)
+			binary.Read(r, binary.LittleEndian, lc.CompStateScore)
+		}
+	}
+
+	var nTokens uint32
+	binary.Read(r, binary.LittleEndian, &nTokens)
+	s.Tokens = make([]int, nTokens)
+	for i := range s.Tokens {
+		var t int32
+		binary.Read(r, binary.LittleEndian, &t)
+		s.Tokens[i] = int(t)
+	}
+
+	return nil
+}
+
+func tensorU16Unsafe(data []byte) []uint16 {
+	return tensorU16(data)
+}
+
+func tensorU16(data []byte) []uint16 {
+	if len(data) < 2 {
+		return nil
+	}
+	return (*[1 << 30]uint16)(unsafePtrBytes(data))[:len(data)/2]
+}
+
+func unsafePtrBytes(b []byte) unsafe.Pointer {
+	return unsafe.Pointer(&b[0])
+}
