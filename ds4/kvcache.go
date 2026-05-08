@@ -40,17 +40,30 @@ func NewKVCache(ctxSize int) *KVCache {
 		ratio := layerCompressRatio(il)
 		lc.CompressRatio = ratio
 		if ratio > 0 {
+			coff := 1
+			if ratio == 4 {
+				coff = 2
+			}
+			width := coff * NHeadDim
+			rows := coff * ratio
+
 			lc.CompCap = ctxSize/ratio + 2
 			lc.CompKV = make([]float32, lc.CompCap*NHeadDim)
-			// Compressor state: ratio entries of KV + score
-			lc.CompStateKV = make([]float32, ratio*NHeadDim)
-			lc.CompStateScore = make([]float32, ratio)
+			lc.CompStateKV = make([]float32, rows*width)
+			lc.CompStateScore = make([]float32, rows*width)
+			for i := range lc.CompStateScore {
+				lc.CompStateScore[i] = -1e30
+			}
 
 			if ratio == 4 {
-				// Indexer
+				idxWidth := coff * NIndexerHeadDim
+				idxRows := coff * ratio
 				lc.IndexCompKV = make([]float32, lc.CompCap*NIndexerHeadDim)
-				lc.IndexStateKV = make([]float32, ratio*NIndexerHeadDim)
-				lc.IndexStateScore = make([]float32, ratio)
+				lc.IndexStateKV = make([]float32, idxRows*idxWidth)
+				lc.IndexStateScore = make([]float32, idxRows*idxWidth)
+				for i := range lc.IndexStateScore {
+					lc.IndexStateScore[i] = -1e30
+				}
 			}
 		}
 	}
@@ -73,10 +86,32 @@ func layerCompressRatio(il int) int {
 	return 128
 }
 
-// PushRawKV appends a new KV row to the sliding window (circular buffer).
+// PushRawKV appends a new KV row to the sliding window in chronological order.
+// Mirrors ds4.c behavior: append until full, then shift left by one row.
 func (lc *LayerCache) PushRawKV(kv []float32) {
-	// Circular: overwrite oldest if full
-	idx := lc.NRaw % lc.CapRaw
-	copy(lc.RawKV[idx*NHeadDim:(idx+1)*NHeadDim], kv)
-	lc.NRaw++
+	if lc.NRaw < lc.CapRaw {
+		copy(lc.RawKV[lc.NRaw*NHeadDim:(lc.NRaw+1)*NHeadDim], kv)
+		lc.NRaw++
+		return
+	}
+	copy(lc.RawKV[0:(lc.CapRaw-1)*NHeadDim], lc.RawKV[NHeadDim:lc.CapRaw*NHeadDim])
+	copy(lc.RawKV[(lc.CapRaw-1)*NHeadDim:lc.CapRaw*NHeadDim], kv)
+}
+
+// PushCompKV appends one compressed attention KV row.
+func (lc *LayerCache) PushCompKV(kv []float32) {
+	if lc.NComp >= lc.CompCap {
+		return
+	}
+	copy(lc.CompKV[lc.NComp*NHeadDim:(lc.NComp+1)*NHeadDim], kv)
+	lc.NComp++
+}
+
+// PushIndexCompKV appends one compressed indexer KV row.
+func (lc *LayerCache) PushIndexCompKV(kv []float32) {
+	if lc.NIndexComp >= lc.CompCap {
+		return
+	}
+	copy(lc.IndexCompKV[lc.NIndexComp*NIndexerHeadDim:(lc.NIndexComp+1)*NIndexerHeadDim], kv)
+	lc.NIndexComp++
 }

@@ -3,6 +3,8 @@ package ds4
 import (
 	"math"
 	"unsafe"
+
+	"github.com/rcarmo/go-ds4/ds4/simd"
 )
 
 // DecodeState holds pre-allocated buffers for single-token decode.
@@ -20,6 +22,18 @@ type DecodeState struct {
 	Heads      []float32 // [NHead * NHeadDim] attention output
 	AttnOut    []float32 // [NEmbd] after output projection
 	AttnScore  []float32 // attention scores (sized per layer)
+	KVCacheRow []float32 // [NHeadDim] scratch row for cache quantization
+	TmpLoRA    []float32 // [NLoraO] scratch for output grouped LoRA
+
+	// Compressor/indexer scratch (decode)
+	CompKVCur       []float32 // [2*NHeadDim]
+	CompScoreCur    []float32 // [2*NHeadDim]
+	CompPooled      []float32 // [NHeadDim]
+	CompOut         []float32 // [NHeadDim]
+	IndexCompKVCur  []float32 // [2*NIndexerHeadDim]
+	IndexCompScore  []float32 // [2*NIndexerHeadDim]
+	IndexCompPooled []float32 // [NIndexerHeadDim]
+	IndexCompOut    []float32 // [NIndexerHeadDim]
 
 	// FFN / MoE
 	FfnNormed  []float32 // [NEmbd]
@@ -48,6 +62,16 @@ func NewDecodeState(ctxSize int) *DecodeState {
 		Heads:      make([]float32, NHead*NHeadDim),
 		AttnOut:    make([]float32, NEmbd),
 		AttnScore:  make([]float32, maxScores),
+		KVCacheRow: make([]float32, NHeadDim),
+		TmpLoRA:    make([]float32, NLoraO),
+		CompKVCur:  make([]float32, 2*NHeadDim),
+		CompScoreCur: make([]float32, 2*NHeadDim),
+		CompPooled: make([]float32, NHeadDim),
+		CompOut:    make([]float32, NHeadDim),
+		IndexCompKVCur:  make([]float32, 2*NIndexerHeadDim),
+		IndexCompScore:  make([]float32, 2*NIndexerHeadDim),
+		IndexCompPooled: make([]float32, NIndexerHeadDim),
+		IndexCompOut:    make([]float32, NIndexerHeadDim),
 		FfnNormed:  make([]float32, NEmbd),
 		RoutedXQ:   make([]byte, (NEmbd/QK_K)*BlockQ8KSize),
 		RoutedMidQ: make([]byte, NExpertUsed*(NFFExp/QK_K)*BlockQ8KSize),
@@ -106,55 +130,93 @@ func layerAttnDecode(
 	// Apply RoPE to KV tail
 	ropeYaRNTailInplace(ds.KV, pos, 1, NHeadDim, NRot, freqBase, freqScale, false)
 
-	// FP8 quantize the non-RoPE portion for storage
-	kvForCache := make([]float32, NHeadDim)
-	copy(kvForCache, ds.KV)
-	fp8KVQuantizeInplace(kvForCache, NHeadDim, NRot)
+	// FP8 quantize the non-RoPE portion for storage (reuse scratch to avoid alloc)
+	copy(ds.KVCacheRow, ds.KV)
+	fp8KVQuantizeInplace(ds.KVCacheRow, NHeadDim, NRot)
 
 	// Push to cache
-	cache.PushRawKV(kvForCache)
+	cache.PushRawKV(ds.KVCacheRow)
 
-	// 4. Attention scoring over SWA window
+	// 4. Compressor/indexer update
+	ratio := cache.CompressRatio
+	if ratio > 0 && len(layer.CompressorKV) != 0 {
+		if compressorDecodeOne(ds.CompOut, ds.CompKVCur, ds.CompScoreCur, ds.CompPooled,
+			layer.CompressorKV, layer.CompressorGate, layer.CompressorAPE, layer.CompressorNorm,
+			ds.AttnNormed, cache.CompStateKV, cache.CompStateScore,
+			NHeadDim, ratio, il, pos, true) {
+			cache.PushCompKV(ds.CompOut)
+		}
+		if ratio == 4 && len(layer.IndexerCompKV) != 0 {
+			if compressorDecodeOne(ds.IndexCompOut, ds.IndexCompKVCur, ds.IndexCompScore, ds.IndexCompPooled,
+				layer.IndexerCompKV, layer.IndexerCompGate, layer.IndexerCompAPE, layer.IndexerCompNorm,
+				ds.AttnNormed, cache.IndexStateKV, cache.IndexStateScore,
+				NIndexerHeadDim, ratio, il, pos, false) {
+				cache.PushIndexCompKV(ds.IndexCompOut)
+			}
+		}
+	}
+
+	// 5. Attention scoring over raw SWA + optional compressed rows
 	nRaw := cache.NRaw
 	if nRaw > cache.CapRaw {
 		nRaw = cache.CapRaw
 	}
+	nComp := cache.NComp
+	if nComp > cache.CompCap {
+		nComp = cache.CompCap
+	}
+	nTotal := nRaw + nComp
 
+	sinks := tensorF32Unsafe(layer.AttnSinks)
 	scale := float32(1.0 / math.Sqrt(float64(NHeadDim)))
 
-	// For each Q head, score against all raw KV rows
 	for h := 0; h < NHead; h++ {
 		qHead := ds.Q[h*NHeadDim : (h+1)*NHeadDim]
-		bestSum := float32(0)
+		maxScore := sinks[h]
+
 		for t := 0; t < nRaw; t++ {
-			idx := t % cache.CapRaw
-			kvRow := cache.RawKV[idx*NHeadDim : (idx+1)*NHeadDim]
-			// Dot product Q·KV
-			dot := float32(0)
-			for d := 0; d < NHeadDim; d++ {
-				dot += qHead[d] * kvRow[d]
+			kvRow := cache.RawKV[t*NHeadDim : (t+1)*NHeadDim]
+			s := simd.Sdot(qHead, kvRow) * scale
+			ds.AttnScore[t] = s
+			if s > maxScore {
+				maxScore = s
 			}
-			ds.AttnScore[t] = dot * scale
-			bestSum += dot * scale
 		}
-		_ = bestSum // will be used after softmax
+		for t := 0; t < nComp; t++ {
+			kvRow := cache.CompKV[t*NHeadDim : (t+1)*NHeadDim]
+			s := simd.Sdot(qHead, kvRow) * scale
+			ds.AttnScore[nRaw+t] = s
+			if s > maxScore {
+				maxScore = s
+			}
+		}
 
-		// Softmax over scores
-		softmax(ds.AttnScore[:nRaw])
-
-		// Weighted sum of KV rows → head output
 		headOut := ds.Heads[h*NHeadDim : (h+1)*NHeadDim]
 		for d := range headOut {
 			headOut[d] = 0
 		}
+		denom := float32(math.Exp(float64(sinks[h] - maxScore)))
+
 		for t := 0; t < nRaw; t++ {
-			idx := t % cache.CapRaw
-			kvRow := cache.RawKV[idx*NHeadDim : (idx+1)*NHeadDim]
-			w := ds.AttnScore[t]
-			for d := 0; d < NHeadDim; d++ {
-				headOut[d] += w * kvRow[d]
+			w := float32(math.Exp(float64(ds.AttnScore[t] - maxScore)))
+			denom += w
+			kvRow := cache.RawKV[t*NHeadDim : (t+1)*NHeadDim]
+			simd.Saxpy(w, kvRow, headOut)
+		}
+		for t := 0; t < nComp; t++ {
+			w := float32(math.Exp(float64(ds.AttnScore[nRaw+t] - maxScore)))
+			denom += w
+			kvRow := cache.CompKV[t*NHeadDim : (t+1)*NHeadDim]
+			simd.Saxpy(w, kvRow, headOut)
+		}
+
+		if denom > 0 {
+			inv := 1 / denom
+			for d := range headOut {
+				headOut[d] *= inv
 			}
 		}
+		_ = nTotal
 	}
 
 	// 5. Output projection (de-RoPE → grouped LoRA)
@@ -162,11 +224,10 @@ func layerAttnDecode(
 	ropeYaRNTailInplace(ds.Heads, pos, NHead, NHeadDim, NRot, freqBase, freqScale, true)
 
 	// attn_output_a: Q8_0 [NHead*NValueDim, NLoraO] → tmp[NLoraO]
-	tmpLoRA := make([]float32, NLoraO)
-	matvecQ8_0Grouped(tmpLoRA, layer.AttnOutputA, ds.Heads, NHead*NValueDim, NLoraO, NOutGroup)
+	matvecQ8_0Grouped(ds.TmpLoRA, layer.AttnOutputA, ds.Heads, NHead*NValueDim, NLoraO, NOutGroup)
 
 	// attn_output_b: Q8_0 [NLoraO, NEmbd] → attn_out[NEmbd]
-	matvecQ8_0(ds.AttnOut, layer.AttnOutputB, tmpLoRA, NLoraO, NEmbd)
+	matvecQ8_0(ds.AttnOut, layer.AttnOutputB, ds.TmpLoRA, NLoraO, NEmbd)
 }
 
 // layerRoPEFreqBase returns the RoPE frequency base for this layer.
