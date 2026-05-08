@@ -30,6 +30,9 @@ func (e *Engine) InitGPU() error {
 
 			// Init IQ2/Q2K kernels too
 			gpu.InitCUDAGemvQ2K()
+			// Init IQ2 kernel with grid table
+			gridSlice := (*[256 * 128 * 8]int8)(unsafe.Pointer(&iq2xxsSignedGrid[0]))
+			gpu.InitCUDAGemvIQ2(gridSlice[:])
 
 			// Allocate expert pool (4 slots for FastExperts, 6 otherwise)
 			nSlots := NExpertUsed
@@ -206,7 +209,7 @@ func (e *Engine) gpuExpertForward(
 	experts []expertScore, il int,
 ) bool {
 	ce, ok := e.GPU.(*CUDAEngine)
-	if !ok || !ce.ready || ce.expertPool == nil || !gpu.CudaGemvQ2KReady() {
+	if !ok || !ce.ready || ce.expertPool == nil || !gpu.CudaGemvIQ2Ready() || !gpu.CudaGemvQ2KReady() {
 		return false
 	}
 
@@ -214,30 +217,68 @@ func (e *Engine) gpuExpertForward(
 	upRowBytes := gateRowBytes
 	downRowBytes := (NFFExp / 256) * BlockQ2KSize
 
-	// Upload activation (FfnNormed as f32)
-	ce.expertPool.UploadActivation(ds.FfnNormed)
-
-	// Upload active expert weights and dispatch
-	for slot, exp := range experts {
-		if slot >= ce.expertPool.NExperts() {
-			break
-		}
-		// Get expert weight slices from mmap
-		gateBase := layer.FfnGateExps[exp.idx*gateRowBytes*NFFExp:]
-		upBase := layer.FfnUpExps[exp.idx*upRowBytes*NFFExp:]
-		downBase := layer.FfnDownExps[exp.idx*downRowBytes*NEmbd:]
-
-		ce.expertPool.UploadExpert(slot,
-			gateBase[:gateRowBytes*NFFExp],
-			upBase[:upRowBytes*NFFExp],
-			downBase[:downRowBytes*NEmbd],
-		)
+	nExp := len(experts)
+	if nExp > ce.expertPool.NExperts() {
+		nExp = ce.expertPool.NExperts()
 	}
 
-	// For now: dispatch sequentially per expert (can be pipelined later)
-	// Each expert: IQ2 gate → IQ2 up → SwiGLU (CPU) → Q2K down
-	// This is complex to fully GPU-ify, so just GPU the biggest part (IQ2 gate+up)
-	// and leave SwiGLU + Q2K down on CPU as before.
-	// TODO: full GPU expert pipeline
-	return false // not yet fully wired
+	// Upload active expert weights from mmap to GPU pool slots
+	for slot := 0; slot < nExp; slot++ {
+		eidx := experts[slot].idx
+		gateBase := layer.FfnGateExps[eidx*gateRowBytes*NFFExp : (eidx+1)*gateRowBytes*NFFExp]
+		upBase := layer.FfnUpExps[eidx*upRowBytes*NFFExp : (eidx+1)*upRowBytes*NFFExp]
+		downBase := layer.FfnDownExps[eidx*downRowBytes*NEmbd : (eidx+1)*downRowBytes*NEmbd]
+		ce.expertPool.UploadExpert(slot, gateBase, upBase, downBase)
+	}
+
+	// Upload f32 activation
+	ce.expertPool.UploadActivation(ds.FfnNormed)
+
+	// Per expert: IQ2 gate → IQ2 up → download → SwiGLU (CPU) → upload → Q2K down → download
+	for slot := 0; slot < nExp; slot++ {
+		weight := experts[slot].score
+
+		// Gate: IQ2_XXS [NFFExp, NEmbd] × f32[NEmbd] → f32[NFFExp]
+		gateBuf := ce.expertPool.OutBuf(slot)
+		if err := gpu.CUDAMatvecIQ2(gateBuf, ce.expertPool.ActBuf(), ce.expertPool.GatePtr(slot),
+			NEmbd, NFFExp, gateRowBytes*NFFExp); err != nil {
+			return false
+		}
+
+		// Up: IQ2_XXS [NFFExp, NEmbd] × f32[NEmbd] → f32[NFFExp]
+		// Reuse actBuf for up output (different from gate output)
+		upOut := make([]float32, NFFExp)
+		if err := gpu.CUDAMatvecIQ2(ce.expertPool.ActBuf(), ce.expertPool.ActBuf(), ce.expertPool.UpPtr(slot),
+			NEmbd, NFFExp, upRowBytes*NFFExp); err != nil {
+			return false
+		}
+		// Download gate and up results
+		gate := make([]float32, NFFExp)
+		gateBuf.Download(gate)
+		ce.expertPool.ActBuf().Download(upOut)
+
+		// SwiGLU on CPU (fast, ~5µs)
+		swiGLU(gate, gate, upOut)
+
+		// Upload SwiGLU result for Q2K down projection
+		ce.expertPool.ActBuf().Upload(gate)
+
+		// Down: Q2_K [NEmbd, NFFExp] × f32[NFFExp] → f32[NEmbd]
+		outBuf := ce.expertPool.OutBuf(slot)
+		if err := gpu.CUDAMatvecQ2K(outBuf, ce.expertPool.ActBuf(), ce.expertPool.DownPtr(slot),
+			NFFExp, NEmbd, downRowBytes*NEmbd); err != nil {
+			return false
+		}
+
+		// Download and accumulate
+		result := make([]float32, NEmbd)
+		outBuf.Download(result)
+		for i := 0; i < NEmbd; i++ {
+			ds.RoutedOut[i] += weight * result[i]
+		}
+	}
+
+	// Re-upload original activation for shared expert (it was overwritten)
+	ce.expertPool.UploadActivation(ds.FfnNormed)
+	return true
 }

@@ -254,3 +254,6 @@ func CUDAMatvecIQ2(output, activation *Buffer, weightPtr CUdeviceptr, inDim, out
 
 	return LaunchKernel(cudaGemvIQ2, uint32(outDim), 1, 1, 256, 1, 1, 256*4, args...)
 }
+
+// CudaGemvIQ2Ready returns true if the IQ2 kernel is compiled.
+func CudaGemvIQ2Ready() bool { return cudaGemvIQ2Ready }

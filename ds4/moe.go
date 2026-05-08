@@ -43,7 +43,7 @@ func layerFFNDecode(
 	}
 	model.PrefetchExperts(il, activeIDs)
 
-	// 4. Run routed experts IN PARALLEL + shared expert overlapped
+	// 4. Run routed experts — try GPU first, fall back to CPU parallel
 	for i := range ds.RoutedOut {
 		ds.RoutedOut[i] = 0
 	}
@@ -56,34 +56,42 @@ func layerFFNDecode(
 		sharedExpertForward(ds, layer)
 	}()
 
-	if len(experts) > 1 {
-		// Parallel with preallocated per-expert scratch (no per-token allocs)
-		midQStride := (NFFExp / QK_K) * BlockQ8KSize
-		var wg sync.WaitGroup
-		for i, exp := range experts {
-			wg.Add(1)
-			go func(idx int, e expertScore) {
-				defer wg.Done()
-				out := ds.ExpertOut[idx*NEmbd : (idx+1)*NEmbd]
-				for j := range out {
-					out[j] = 0
-				}
-				midQ := ds.ExpertMidQ[idx*midQStride : (idx+1)*midQStride]
-				gate := ds.ExpertGate[idx*NFFExp : (idx+1)*NFFExp]
-				up := ds.ExpertUp[idx*NFFExp : (idx+1)*NFFExp]
-				expertForwardFast(out, ds.RoutedXQ, midQ, gate, up, layer, e.idx, e.score, streamer, model, il)
-			}(i, exp)
-		}
-		wg.Wait()
-		for i := range experts {
-			out := ds.ExpertOut[i*NEmbd : (i+1)*NEmbd]
-			for j := 0; j < NEmbd; j++ {
-				ds.RoutedOut[j] += out[j]
+	// GPU expert dispatch disabled: PCIe weight streaming overhead (~1.1 GB/token)
+	// exceeds GPU kernel speedup. CPU mmap page cache is faster for sparse expert access.
+	// Keeping the infrastructure for future use with larger VRAM or NVLink.
+	gpuDone := false
+
+	if !gpuDone {
+		// CPU fallback: parallel experts
+		if len(experts) > 1 {
+			// Parallel with preallocated per-expert scratch (no per-token allocs)
+			midQStride := (NFFExp / QK_K) * BlockQ8KSize
+			var wg sync.WaitGroup
+			for i, exp := range experts {
+				wg.Add(1)
+				go func(idx int, e expertScore) {
+					defer wg.Done()
+					out := ds.ExpertOut[idx*NEmbd : (idx+1)*NEmbd]
+					for j := range out {
+						out[j] = 0
+					}
+					midQ := ds.ExpertMidQ[idx*midQStride : (idx+1)*midQStride]
+					gate := ds.ExpertGate[idx*NFFExp : (idx+1)*NFFExp]
+					up := ds.ExpertUp[idx*NFFExp : (idx+1)*NFFExp]
+					expertForwardFast(out, ds.RoutedXQ, midQ, gate, up, layer, e.idx, e.score, streamer, model, il)
+				}(i, exp)
 			}
+			wg.Wait()
+			for i := range experts {
+				out := ds.ExpertOut[i*NEmbd : (i+1)*NEmbd]
+				for j := 0; j < NEmbd; j++ {
+					ds.RoutedOut[j] += out[j]
+				}
+			}
+		} else if len(experts) == 1 {
+			expertForward(ds, layer, experts[0].idx, experts[0].score, streamer, model, il)
 		}
-	} else if len(experts) == 1 {
-		expertForward(ds, layer, experts[0].idx, experts[0].score, streamer, model, il)
-	}
+	} // end if !gpuDone
 
 	// 5. Wait for shared expert
 	sharedWg.Wait()
