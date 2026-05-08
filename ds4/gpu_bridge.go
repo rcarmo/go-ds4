@@ -9,11 +9,12 @@ import (
 
 // CUDAEngine holds CUDA GPU state for DS4 inference acceleration.
 type CUDAEngine struct {
-	ready      bool
-	weightPtrs map[string]gpu.CUdeviceptr // raw byte buffers on GPU
-	actBuf     *gpu.Buffer                // [maxDim] float32 activation
-	outBuf     *gpu.Buffer                // [maxOutDim] float32 output
-	expertPool *gpu.ExpertPool            // reusable expert weight buffers
+	ready       bool
+	weightPtrs  map[string]gpu.CUdeviceptr
+	actBuf      *gpu.Buffer
+	outBuf      *gpu.Buffer
+	expertPool  *gpu.ExpertPool
+	expertCache *gpu.ExpertCache
 }
 
 // InitGPU initializes GPU acceleration (CUDA or Vulkan).
@@ -44,6 +45,16 @@ func (e *Engine) InitGPU() error {
 				ce.expertPool = pool
 			} else {
 				fmt.Printf("[gpu] expert pool alloc failed: %v\n", err)
+			}
+
+			// Allocate expert cache (top-16 per layer, ~4.5 GB)
+			const cachedPerLayer = 16
+			cache, err := gpu.NewExpertCache(cachedPerLayer)
+			if err == nil {
+				ce.expertCache = cache
+				e.loadExpertCache(ce, cachedPerLayer)
+			} else {
+				fmt.Printf("[gpu] expert cache alloc failed: %v\n", err)
 			}
 
 			// Upload Q8_0 weight tensors
@@ -199,17 +210,20 @@ func (ce *CUDAEngine) Close() {
 	if ce.expertPool != nil {
 		ce.expertPool.Free()
 	}
+	if ce.expertCache != nil {
+		ce.expertCache.Free()
+	}
 	ce.ready = false
 }
 
-// gpuExpertForward runs a batch of experts on GPU.
-// Returns true if successfully dispatched, false for CPU fallback.
+// gpuExpertForward runs cached experts on GPU, skips uncached ones.
+// Returns true only if ALL experts were handled on GPU.
 func (e *Engine) gpuExpertForward(
 	ds *DecodeState, layer *LayerWeights,
 	experts []expertScore, il int,
 ) bool {
 	ce, ok := e.GPU.(*CUDAEngine)
-	if !ok || !ce.ready || ce.expertPool == nil || !gpu.CudaGemvIQ2Ready() || !gpu.CudaGemvQ2KReady() {
+	if !ok || !ce.ready || ce.expertCache == nil || !gpu.CudaGemvIQ2Ready() || !gpu.CudaGemvQ2KReady() {
 		return false
 	}
 
@@ -217,68 +231,93 @@ func (e *Engine) gpuExpertForward(
 	upRowBytes := gateRowBytes
 	downRowBytes := (NFFExp / 256) * BlockQ2KSize
 
-	nExp := len(experts)
-	if nExp > ce.expertPool.NExperts() {
-		nExp = ce.expertPool.NExperts()
+	// Check if all experts are cached
+	allCached := true
+	for _, exp := range experts {
+		if !ce.expertCache.IsCached(il, exp.idx) {
+			allCached = false
+			break
+		}
+	}
+	if !allCached {
+		return false // fall back to CPU for entire batch
 	}
 
-	// Upload active expert weights from mmap to GPU pool slots
-	for slot := 0; slot < nExp; slot++ {
-		eidx := experts[slot].idx
-		gateBase := layer.FfnGateExps[eidx*gateRowBytes*NFFExp : (eidx+1)*gateRowBytes*NFFExp]
-		upBase := layer.FfnUpExps[eidx*upRowBytes*NFFExp : (eidx+1)*upRowBytes*NFFExp]
-		downBase := layer.FfnDownExps[eidx*downRowBytes*NEmbd : (eidx+1)*downRowBytes*NEmbd]
-		ce.expertPool.UploadExpert(slot, gateBase, upBase, downBase)
-	}
+	// Upload f32 activation once
+	actBuf := ce.expertCache.ActBuf(il)
+	actBuf.Upload(ds.FfnNormed)
 
-	// Upload f32 activation
-	ce.expertPool.UploadActivation(ds.FfnNormed)
+	for _, exp := range experts {
+		gatePtr, upPtr, downPtr, _ := ce.expertCache.Get(il, exp.idx)
 
-	// Per expert: IQ2 gate → IQ2 up → download → SwiGLU (CPU) → upload → Q2K down → download
-	for slot := 0; slot < nExp; slot++ {
-		weight := experts[slot].score
-
-		// Gate: IQ2_XXS [NFFExp, NEmbd] × f32[NEmbd] → f32[NFFExp]
-		gateBuf := ce.expertPool.OutBuf(slot)
-		if err := gpu.CUDAMatvecIQ2(gateBuf, ce.expertPool.ActBuf(), ce.expertPool.GatePtr(slot),
+		// Gate: IQ2_XXS
+		outBuf := ce.expertCache.OutBuf(il)
+		if err := gpu.CUDAMatvecIQ2(outBuf, actBuf, gatePtr,
 			NEmbd, NFFExp, gateRowBytes*NFFExp); err != nil {
 			return false
 		}
 
-		// Up: IQ2_XXS [NFFExp, NEmbd] × f32[NEmbd] → f32[NFFExp]
-		// Reuse actBuf for up output (different from gate output)
-		upOut := make([]float32, NFFExp)
-		if err := gpu.CUDAMatvecIQ2(ce.expertPool.ActBuf(), ce.expertPool.ActBuf(), ce.expertPool.UpPtr(slot),
+		// Up: IQ2_XXS (reuse midBuf for up result)
+		midBuf := ce.expertCache.MidBuf(il)
+		if err := gpu.CUDAMatvecIQ2(midBuf, actBuf, upPtr,
 			NEmbd, NFFExp, upRowBytes*NFFExp); err != nil {
 			return false
 		}
-		// Download gate and up results
-		gate := make([]float32, NFFExp)
-		gateBuf.Download(gate)
-		ce.expertPool.ActBuf().Download(upOut)
 
-		// SwiGLU on CPU (fast, ~5µs)
-		swiGLU(gate, gate, upOut)
+		// Download gate and up
+		gate := ds.ExpertGate[:NFFExp]
+		up := ds.ExpertUp[:NFFExp]
+		outBuf.Download(gate)
+		midBuf.Download(up)
 
-		// Upload SwiGLU result for Q2K down projection
-		ce.expertPool.ActBuf().Upload(gate)
+		// SwiGLU on CPU
+		swiGLU(gate, gate, up)
 
-		// Down: Q2_K [NEmbd, NFFExp] × f32[NFFExp] → f32[NEmbd]
-		outBuf := ce.expertPool.OutBuf(slot)
-		if err := gpu.CUDAMatvecQ2K(outBuf, ce.expertPool.ActBuf(), ce.expertPool.DownPtr(slot),
+		// Upload for Q2K down
+		actBuf.Upload(gate)
+
+		// Down: Q2_K
+		if err := gpu.CUDAMatvecQ2K(outBuf, actBuf, downPtr,
 			NFFExp, NEmbd, downRowBytes*NEmbd); err != nil {
 			return false
 		}
 
 		// Download and accumulate
-		result := make([]float32, NEmbd)
+		result := ds.ExpertOut[:NEmbd]
 		outBuf.Download(result)
 		for i := 0; i < NEmbd; i++ {
-			ds.RoutedOut[i] += weight * result[i]
+			ds.RoutedOut[i] += exp.score * result[i]
+		}
+
+		// Restore activation for next expert
+		actBuf.Upload(ds.FfnNormed)
+	}
+	return true
+}
+
+// loadExpertCache pre-loads top-N experts per layer into VRAM.
+func (e *Engine) loadExpertCache(ce *CUDAEngine, nPerLayer int) {
+	gateRowBytes := (NEmbd / 256) * BlockIQ2XXSSize
+	upRowBytes := gateRowBytes
+	downRowBytes := (NFFExp / 256) * BlockQ2KSize
+
+	loaded := 0
+	for il := 0; il < NLayer; il++ {
+		l := &e.Weights.Layer[il]
+		if len(l.FfnGateExps) == 0 {
+			continue
+		}
+		for eidx := 0; eidx < nPerLayer && eidx < NExpert; eidx++ {
+			gateBase := l.FfnGateExps[eidx*gateRowBytes*NFFExp : (eidx+1)*gateRowBytes*NFFExp]
+			upBase := l.FfnUpExps[eidx*upRowBytes*NFFExp : (eidx+1)*upRowBytes*NFFExp]
+			downBase := l.FfnDownExps[eidx*downRowBytes*NEmbd : (eidx+1)*downRowBytes*NEmbd]
+			if err := ce.expertCache.LoadExpert(il, eidx, gateBase, upBase, downBase); err != nil {
+				fmt.Printf("[gpu] expert cache layer %d expert %d: %v\n", il, eidx, err)
+				return
+			}
+			loaded++
 		}
 	}
-
-	// Re-upload original activation for shared expert (it was overwritten)
-	ce.expertPool.UploadActivation(ds.FfnNormed)
-	return true
+	fmt.Printf("[gpu] Expert cache: %d experts loaded (%.1f GB VRAM)\n",
+		loaded, float64(ce.expertCache.TotalVRAM())/(1024*1024*1024))
 }

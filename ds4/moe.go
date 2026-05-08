@@ -56,10 +56,13 @@ func layerFFNDecode(
 		sharedExpertForward(ds, layer)
 	}()
 
-	// GPU expert dispatch disabled: PCIe weight streaming overhead (~1.1 GB/token)
-	// exceeds GPU kernel speedup. CPU mmap page cache is faster for sparse expert access.
-	// Keeping the infrastructure for future use with larger VRAM or NVLink.
+	// GPU expert dispatch: use cached experts if all are in VRAM
 	gpuDone := false
+	if ds.Engine != nil {
+		if eng, ok := ds.Engine.(*Engine); ok {
+			gpuDone = eng.gpuExpertForward(ds, layer, experts, il)
+		}
+	}
 
 	if !gpuDone {
 		// CPU fallback: parallel experts
