@@ -50,6 +50,16 @@ func sigmoid(x float32) float32 {
 	return e / (1.0 + e)
 }
 
+func softplusStable(x float32) float32 {
+	if x > 20 {
+		return x
+	}
+	if x < -20 {
+		return float32(math.Exp(float64(x)))
+	}
+	return float32(math.Log1p(math.Exp(float64(x))))
+}
+
 // swiGLU computes dst = silu(a) * b in-place.
 // silu(x) = x * sigmoid(x).
 func swiGLU(dst, a, b []float32) {

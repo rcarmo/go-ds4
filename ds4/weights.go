@@ -79,7 +79,7 @@ type Weights struct {
 }
 
 // BindWeights resolves tensor names from the GGUF to weight struct fields.
-func BindWeights(m *GGUFModel) (*Weights, error) {
+func BindWeights(m *GGUFModel, nLayers int) (*Weights, error) {
 	w := &Weights{}
 	var err error
 
@@ -115,7 +115,7 @@ func BindWeights(m *GGUFModel) (*Weights, error) {
 	bindOpt(&w.Output, "output.weight")
 
 	// Per-layer tensors
-	for il := 0; il < NLayer; il++ { // TODO: use config.NLayer
+	for il := 0; il < nLayers; il++ {
 		l := &w.Layer[il]
 		p := fmt.Sprintf("blk.%d.", il)
 

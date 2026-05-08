@@ -70,7 +70,7 @@ func OpenEngineWithOptions(opts EngineOptions) (*Engine, error) {
 		// V2 Lite: different tensor layout
 		w, err = BindWeightsV2(m, cfg.NLayer)
 	} else {
-		w, err = BindWeights(m)
+		w, err = BindWeights(m, cfg.NLayer)
 	}
 	if err != nil {
 		m.Close()
@@ -135,13 +135,10 @@ func (e *Engine) Close() {
 	}
 }
 
-// NewSession creates a new inference session with the given context size.
-func (e *Engine) NewSession(ctxSize int) *Session {
-	ds := NewDecodeStateWithConfig(ctxSize, e.Config)
-	ds.Engine = e
+func (e *Engine) newKVCache(ctxSize int) *KVCache {
 	kv := NewKVCacheN(ctxSize, e.Config.NLayer)
 	if e.Config.NHC == 0 {
-		// V2 Lite: KV cache stores compressed kvA (kvLoraRank + NRot)
+		// V2 Lite: KV cache stores compressed kvA (kv_lora_rank + n_rot)
 		kvLoraRank := 512
 		if v, ok := e.Model.MetaU32("deepseek2.attention.kv_lora_rank"); ok {
 			kvLoraRank = int(v)
@@ -152,6 +149,14 @@ func (e *Engine) NewSession(ctxSize int) *Session {
 			kv.Layer[il].RawKV = make([]float32, kv.Layer[il].CapRaw*rowDim)
 		}
 	}
+	return kv
+}
+
+// NewSession creates a new inference session with the given context size.
+func (e *Engine) NewSession(ctxSize int) *Session {
+	ds := NewDecodeStateWithConfig(ctxSize, e.Config)
+	ds.Engine = e
+	kv := e.newKVCache(ctxSize)
 	return &Session{
 		Engine:  e,
 		KV:      kv,
@@ -181,10 +186,20 @@ func (s *Session) Eval(token int) {
 	embOff := token * embRowBytes
 	embRow := embData[embOff : embOff+embRowBytes]
 
-	// Dequantize embedding → F32 into HC stream 0
+	// Dequantize embedding. V4 HC initializes all streams with the same token
+	// vector (matches ds4.c hc_from_plain_embedding/layer_attn_pre_one).
 	DequantEmbedding(s.Decode.CurHC[:cfg.NEmbd], embRow, embT.Type, cfg.NEmbd)
-	for i := cfg.NEmbd; i < len(s.Decode.CurHC); i++ {
-		s.Decode.CurHC[i] = 0
+	if cfg.NHC > 0 {
+		for h := 1; h < cfg.NHC; h++ {
+			copy(s.Decode.CurHC[h*cfg.NEmbd:(h+1)*cfg.NEmbd], s.Decode.CurHC[:cfg.NEmbd])
+		}
+		for i := cfg.NHC * cfg.NEmbd; i < len(s.Decode.CurHC); i++ {
+			s.Decode.CurHC[i] = 0
+		}
+	} else {
+		for i := cfg.NEmbd; i < len(s.Decode.CurHC); i++ {
+			s.Decode.CurHC[i] = 0
+		}
 	}
 
 	// Run all layers
@@ -350,7 +365,7 @@ func (s *Session) Rewind(pos int) {
 func (s *Session) Invalidate() {
 	s.Pos = 0
 	s.Tokens = s.Tokens[:0]
-	s.KV = NewKVCache(s.CtxSize)
+	s.KV = s.Engine.newKVCache(s.CtxSize)
 }
 
 // SavePayload writes the session KV state to a writer.
@@ -359,7 +374,7 @@ func (s *Session) SavePayload(w io.Writer) error {
 	if err := binary.Write(w, binary.LittleEndian, uint32(0x34565344)); err != nil { // "DSV4"
 		return err
 	}
-	if err := binary.Write(w, binary.LittleEndian, uint32(4)); err != nil { // version
+	if err := binary.Write(w, binary.LittleEndian, uint32(5)); err != nil { // version
 		return err
 	}
 	if err := binary.Write(w, binary.LittleEndian, uint32(s.Pos)); err != nil {
@@ -368,9 +383,12 @@ func (s *Session) SavePayload(w io.Writer) error {
 	if err := binary.Write(w, binary.LittleEndian, uint32(s.CtxSize)); err != nil {
 		return err
 	}
+	if err := binary.Write(w, binary.LittleEndian, uint32(s.Engine.Config.NLayer)); err != nil {
+		return err
+	}
 
 	// Per-layer KV data
-	for il := 0; il < NLayer; il++ {
+	for il := 0; il < s.Engine.Config.NLayer; il++ {
 		lc := &s.KV.Layer[il]
 		if err := binary.Write(w, binary.LittleEndian, uint32(lc.NRaw)); err != nil {
 			return err
@@ -442,7 +460,7 @@ func (s *Session) LoadPayload(r io.Reader) error {
 	if err := binary.Read(r, binary.LittleEndian, &version); err != nil {
 		return err
 	}
-	if version != 1 && version != 2 && version != 3 && version != 4 {
+	if version != 1 && version != 2 && version != 3 && version != 4 && version != 5 {
 		return fmt.Errorf("unsupported session version %d", version)
 	}
 	if err := binary.Read(r, binary.LittleEndian, &pos); err != nil {
@@ -451,14 +469,25 @@ func (s *Session) LoadPayload(r io.Reader) error {
 	if err := binary.Read(r, binary.LittleEndian, &ctxSize); err != nil {
 		return err
 	}
+	layerCount := s.Engine.Config.NLayer
+	if version >= 5 {
+		var nLayers uint32
+		if err := binary.Read(r, binary.LittleEndian, &nLayers); err != nil {
+			return err
+		}
+		layerCount = int(nLayers)
+	}
+	if layerCount != s.Engine.Config.NLayer {
+		return fmt.Errorf("session layer_count=%d does not match model layer_count=%d", layerCount, s.Engine.Config.NLayer)
+	}
 
-	if s.CtxSize != int(ctxSize) || s.KV == nil {
+	if s.CtxSize != int(ctxSize) || s.KV == nil || len(s.KV.Layer) != layerCount {
 		s.CtxSize = int(ctxSize)
-		s.KV = NewKVCache(s.CtxSize)
+		s.KV = s.Engine.newKVCache(s.CtxSize)
 	}
 	s.Pos = int(pos)
 
-	for il := 0; il < NLayer; il++ {
+	for il := 0; il < layerCount; il++ {
 		lc := &s.KV.Layer[il]
 		var nRaw uint32
 		if err := binary.Read(r, binary.LittleEndian, &nRaw); err != nil {

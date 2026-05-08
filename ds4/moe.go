@@ -134,22 +134,8 @@ func layerFFNDecode(
 // routeExperts selects the top-K experts for a token.
 func routeExperts(ds *DecodeState, normed []float32, layer *LayerWeights, il, tokenID, nExperts int) []expertScore {
 	cfg := ds.Cfg()
-	// Check for hash routing (3 hash layers)
-	if layer.FfnGateTid2Eid != nil {
-		nHash := nExperts
-		if nHash > NExpertUsed {
-			nHash = NExpertUsed
-		}
-		table := unsafe.Slice((*int32)(unsafe.Pointer(&layer.FfnGateTid2Eid[0])), NExpertUsed*NVocab)
-		top := ds.RouteScores[:nHash]
-		w := float32(1.0 / float32(nHash))
-		for k := 0; k < nHash; k++ {
-			top[k] = expertScore{idx: int(table[k*NVocab+tokenID]), score: w}
-		}
-		return top
-	}
-
-	// Standard routing: gate logits from normed activation
+	// Router probabilities are sqrt(softplus(logit)); selected expert weights
+	// are normalized only after top-k/hash selection (matches ds4.c).
 	nExp := cfg.NExpert
 	logits := ds.RouteLogits[:nExp]
 
@@ -174,44 +160,69 @@ func routeExperts(ds *DecodeState, normed []float32, layer *LayerWeights, il, to
 		}
 	}
 
-	// Add bias
+	// Reuse logits as unbiased router probabilities after projection.
+	probs := logits
+	for e := 0; e < nExp; e++ {
+		probs[e] = float32(math.Sqrt(float64(softplusStable(logits[e]))))
+	}
+
+	// Hash routing (early V4 layers): table is [token, NExpertUsed] in memory.
+	if layer.FfnGateTid2Eid != nil {
+		nHash := nExperts
+		if nHash > cfg.NExpertUsed {
+			nHash = cfg.NExpertUsed
+		}
+		table := unsafe.Slice((*int32)(unsafe.Pointer(&layer.FfnGateTid2Eid[0])), cfg.NExpertUsed*cfg.NVocab)
+		top := ds.RouteScores[:nHash]
+		sum := float32(0)
+		for k := 0; k < nHash; k++ {
+			eid := int(table[tokenID*cfg.NExpertUsed+k])
+			w := probs[eid]
+			top[k] = expertScore{idx: eid, score: w}
+			sum += w
+		}
+		if sum < 6.103515625e-5 {
+			sum = 6.103515625e-5
+		}
+		for k := 0; k < nHash; k++ {
+			top[k].score = top[k].score / sum * cfg.ExpertWeightScale
+		}
+		return top
+	}
+
+	// Later routing: selection is based on probs + optional bias, but final
+	// expert weights use unbiased probs for the selected experts.
+	selection := make([]float32, nExp)
+	for e := 0; e < nExp; e++ {
+		selection[e] = probs[e]
+	}
 	if layer.FfnExpProbsB != nil {
 		bias := tensorF32Unsafe(layer.FfnExpProbsB)
 		for e := 0; e < nExp; e++ {
-			logits[e] += bias[e]
+			selection[e] += bias[e]
 		}
 	}
 
-	// Softmax
-	softmax(logits)
-
-	// Scale
-	for e := range logits[:nExp] {
-		logits[e] *= cfg.ExpertWeightScale
-	}
-
-	// Top-K selection
 	scores := ds.RouteScores[:nExp]
 	for i := range scores[:nExp] {
-		scores[i] = expertScore{idx: i, score: logits[i]}
+		scores[i] = expertScore{idx: i, score: selection[i]}
 	}
-	sort.Slice(scores, func(i, j int) bool {
-		return scores[i].score > scores[j].score
-	})
+	sort.Slice(scores, func(i, j int) bool { return scores[i].score > scores[j].score })
 
-	// Normalize top-K weights
 	topK := scores[:nExperts]
 	sum := float32(0)
-	for _, s := range topK {
-		sum += s.score
+	for i := range topK {
+		eid := topK[i].idx
+		w := probs[eid]
+		topK[i].score = w
+		sum += w
 	}
-	if sum > 0 {
-		inv := 1.0 / sum
-		for i := range topK {
-			topK[i].score *= inv
-		}
+	if sum < 6.103515625e-5 {
+		sum = 6.103515625e-5
 	}
-
+	for i := range topK {
+		topK[i].score = topK[i].score / sum * cfg.ExpertWeightScale
+	}
 	return topK
 }
 
@@ -302,8 +313,25 @@ func expertForwardFast(out []float32, xQ8K, midQ []byte, cfg *ModelConfig,
 		}
 	}
 
-	// SwiGLU
+	// DeepSeek V4 clamps routed expert gate/up before SwiGLU, then applies
+	// router weight before Q8_K quantization (matches ds4.c).
+	limit := cfg.SwiGLUClampExp
+	if limit > 1.0e-6 {
+		for i := 0; i < ffnDim; i++ {
+			if gate[i] > limit {
+				gate[i] = limit
+			}
+			if up[i] > limit {
+				up[i] = limit
+			} else if up[i] < -limit {
+				up[i] = -limit
+			}
+		}
+	}
 	swiGLU(gate, gate, up)
+	for i := 0; i < ffnDim; i++ {
+		gate[i] *= weight
+	}
 
 	// Quantize hidden
 	quantizeQ8KPadded(gate[:ffnDim], midQ)
@@ -311,11 +339,11 @@ func expertForwardFast(out []float32, xQ8K, midQ []byte, cfg *ModelConfig,
 	// Q2_K down projection
 	for o := 0; o < cfg.NEmbd; o++ {
 		if ed.downIsIQ4NL {
-			out[o] += weight * VecDotIQ4NLQ8K(ffnDim, downBase[o*downRowBytes:(o+1)*downRowBytes], midQ)
+			out[o] += VecDotIQ4NLQ8K(ffnDim, downBase[o*downRowBytes:(o+1)*downRowBytes], midQ)
 		} else if ed.downIsQ5K {
-			out[o] += weight * VecDotQ5KQ8K(ffnDim, downBase[o*downRowBytes:(o+1)*downRowBytes], midQ)
+			out[o] += VecDotQ5KQ8K(ffnDim, downBase[o*downRowBytes:(o+1)*downRowBytes], midQ)
 		} else {
-			out[o] += weight * VecDotQ2KQ8K(ffnDim, downBase[o*downRowBytes:(o+1)*downRowBytes], midQ)
+			out[o] += VecDotQ2KQ8K(ffnDim, downBase[o*downRowBytes:(o+1)*downRowBytes], midQ)
 		}
 	}
 }
@@ -381,16 +409,24 @@ func expertForward(ds *DecodeState, layer *LayerWeights, expertIdx int, weight f
 		up[o] = VecDotIQ2XXSQ8K(cfg.NEmbd, upRow, ds.RoutedXQ)
 	}
 
-	// SwiGLU: dst = silu(gate) * up
-	swiGLU(gate, gate, up)
-
-	// Clamp
-	for i := range gate {
-		if gate[i] > SwiGLUClampExp {
-			gate[i] = SwiGLUClampExp
-		} else if gate[i] < -SwiGLUClampExp {
-			gate[i] = -SwiGLUClampExp
+	limit := cfg.SwiGLUClampExp
+	if limit > 1.0e-6 {
+		for i := 0; i < ffnDim; i++ {
+			if gate[i] > limit {
+				gate[i] = limit
+			}
+			if up[i] > limit {
+				up[i] = limit
+			} else if up[i] < -limit {
+				up[i] = -limit
+			}
 		}
+	}
+
+	// SwiGLU and apply router weight before Q8_K quantization.
+	swiGLU(gate, gate, up)
+	for i := 0; i < ffnDim; i++ {
+		gate[i] *= weight
 	}
 
 	// Quantize hidden to Q8_K for down projection
@@ -400,7 +436,7 @@ func expertForward(ds *DecodeState, layer *LayerWeights, expertIdx int, weight f
 	// Down projection: Q2_K [NEmbd, NFFExp] × Q8_K hidden
 	for o := 0; o < cfg.NEmbd; o++ {
 		downRow := downBase[o*downRowBytes : (o+1)*downRowBytes]
-		ds.RoutedOut[o] += weight * VecDotQ2KQ8K(cfg.NFFExp, downRow, midQ)
+		ds.RoutedOut[o] += VecDotQ2KQ8K(ffnDim, downRow, midQ)
 	}
 }
 
@@ -490,7 +526,7 @@ func outputLogits(ds *DecodeState, logits []float32, hcState []float32, w *Weigh
 		hcWeights := ds.OutHCWeights
 		for j := 0; j < NHC; j++ {
 			row := hcFnU16[j*hcDim : (j+1)*hcDim]
-			hcWeights[j] = sigmoid(hcScale[0]*DotF16(row, flat) + hcBase[j])
+			hcWeights[j] = sigmoid(hcScale[0]*DotF16(row, flat)+hcBase[j]) + HCEps
 		}
 		collapsed = ds.OutCollapsed
 		for i := range collapsed {

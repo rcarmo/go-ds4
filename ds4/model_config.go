@@ -103,6 +103,12 @@ func DetectModelConfig(m *GGUFModel) *ModelConfig {
 		if v, ok := m.MetaU32("deepseek2.num_attention_heads"); ok {
 			cfg.NHead = int(v)
 		}
+		if v, ok := m.MetaU32("deepseek2.attention.head_count_kv"); ok {
+			cfg.NHeadKV = int(v)
+		}
+		if v, ok := m.MetaU32("deepseek2.rope.dimension_count"); ok {
+			cfg.NRot = int(v)
+		}
 		if v, ok := m.MetaU32("deepseek2.attention.key_length"); ok {
 			cfg.NHeadDim = int(v)
 		}
@@ -119,6 +125,18 @@ func DetectModelConfig(m *GGUFModel) *ModelConfig {
 			cfg.ExpertWeightScale = v
 		} else if v, ok := m.MetaF32("deepseek4.expert_weights_scale"); ok {
 			cfg.ExpertWeightScale = v
+		}
+		if v, ok := m.MetaF32("deepseek2.rope.freq_base"); ok {
+			cfg.RoPEFreqBase = v
+		}
+		if v, ok := m.MetaF32("deepseek2.rope.scaling.factor"); ok {
+			cfg.RoPEScaleFactor = v
+		}
+		if v, ok := m.MetaF32("deepseek2.rope.scaling.yarn_beta_fast"); ok {
+			cfg.RoPEYarnBetaFast = v
+		}
+		if v, ok := m.MetaF32("deepseek2.rope.scaling.yarn_beta_slow"); ok {
+			cfg.RoPEYarnBetaSlow = v
 		}
 		if v, ok := m.MetaU32("deepseek2.vocab_size"); ok {
 			cfg.NVocab = int(v)

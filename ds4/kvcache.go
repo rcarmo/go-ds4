@@ -30,7 +30,7 @@ type LayerCache struct {
 
 // KVCache holds the full KV cache across all layers.
 type KVCache struct {
-	Layer [NLayer]LayerCache
+	Layer []LayerCache
 }
 
 // NewKVCache allocates a KV cache for the given context size.
@@ -39,7 +39,7 @@ func NewKVCache(ctxSize int) *KVCache {
 }
 
 func NewKVCacheN(ctxSize, nLayers int) *KVCache {
-	kv := &KVCache{}
+	kv := &KVCache{Layer: make([]LayerCache, nLayers)}
 	for il := 0; il < nLayers; il++ {
 		lc := &kv.Layer[il]
 		lc.RowDim = NHeadDim

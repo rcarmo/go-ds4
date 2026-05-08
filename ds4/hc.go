@@ -133,7 +133,7 @@ func hcPreFromState(
 
 // hcPostOne injects a sublayer output into the HC state and mixes streams.
 //
-//	outHC[s] = post[s] * blockOut + Σ_t (comb[s*NHC+t] * residualHC[t])
+//	outHC[dst] = post[dst] * blockOut + Σ_src (comb[dst + src*NHC] * residualHC[src])
 func hcPostOne(
 	outHC []float32, // [NHC, NEmbd] — updated HC state
 	blockOut []float32, // [NEmbd] — sublayer output
@@ -146,7 +146,8 @@ func hcPostOne(
 		for i := 0; i < NEmbd; i++ {
 			val := post[s] * blockOut[i]
 			for t := 0; t < NHC; t++ {
-				val += comb[s*NHC+t] * residualHC[t*NEmbd+i]
+				// C reference addresses HC combine as [dst, src] using comb[dst + src*NHC].
+				val += comb[s+t*NHC] * residualHC[t*NEmbd+i]
 			}
 			outHC[off+i] = val
 		}
