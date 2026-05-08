@@ -58,13 +58,11 @@ func (e *Engine) uploadCUDAWeights(ce *CUDAEngine) (int, int64) {
 	for il := 0; il < NLayer; il++ {
 		l := &e.Weights.Layer[il]
 		p := fmt.Sprintf("blk.%d.", il)
-		// Only upload tensors where outDim >= 2048 (GPU crossover)
+		// Only the high-value Q8_0 projections (~2 GB total, fits in 12 GB VRAM)
 		uploads = append(uploads,
-			upload{p + "attn_q_b.weight", l.AttnQB, NHead * NHeadDim},   // 1024→32768
-			upload{p + "attn_output_b.weight", l.AttnOutputB, NEmbd},    // 1024→4096
-			upload{p + "ffn_gate_shexp.weight", l.FfnGateShexp, NFFExp}, // 4096→2048
-			upload{p + "ffn_up_shexp.weight", l.FfnUpShexp, NFFExp},     // 4096→2048
-			upload{p + "ffn_down_shexp.weight", l.FfnDownShexp, NEmbd},  // 2048→4096
+			upload{p + "attn_q_b.weight", l.AttnQB, NHead * NHeadDim},  // 1024→32768 (34 MB)
+			upload{p + "attn_output_b.weight", l.AttnOutputB, NEmbd},   // 1024→4096 (34 MB)
+			upload{p + "ffn_down_shexp.weight", l.FfnDownShexp, NEmbd}, // 2048→4096 (8.5 MB)
 		)
 	}
 
@@ -120,8 +118,8 @@ func (ce *CUDAEngine) matvecQ8_0(out []float32, tensorName string, x []float32, 
 	if !ce.ready {
 		return false
 	}
-	// Only GPU-dispatch when output is large enough to overcome PCIe overhead
-	if outDim < 2048 {
+	// Only GPU-dispatch for large outputs where kernel speedup exceeds PCIe overhead
+	if outDim < 4096 {
 		return false
 	}
 	wtPtr, ok := ce.weightPtrs[tensorName]
