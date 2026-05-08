@@ -245,13 +245,19 @@ func matvecF16(out []float32, wF16 []byte, x []float32, inDim, outDim int) {
 	})
 }
 
-// quantizeQ8_0Activation quantizes activation to per-block int8 with f32 scales and f32 sums.
+// quantizeQ8_0Activation quantizes activation to per-block int8 with f32 scales.
+// Matches ds4.c quantize_q8_0_activation (32-wide blocks, lrintf-style
+// round-to-nearest-even under the default FP environment, clamp to int8).
 func quantizeQ8_0Activation(x []float32, xq []int8, xscale []float32, xsum []float32) {
-	nBlocks := len(x) / 32
+	nBlocks := (len(x) + 31) / 32
 	for b := 0; b < nBlocks; b++ {
 		off := b * 32
+		bn := len(x) - off
+		if bn > 32 {
+			bn = 32
+		}
 		amax := float32(0)
-		for i := 0; i < 32; i++ {
+		for i := 0; i < bn; i++ {
 			v := x[off+i]
 			if v < 0 {
 				v = -v
@@ -260,40 +266,55 @@ func quantizeQ8_0Activation(x []float32, xq []int8, xscale []float32, xsum []flo
 				amax = v
 			}
 		}
-		if amax == 0 {
-			xscale[b] = 0
-			xsum[b] = 0
-			for i := 0; i < 32; i++ {
-				xq[off+i] = 0
-			}
-			continue
+		d := amax / 127.0
+		xscale[b] = d
+		id := float32(0)
+		if d != 0 {
+			id = 1.0 / d
 		}
-		xscale[b] = amax / 127.0
-		inv := 127.0 / amax
 		sum := int32(0)
-		for i := 0; i < 32; i++ {
-			v := x[off+i] * inv
-			var q int8
-			if v >= 0 {
-				q = int8(v + 0.5)
-			} else {
-				q = int8(v - 0.5)
+		for i := 0; i < bn; i++ {
+			v := int(math.RoundToEven(float64(x[off+i] * id)))
+			if v > 127 {
+				v = 127
+			} else if v < -128 {
+				v = -128
 			}
-			xq[off+i] = q
-			sum += int32(q)
+			xq[off+i] = int8(v)
+			sum += int32(int8(v))
 		}
-		xsum[b] = float32(sum)
+		for i := bn; i < 32 && off+i < len(xq); i++ {
+			xq[off+i] = 0
+		}
+		if len(xsum) > b {
+			xsum[b] = float32(sum)
+		}
 	}
+}
+
+func dotQ8_0Prequant(row []byte, xq []int8, xscale []float32, xsum []float32, nBlocks int) float32 {
+	return simd.DotQ8_0PrequantI8(
+		unsafe.Pointer(&row[0]),
+		unsafe.Pointer(&xq[0]),
+		unsafe.Pointer(&xscale[0]),
+		unsafe.Pointer(&xsum[0]),
+		nBlocks,
+	)
 }
 
 // matvecQ8_0 computes out[outDim] = Q8_0_weight[outDim, inDim] · x[inDim].
 // Uses SIMD DotQ8_0F32 (VCVTPH2PS+VPMOVSXBD+VCVTDQ2PS+FMA) directly per row.
 func matvecQ8_0(out []float32, wQ8 []byte, x []float32, inDim, outDim int) {
-	rowBytes := (inDim / 32) * BlockQ8_0Size
+	nBlocks := (inDim + 31) / 32
+	rowBytes := nBlocks * BlockQ8_0Size
+	xq := make([]int8, nBlocks*32)
+	xscale := make([]float32, nBlocks)
+	xsum := make([]float32, nBlocks)
+	quantizeQ8_0Activation(x[:inDim], xq, xscale, xsum)
 	parallelFor(outDim, func(start, end int) {
 		for o := start; o < end; o++ {
 			row := wQ8[o*rowBytes : (o+1)*rowBytes]
-			out[o] = DotQ8_0F32(row, x, inDim)
+			out[o] = dotQ8_0Prequant(row, xq, xscale, xsum, nBlocks)
 		}
 	})
 }
@@ -321,15 +342,33 @@ func matvecQ8_0GPULayer(out []float32, wQ8 []byte, x []float32, inDim, outDim in
 
 // matvecQ8_0Grouped computes grouped output projection.
 func matvecQ8_0Grouped(out []float32, wQ8 []byte, x []float32, inDim, outDim, groupSize int) {
-	rowBytes := (inDim / 32) * BlockQ8_0Size
-	nGroups := outDim / groupSize
-	parallelFor(nGroups, func(gStart, gEnd int) {
-		for g := gStart; g < gEnd; g++ {
-			for j := 0; j < groupSize; j++ {
-				o := g*groupSize + j
-				row := wQ8[o*rowBytes : (o+1)*rowBytes]
-				out[o] = DotQ8_0F32(row, x, inDim)
-			}
+	// C parity: attn_output_a is laid out as nGroups contiguous rank-row
+	// matrices, each consuming that group's slice of heads. inDim is the total
+	// head width; outDim is the per-group rank; groupSize is nGroups.
+	nGroups := groupSize
+	groupDim := inDim / nGroups
+	rank := outDim
+	nBlocks := (groupDim + 31) / 32
+	rowBytes := nBlocks * BlockQ8_0Size
+	xq := make([]int8, nGroups*nBlocks*32)
+	xscale := make([]float32, nGroups*nBlocks)
+	xsum := make([]float32, nGroups*nBlocks)
+	for g := 0; g < nGroups; g++ {
+		quantizeQ8_0Activation(
+			x[g*groupDim:(g+1)*groupDim],
+			xq[g*nBlocks*32:(g+1)*nBlocks*32],
+			xscale[g*nBlocks:(g+1)*nBlocks],
+			xsum[g*nBlocks:(g+1)*nBlocks],
+		)
+	}
+	parallelFor(nGroups*rank, func(start, end int) {
+		for idx := start; idx < end; idx++ {
+			g := idx / rank
+			gxq := xq[g*nBlocks*32 : (g+1)*nBlocks*32]
+			gscale := xscale[g*nBlocks : (g+1)*nBlocks]
+			gsum := xsum[g*nBlocks : (g+1)*nBlocks]
+			row := wQ8[idx*rowBytes : (idx+1)*rowBytes]
+			out[idx] = dotQ8_0Prequant(row, gxq, gscale, gsum, nBlocks)
 		}
 	})
 }

@@ -132,7 +132,7 @@ func (e *Engine) uploadCUDAWeights(ce *CUDAEngine) (int, int64) {
 			upload{p + "attn_q_a.weight", l.AttnQA, NLoraQ},
 			upload{p + "attn_q_b.weight", l.AttnQB, NHead * NHeadDim},
 			upload{p + "attn_kv.weight", l.AttnKV, NHeadDim},
-			upload{p + "attn_output_a.weight", l.AttnOutputA, NLoraO},
+			upload{p + "attn_output_a.weight", l.AttnOutputA, NLoraO * NOutGroup},
 			upload{p + "attn_output_b.weight", l.AttnOutputB, NEmbd},
 			upload{p + "ffn_gate_shexp.weight", l.FfnGateShexp, NFFExp},
 			upload{p + "ffn_up_shexp.weight", l.FfnUpShexp, NFFExp},

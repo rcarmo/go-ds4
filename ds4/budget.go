@@ -38,30 +38,30 @@ type MemorySummary struct {
 // EstimateMemory returns the model's memory breakdown.
 func EstimateMemory(ctxSize int) MemorySummary {
 	// These are computed from the model constants
-	bq8_0 := 36   // Q8_0 block: 36 bytes per 32 elements
-	biq2 := 66    // IQ2_XXS: 66 bytes per 256 elements
-	bq2k := 84    // Q2_K: 84 bytes per 256 elements
+	bq8_0 := 36 // Q8_0 block: 36 bytes per 32 elements
+	biq2 := 66  // IQ2_XXS: 66 bytes per 256 elements
+	bq2k := 84  // Q2_K: 84 bytes per 256 elements
 
 	perLayerNonExpert := float64(0)
 	// Attention projections (Q8_0)
-	perLayerNonExpert += float64(NEmbd*NLoraQ*bq8_0) / 32           // attn_q_a
-	perLayerNonExpert += float64(NLoraQ*NHead*NHeadDim*bq8_0) / 32  // attn_q_b
-	perLayerNonExpert += float64(NEmbd*NHeadDim*bq8_0) / 32         // attn_kv
-	perLayerNonExpert += float64(NHead*NHeadDim*NLoraO*bq8_0) / 32  // attn_out_a
-	perLayerNonExpert += float64(NLoraO*NEmbd*bq8_0) / 32           // attn_out_b
+	perLayerNonExpert += float64(NEmbd*NLoraQ*bq8_0) / 32             // attn_q_a
+	perLayerNonExpert += float64(NLoraQ*NHead*NHeadDim*bq8_0) / 32    // attn_q_b
+	perLayerNonExpert += float64(NEmbd*NHeadDim*bq8_0) / 32           // attn_kv
+	perLayerNonExpert += float64(NHead*NHeadDim*NLoraO*bq8_0) / 32    // attn_out_a grouped rows
+	perLayerNonExpert += float64((NLoraO*NOutGroup)*NEmbd*bq8_0) / 32 // attn_out_b
 	// Shared expert (Q8_0)
-	perLayerNonExpert += float64(NFFExp*NEmbd*bq8_0) / 32 * 3       // gate+up+down
+	perLayerNonExpert += float64(NFFExp*NEmbd*bq8_0) / 32 * 3 // gate+up+down
 	// HC projections (F16) + norms + routing
 	perLayerNonExpert += float64(NHC*NEmbd*(2*NHC+NHC*NHC)) * 2 * 2 // 2 HC blocks × F16
-	perLayerNonExpert += float64(NEmbd*NExpert) * 2                  // routing (F16)
+	perLayerNonExpert += float64(NEmbd*NExpert) * 2                 // routing (F16)
 
 	perLayerExpert := float64(0)
-	perLayerExpert += float64(NFFExp*NExpert*NEmbd*biq2) / QK_K * 2  // gate+up
-	perLayerExpert += float64(NEmbd*NExpert*NFFExp*bq2k) / QK_K      // down
+	perLayerExpert += float64(NFFExp*NExpert*NEmbd*biq2) / QK_K * 2 // gate+up
+	perLayerExpert += float64(NEmbd*NExpert*NFFExp*bq2k) / QK_K     // down
 
 	totalNonExpert := float64(NLayer)*perLayerNonExpert +
-		float64(NVocab*NEmbd)*2 +                    // token_embd (F16)
-		float64(NVocab*NEmbd*bq8_0)/32               // output (Q8_0)
+		float64(NVocab*NEmbd)*2 + // token_embd (F16)
+		float64(NVocab*NEmbd*bq8_0)/32 // output (Q8_0)
 
 	totalExpert := float64(NLayer) * perLayerExpert
 	activeSet := totalNonExpert + float64(NLayer)*float64(NExpertUsed)/float64(NExpert)*perLayerExpert

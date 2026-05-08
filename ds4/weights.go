@@ -22,8 +22,8 @@ type LayerWeights struct {
 	AttnSinks   []byte // attention sink vectors
 
 	// MLA: output projection (grouped LoRA for V4, direct for V2)
-	AttnOutputA []byte // Q8_0 [NHead*NValueDim, NLoraO] (V4 only)
-	AttnOutputB []byte // Q8_0 [NLoraO, NEmbd] grouped (V4 only)
+	AttnOutputA []byte // Q8_0 [NHead*NValueDim/NOutGroup, NLoraO*NOutGroup] grouped (V4 only)
+	AttnOutputB []byte // Q8_0 [NLoraO*NOutGroup, NEmbd] (V4 only)
 	AttnOutput  []byte // direct output projection (V2 only)
 
 	// V2 Lite: split KV projection

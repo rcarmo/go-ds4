@@ -24,7 +24,7 @@ type DecodeState struct {
 	AttnOut    []float32 // [NEmbd] after output projection
 	AttnScore  []float32 // attention scores (sized per layer)
 	KVCacheRow []float32 // [NHeadDim] scratch row for cache quantization
-	TmpLoRA    []float32 // [NLoraO] scratch for output grouped LoRA
+	TmpLoRA    []float32 // [NOutGroup * NLoraO] scratch for output grouped LoRA
 
 	// Compressor/indexer scratch (decode)
 	CompKVCur       []float32 // [2*NHeadDim]
@@ -84,6 +84,7 @@ func NewDecodeStateWithConfig(ctxSize int, cfg *ModelConfig) *DecodeState {
 	nHeadDim := NHeadDim
 	nLoraQ := NLoraQ
 	nLoraO := NLoraO
+	nOutGroup := NOutGroup
 	nFFExp := NFFExp
 	nExpert := NExpert
 	nExpertUsed := NExpertUsed
@@ -96,6 +97,7 @@ func NewDecodeStateWithConfig(ctxSize int, cfg *ModelConfig) *DecodeState {
 		nHeadDim = cfg.NHeadDim
 		nLoraQ = cfg.NLoraQ
 		nLoraO = cfg.NLoraO
+		nOutGroup = cfg.NOutGroup
 		nFFExp = cfg.NFFExp
 		nExpert = cfg.NExpert
 		nExpertUsed = cfg.NExpertUsed
@@ -136,7 +138,7 @@ func NewDecodeStateWithConfig(ctxSize int, cfg *ModelConfig) *DecodeState {
 		AttnOut:         make([]float32, nEmbd),
 		AttnScore:       make([]float32, maxScores),
 		KVCacheRow:      make([]float32, nHeadDim),
-		TmpLoRA:         make([]float32, max(nLoraO, 1)),
+		TmpLoRA:         make([]float32, max(nLoraO*nOutGroup, 1)),
 		CompKVCur:       make([]float32, 2*nHeadDim),
 		CompScoreCur:    make([]float32, 2*nHeadDim),
 		CompPooled:      make([]float32, nHeadDim),
@@ -396,7 +398,7 @@ func layerAttnDecode(
 	} else {
 		// V4: grouped LoRA output
 		matvecQ8_0Grouped(ds.TmpLoRA, layer.AttnOutputA, ds.Heads, NHead*NValueDim, NLoraO, NOutGroup)
-		matvecQ8_0GPULayer(ds.AttnOut, layer.AttnOutputB, ds.TmpLoRA, NLoraO, NEmbd, ds, "attn_output_b.weight")
+		matvecQ8_0GPULayer(ds.AttnOut, layer.AttnOutputB, ds.TmpLoRA, NLoraO*NOutGroup, NEmbd, ds, "attn_output_b.weight")
 	}
 }
 
