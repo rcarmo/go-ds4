@@ -154,54 +154,82 @@ func init() {
 }
 
 // fp8KVQuantizeInplace quantizes the non-RoPE portion of a KV row to FP8 in-place.
-// The RoPE tail (last nRot floats) is left as FP32.
+// Matches ds4.c dsv4_fp8_kv_quantize_row_inplace_cpu exactly: 64-wide
+// per-block amax, power-of-two scale, nearest-even E4M3FN round trip.
 func fp8KVQuantizeInplace(x []float32, headDim, nRot int) {
 	nopeLen := headDim - nRot
-	// Find absmax of NoPE portion
-	amax := float32(0)
-	for i := 0; i < nopeLen; i++ {
-		v := x[i]
-		if v < 0 {
-			v = -v
+	for off := 0; off < nopeLen; off += 64 {
+		amax := float32(0)
+		for i := 0; i < 64 && off+i < nopeLen; i++ {
+			av := x[off+i]
+			if av < 0 {
+				av = -av
+			}
+			if av > amax {
+				amax = av
+			}
 		}
-		if v > amax {
-			amax = v
+		if amax < 1.0e-4 {
+			amax = 1.0e-4
+		}
+		scale := float32(math.Ldexp(1.0, int(math.Ceil(math.Log2(float64(amax/448.0))))))
+		invScale := 1.0 / scale
+		for i := 0; i < 64 && off+i < nopeLen; i++ {
+			v := x[off+i] * invScale
+			if v > 448 {
+				v = 448
+			} else if v < -448 {
+				v = -448
+			}
+			x[off+i] = e4m3fnDequant(v) * scale
 		}
 	}
-	if amax == 0 {
-		return
-	}
-	// Scale to fit in E4M3FN range (max representable: 448)
-	scale := amax / 448.0
-	invScale := 1.0 / scale
+}
 
-	// Quantize each value: find nearest E4M3FN, then dequantize × scale
-	for i := 0; i < nopeLen; i++ {
-		v := x[i] * invScale
-		// Binary search for nearest E4M3FN value
-		ax := v
-		if ax < 0 {
-			ax = -ax
-		}
-		signBit := 0
-		if v < 0 {
-			signBit = 128
-		}
-		// Simple linear search (256 entries, fast enough)
-		best := 0
-		bestDiff := float32(1e30)
-		for j := 0; j < 128; j++ {
-			diff := e4m3fnTable[j] - ax
-			if diff < 0 {
-				diff = -diff
-			}
-			if diff < bestDiff {
-				bestDiff = diff
-				best = j
-			}
-		}
-		x[i] = e4m3fnTable[signBit|best] * scale
+func e4m3fnValue(i int) float32 {
+	expScale := [16]float32{0, 0.015625, 0.03125, 0.0625, 0.125, 0.25, 0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256}
+	exp := (i >> 3) & 0x0f
+	mant := i & 0x07
+	if exp == 0 {
+		return float32(mant) * 0.001953125
 	}
+	return (1.0 + float32(mant)*0.125) * expScale[exp]
+}
+
+func e4m3fnDequant(x float32) float32 {
+	sign := float32(1)
+	ax := x
+	if ax < 0 {
+		sign = -1
+		ax = -ax
+	}
+	if ax > 448 {
+		ax = 448
+	}
+	lo, hi := 0, 126
+	for lo < hi {
+		mid := (lo + hi + 1) >> 1
+		if e4m3fnValue(mid) <= ax {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	best := lo
+	if best < 126 {
+		bestDiff := ax - e4m3fnValue(best)
+		if bestDiff < 0 {
+			bestDiff = -bestDiff
+		}
+		nextDiff := ax - e4m3fnValue(best+1)
+		if nextDiff < 0 {
+			nextDiff = -nextDiff
+		}
+		if nextDiff < bestDiff || (nextDiff == bestDiff && ((best+1)&1) == 0 && (best&1) != 0) {
+			best++
+		}
+	}
+	return sign * e4m3fnValue(best)
 }
 
 // matvecF16 computes out[outDim] = F16_weight[outDim, inDim] · x[inDim].
