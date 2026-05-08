@@ -34,6 +34,10 @@ type DecodeState struct {
 	IndexCompScore  []float32 // [2*NIndexerHeadDim]
 	IndexCompPooled []float32 // [NIndexerHeadDim]
 	IndexCompOut    []float32 // [NIndexerHeadDim]
+	IndexQ          []float32 // [NIndexerHead*NIndexerHeadDim]
+	IndexWeights    []float32 // [NIndexerHead]
+	IndexScores     []float32 // [ctx/4+2]
+	IndexAllowed    []bool    // [ctx/4+2]
 
 	// FFN / MoE
 	FfnNormed  []float32 // [NEmbd]
@@ -72,6 +76,10 @@ func NewDecodeState(ctxSize int) *DecodeState {
 		IndexCompScore:  make([]float32, 2*NIndexerHeadDim),
 		IndexCompPooled: make([]float32, NIndexerHeadDim),
 		IndexCompOut:    make([]float32, NIndexerHeadDim),
+		IndexQ:          make([]float32, NIndexerHead*NIndexerHeadDim),
+		IndexWeights:    make([]float32, NIndexerHead),
+		IndexScores:     make([]float32, ctxSize/4+2),
+		IndexAllowed:    make([]bool, ctxSize/4+2),
 		FfnNormed:  make([]float32, NEmbd),
 		RoutedXQ:   make([]byte, (NEmbd/QK_K)*BlockQ8KSize),
 		RoutedMidQ: make([]byte, NExpertUsed*(NFFExp/QK_K)*BlockQ8KSize),
@@ -139,6 +147,7 @@ func layerAttnDecode(
 
 	// 4. Compressor/indexer update
 	ratio := cache.CompressRatio
+	var compAllowed []bool
 	if ratio > 0 && len(layer.CompressorKV) != 0 {
 		if compressorDecodeOne(ds.CompOut, ds.CompKVCur, ds.CompScoreCur, ds.CompPooled,
 			layer.CompressorKV, layer.CompressorGate, layer.CompressorAPE, layer.CompressorNorm,
@@ -153,6 +162,7 @@ func layerAttnDecode(
 				NIndexerHeadDim, ratio, il, pos, false) {
 				cache.PushIndexCompKV(ds.IndexCompOut)
 			}
+			compAllowed = indexerAllowedDecodeOne(ds, layer, ds.AttnNormed, ds.QRNorm, cache.IndexCompKV, cache.NIndexComp, il, pos)
 		}
 	}
 
@@ -183,6 +193,10 @@ func layerAttnDecode(
 			}
 		}
 		for t := 0; t < nComp; t++ {
+			if compAllowed != nil && !compAllowed[t] {
+				ds.AttnScore[nRaw+t] = -1e30
+				continue
+			}
 			kvRow := cache.CompKV[t*NHeadDim : (t+1)*NHeadDim]
 			s := simd.Sdot(qHead, kvRow) * scale
 			ds.AttnScore[nRaw+t] = s
@@ -204,6 +218,9 @@ func layerAttnDecode(
 			simd.Saxpy(w, kvRow, headOut)
 		}
 		for t := 0; t < nComp; t++ {
+			if ds.AttnScore[nRaw+t] <= -1e29 {
+				continue
+			}
 			w := float32(math.Exp(float64(ds.AttnScore[nRaw+t] - maxScore)))
 			denom += w
 			kvRow := cache.CompKV[t*NHeadDim : (t+1)*NHeadDim]

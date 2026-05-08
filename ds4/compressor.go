@@ -1,6 +1,10 @@
 package ds4
 
-import "math"
+import (
+	"math"
+
+	"github.com/rcarmo/go-ds4/ds4/simd"
+)
 
 // compressorDecodeOne updates compressor rolling state for one token and
 // emits a compressed KV row when reaching the compression boundary.
@@ -21,7 +25,6 @@ func compressorDecodeOne(
 		coff = 2
 	}
 	width := coff * headDim
-	rows := coff * compressRatio
 	posMod := pos % compressRatio
 	row := posMod
 	if compressRatio == 4 {
@@ -77,7 +80,6 @@ func compressorDecodeOne(
 			copy(stateScore[(compressRatio+r)*width:(compressRatio+r+1)*width], stateScore[r*width:(r+1)*width])
 		}
 	}
-	_ = rows
 	return true
 }
 
@@ -141,4 +143,75 @@ func compressorPoolDecodeState(out, stateKV, stateScore []float32, headDim, comp
 			out[j] = 0
 		}
 	}
+}
+
+// indexerAllowedDecodeOne selects which compressed rows are visible for ratio-4
+// layers, using the indexer auxiliary projection. Mirrors ds4.c behavior.
+func indexerAllowedDecodeOne(
+	ds *DecodeState,
+	layer *LayerWeights,
+	cur []float32,
+	qrNorm []float32,
+	indexComp []float32,
+	nComp, il, pos int,
+) []bool {
+	if nComp == 0 || len(layer.IndexerQB) == 0 || len(layer.IndexerProj) == 0 {
+		return nil
+	}
+	if nComp > len(ds.IndexAllowed) {
+		nComp = len(ds.IndexAllowed)
+	}
+	allowed := ds.IndexAllowed[:nComp]
+	for i := range allowed {
+		allowed[i] = false
+	}
+	topK := NIndexerTopK
+	if topK > nComp {
+		topK = nComp
+	}
+	if topK == nComp {
+		for i := range allowed {
+			allowed[i] = true
+		}
+		return allowed
+	}
+
+	matvecQ8_0(ds.IndexQ, layer.IndexerQB, qrNorm, NLoraQ, NIndexerHead*NIndexerHeadDim)
+	ropeYaRNTailInplace(ds.IndexQ, pos, NIndexerHead, NIndexerHeadDim, NRot, layerRoPEFreqBase(il), layerRoPEFreqScale(il), false)
+
+	matvecQ8_0(ds.IndexWeights, layer.IndexerProj, cur, NEmbd, NIndexerHead)
+	scale := float32(1.0 / math.Sqrt(float64(NIndexerHeadDim*NIndexerHead)))
+	for h := 0; h < NIndexerHead; h++ {
+		ds.IndexWeights[h] *= scale
+	}
+
+	scores := ds.IndexScores[:nComp]
+	for c := 0; c < nComp; c++ {
+		kv := indexComp[c*NIndexerHeadDim : (c+1)*NIndexerHeadDim]
+		s := float32(0)
+		for h := 0; h < NIndexerHead; h++ {
+			qh := ds.IndexQ[h*NIndexerHeadDim : (h+1)*NIndexerHeadDim]
+			dot := simd.Sdot(kv, qh)
+			if dot < 0 {
+				dot = 0
+			}
+			s += dot * ds.IndexWeights[h]
+		}
+		scores[c] = s
+	}
+
+	for k := 0; k < topK; k++ {
+		best := -1
+		bestScore := float32(-1e30)
+		for c := 0; c < nComp; c++ {
+			if !allowed[c] && scores[c] > bestScore {
+				best = c
+				bestScore = scores[c]
+			}
+		}
+		if best >= 0 {
+			allowed[best] = true
+		}
+	}
+	return allowed
 }
