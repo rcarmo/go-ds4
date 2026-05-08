@@ -49,7 +49,7 @@ const (
 	TensorQ2_K   = 10
 	TensorQ4_K   = 12
 	TensorIQ2XXS = 16
-	TensorI32    = 22
+	TensorI32    = 26
 )
 
 // Block sizes in bytes per QK_K=256 elements
