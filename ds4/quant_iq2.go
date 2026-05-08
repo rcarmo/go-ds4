@@ -22,7 +22,13 @@ import (
 //   d: float32 scale
 //   qs: int8[256] quantized values
 //   bsums: int16[16] partial sums
+// VecDotIQ2XXSQ8K computes IQ2_XXS · Q8_K using SIMD integer dot products.
 func VecDotIQ2XXSQ8K(n int, xIQ2 []byte, yQ8K []byte) float32 {
+	return VecDotIQ2XXSQ8K_SIMD(n, xIQ2, yQ8K)
+}
+
+// vecDotIQ2XXSQ8K_scalar is the reference scalar implementation.
+func vecDotIQ2XXSQ8K_scalar(n int, xIQ2 []byte, yQ8K []byte) float32 {
 	nBlocks := n / QK_K
 	sumf := float32(0)
 

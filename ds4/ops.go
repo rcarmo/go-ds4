@@ -2,6 +2,7 @@ package ds4
 
 import (
 	"math"
+	"runtime"
 	"sync"
 	"unsafe"
 
@@ -219,11 +220,11 @@ func matvecQ8_0Grouped(out []float32, wQ8 []byte, x []float32, inDim, outDim, gr
 
 // parallelFor splits work across goroutines. Falls back to serial for small n.
 func parallelFor(n int, fn func(start, end int)) {
-	if n <= 64 {
+	if n <= 32 {
 		fn(0, n)
 		return
 	}
-	nWorkers := 8 // fixed, matches ds4.c default
+	nWorkers := runtime.NumCPU()
 	if nWorkers > n {
 		nWorkers = n
 	}

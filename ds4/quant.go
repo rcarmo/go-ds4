@@ -66,9 +66,15 @@ func QuantizeRowQ8K(x []float32, out []byte) {
 	simd.QuantizeQ8K(unsafe.Pointer(&x[0]), unsafe.Pointer(&out[0]), len(x))
 }
 
-// VecDotQ2KQ8K computes the dot product of Q2_K weights with Q8_K quantized activations.
-// This is the hot path for routed expert down-projections.
+// VecDotQ2KQ8K computes Q2_K · Q8_K dot product.
+// Uses scalar implementation — the per-group scale structure (16 groups × 16 elements)
+// doesn't benefit from bulk SIMD at the inner 16-element level.
 func VecDotQ2KQ8K(n int, xQ2K []byte, yQ8K []byte) float32 {
+	return vecDotQ2KQ8K_scalar(n, xQ2K, yQ8K)
+}
+
+// vecDotQ2KQ8K_scalar is the reference scalar implementation.
+func vecDotQ2KQ8K_scalar(n int, xQ2K []byte, yQ8K []byte) float32 {
 	nBlocks := n / QK_K
 	sum := float32(0)
 
