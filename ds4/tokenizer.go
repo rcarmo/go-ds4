@@ -46,10 +46,10 @@ func LoadVocab(m *GGUFModel) (*Vocab, error) {
 	}
 
 	// Special token IDs
-	v.BOS = v.findToken("<|begin▁of▁sentence|>", 0)
-	v.EOS = v.findToken("<|end▁of▁sentence|>", 1)
-	v.User = v.findToken("<|User|>", -1)
-	v.Assistant = v.findToken("<|Assistant|>", -1)
+	v.BOS = v.findToken("<｜begin▁of▁sentence｜>", 0)
+	v.EOS = v.findToken("<｜end▁of▁sentence｜>", 1)
+	v.User = v.findToken("<｜User｜>", -1)
+	v.Assistant = v.findToken("<｜Assistant｜>", -1)
 	v.ThinkStart = v.findToken("<think>", -1)
 	v.ThinkEnd = v.findToken("</think>", -1)
 
@@ -212,10 +212,10 @@ func (v *Vocab) Tokenize(text string) []int {
 // matchSpecialToken checks if text starts with a known special token.
 func (v *Vocab) matchSpecialToken(text string) int {
 	specials := []string{
-		"<|begin▁of▁sentence|>",
-		"<|end▁of▁sentence|>",
-		"<|User|>",
-		"<|Assistant|>",
+		"<｜begin▁of▁sentence｜>",
+		"<｜end▁of▁sentence｜>",
+		"<｜User｜>",
+		"<｜Assistant｜>",
 		"<think>",
 		"</think>",
 	}

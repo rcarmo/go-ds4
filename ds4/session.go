@@ -117,6 +117,9 @@ func (e *Engine) NewSession(ctxSize int) *Session {
 
 // Eval processes one token: runs the full forward pass and produces logits.
 func (s *Session) Eval(token int) {
+	if token < 0 || token >= NVocab {
+		return // skip invalid tokens
+	}
 	s.Tokens = append(s.Tokens, token)
 
 	// Embed token: look up in token_embd (F16)
