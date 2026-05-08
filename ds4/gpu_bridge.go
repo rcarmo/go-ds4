@@ -33,6 +33,7 @@ func (e *Engine) InitGPU() error {
 			// Init IQ2/Q2K kernels too
 			gpu.InitCUDAGemvQ2K()
 			gpu.InitCUDASwiGLU()
+			gpu.InitCUDAGemvIQ2Opt()
 			// Init IQ2 kernel with grid table
 			gridSlice := (*[256 * 128 * 8]int8)(unsafe.Pointer(&iq2xxsSignedGrid[0]))
 			gpu.InitCUDAGemvIQ2(gridSlice[:])
@@ -275,10 +276,10 @@ func (e *Engine) gpuExpertForward(
 	// The kernel processes rows sequentially; row r reads weight at offset r*rowBytes
 	// where rowBytes = per-row IQ2 size. The batched buffer has expert weights
 	// concatenated, so rows 0..NFFExp-1 are expert 0, NFFExp..2*NFFExp-1 are expert 1, etc.
-	gpu.CUDAMatvecIQ2(bb.GateOut, bb.ActBuf, bb.GateBuf, NEmbd, nExp*NFFExp, gateRowBytes)
+	gpu.CUDAMatvecIQ2Opt(bb.GateOut, bb.ActBuf, bb.GateBuf, NEmbd, nExp*NFFExp, gateRowBytes)
 
 	// Batched up
-	gpu.CUDAMatvecIQ2(bb.UpOut, bb.ActBuf, bb.UpBuf, NEmbd, nExp*NFFExp, upRowBytes)
+	gpu.CUDAMatvecIQ2Opt(bb.UpOut, bb.ActBuf, bb.UpBuf, NEmbd, nExp*NFFExp, upRowBytes)
 
 	// Batched SwiGLU on all nExp*NFFExp elements
 	gpu.CUDASwiGLU(bb.GateOut, bb.GateOut, bb.UpOut, nExp*NFFExp)
