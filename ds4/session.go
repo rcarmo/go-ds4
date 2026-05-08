@@ -38,9 +38,15 @@ type EngineOptions struct {
 	StreamExperts bool // read expert weights from disk instead of mmap
 }
 
-// OpenEngine loads a GGUF model and prepares the inference engine.
+// OpenEngine loads a GGUF model with sensible defaults for low-memory operation.
+// Pins non-expert weights (~6.5 GB) and evicts cold experts after each layer,
+// keeping RSS at ~7 GB even with a 128 GB model.
 func OpenEngine(modelPath string) (*Engine, error) {
-	return OpenEngineWithOptions(EngineOptions{ModelPath: modelPath})
+	return OpenEngineWithOptions(EngineOptions{
+		ModelPath:    modelPath,
+		PinNonExpert: true,
+		EvictExperts: true,
+	})
 }
 
 // OpenEngineWithOptions loads a model with memory budget controls.
