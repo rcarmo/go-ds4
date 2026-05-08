@@ -70,7 +70,7 @@ func DS4FlashConfig() *ModelConfig {
 func DS2LiteConfig() *ModelConfig {
 	return &ModelConfig{
 		NLayer: 27, NEmbd: 2048, NVocab: 100015,
-		NHead: 16, NHeadKV: 1, NHeadDim: 128 * 2, NValueDim: 128 * 2,
+		NHead: 16, NHeadKV: 1, NHeadDim: 192, NValueDim: 128,
 		NRot: 64, NOutGroup: 4, NLoraQ: 512, NLoraO: 512,
 		NExpert: 64, NExpertUsed: 6, NExpertShared: 2,
 		NFFExp: 1408, NHashLayer: 0,
@@ -101,6 +101,12 @@ func DetectModelConfig(m *GGUFModel) *ModelConfig {
 		}
 		if v, ok := m.MetaU32("deepseek2.num_attention_heads"); ok {
 			cfg.NHead = int(v)
+		}
+		if v, ok := m.MetaU32("deepseek2.attention.key_length"); ok {
+			cfg.NHeadDim = int(v)
+		}
+		if v, ok := m.MetaU32("deepseek2.attention.value_length"); ok {
+			cfg.NValueDim = int(v)
 		}
 		if v, ok := m.MetaU32("deepseek2.num_experts"); ok {
 			cfg.NExpert = int(v)

@@ -113,3 +113,46 @@ func vecDotQ2KQ8K_scalar(n int, xQ2K []byte, yQ8K []byte) float32 {
 	}
 	return sum
 }
+
+// dequantEmbedding extracts one row of quantized embedding data to float32.
+func DequantEmbedding(out []float32, data []byte, typ uint32, n int) {
+	switch typ {
+	case TensorQ2_K:
+		// Q2_K: extract using scales + 2-bit values
+		nBlocks := n / QK_K
+		for b := 0; b < nBlocks; b++ {
+			off := b * BlockQ2KSize
+			scales := data[off : off+16]
+			qs := data[off+16 : off+80]
+			d := F16ToF32(*(*uint16)(unsafe.Pointer(&data[off+80])))
+			dmin := F16ToF32(*(*uint16)(unsafe.Pointer(&data[off+82])))
+			for j := 0; j < 16; j++ {
+				sc := scales[j]
+				scLo := float32(sc & 0x0f)
+				scHi := float32(sc >> 4)
+				for k := 0; k < 4; k++ {
+					qb := qs[j*4+k]
+					for m := 0; m < 4; m++ {
+						q := float32((qb >> (uint(m) * 2)) & 3)
+						idx := b*QK_K + j*16 + k*4 + m
+						if idx < n {
+							out[idx] = d*scLo*q - dmin*scHi
+						}
+					}
+				}
+			}
+		}
+	case TensorF32:
+		f32 := tensorF32Unsafe(data)
+		copy(out, f32[:n])
+	case TensorF16:
+		u16 := tensorU16Unsafe(data)
+		for i := 0; i < n; i++ {
+			out[i] = F16ToF32(u16[i])
+		}
+	default:
+		for i := range out[:n] {
+			out[i] = 0
+		}
+	}
+}

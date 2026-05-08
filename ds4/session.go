@@ -156,24 +156,25 @@ func (s *Session) Eval(token int) {
 	}
 	s.Tokens = append(s.Tokens, token)
 
-	// Embed token: look up in token_embd (F16)
-	embF16 := s.Engine.Weights.TokenEmbd
-	embRowBytes := NEmbd * 2 // F16 = 2 bytes per element
-	embOff := token * embRowBytes
-	embRow := embF16[embOff : embOff+embRowBytes]
-
-	// Dequantize F16 → F32 into HC stream 0
-	embU16 := tensorU16Unsafe(embRow)
-	for i := 0; i < NEmbd; i++ {
-		s.Decode.CurHC[i] = F16ToF32(embU16[i])
+	// Embed token
+	cfg := s.Engine.Config
+	embData := s.Engine.Weights.TokenEmbd
+	embT := s.Engine.Model.Tensors["token_embd.weight"]
+	bpb, epb := TensorTypeSize(embT.Type)
+	if epb == 0 {
+		epb = 1
 	}
-	// Zero other HC streams
-	for i := NEmbd; i < hcDim; i++ {
+	embRowBytes := ((cfg.NEmbd + epb - 1) / epb) * bpb
+	embOff := token * embRowBytes
+	embRow := embData[embOff : embOff+embRowBytes]
+
+	// Dequantize embedding → F32 into HC stream 0
+	DequantEmbedding(s.Decode.CurHC[:cfg.NEmbd], embRow, embT.Type, cfg.NEmbd)
+	for i := cfg.NEmbd; i < len(s.Decode.CurHC); i++ {
 		s.Decode.CurHC[i] = 0
 	}
 
 	// Run all layers
-	cfg := s.Engine.Config
 	nExperts := cfg.NExpertUsed
 	if s.Engine.FastExperts && nExperts > 2 {
 		nExperts = nExperts - 2

@@ -355,3 +355,12 @@ func matvecAuto(out []float32, w []byte, x []float32, inDim, outDim int) {
 		}
 	}
 }
+
+func hasNaNF32(x []float32) bool {
+	for _, v := range x {
+		if v != v {
+			return true
+		} // NaN != NaN
+	}
+	return false
+}

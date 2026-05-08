@@ -254,7 +254,6 @@ func expertForwardFast(out []float32, xQ8K, midQ []byte, cfg *ModelConfig,
 	upRowBytes := ed.upRowBytes
 	downRowBytes := ed.downRowBytes
 	ffnDim := ed.outDim
-	fmt.Printf("  downExps=%d\n", len(layer.FfnDownExps))
 	if ffnDim == 0 {
 		ffnDim = NFFExp
 	}
@@ -331,7 +330,6 @@ func expertForward(ds *DecodeState, layer *LayerWeights, expertIdx int, weight f
 	upRowBytes := ed.upRowBytes
 	downRowBytes := ed.downRowBytes
 	ffnDim := ed.outDim
-	fmt.Printf("  downExps=%d\n", len(layer.FfnDownExps))
 	if ffnDim == 0 {
 		ffnDim = NFFExp
 	}
@@ -467,20 +465,20 @@ func layerForwardDecode(
 	} else {
 		// Standard residual (V2 Lite)
 		normW := tensorF32Unsafe(layer.AttnNorm)
-		copy(ds.AttnCur, ds.CurHC[:NEmbd])
-		rmsNorm(ds.AttnCur, normW)
+		copy(ds.AttnCur, ds.CurHC[:cfg.NEmbd])
+		rmsNorm(ds.AttnCur[:cfg.NEmbd], normW[:cfg.NEmbd])
 		copy(ds.AttnNormed, ds.AttnCur)
 		rmsNorm(ds.AttnNormed, normW)
 		layerAttnDecode(ds, layer, cache, model, pos, il)
-		for i := 0; i < NEmbd; i++ {
+		for i := 0; i < cfg.NEmbd; i++ {
 			ds.CurHC[i] += ds.AttnOut[i]
 		}
 		ffnNormW := tensorF32Unsafe(layer.FfnNorm)
-		copy(ds.FfnCur, ds.CurHC[:NEmbd])
-		copy(ds.FfnNormed, ds.CurHC[:NEmbd])
-		rmsNorm(ds.FfnNormed, ffnNormW)
+		copy(ds.FfnCur, ds.CurHC[:cfg.NEmbd])
+		copy(ds.FfnNormed, ds.CurHC[:cfg.NEmbd])
+		rmsNorm(ds.FfnNormed[:cfg.NEmbd], ffnNormW[:cfg.NEmbd])
 		layerFFNDecode(ds, layer, model, budget, streamer, il, tokenID, nExperts)
-		for i := 0; i < NEmbd; i++ {
+		for i := 0; i < cfg.NEmbd; i++ {
 			ds.CurHC[i] += ds.RoutedOut[i] + ds.SharedOut[i]
 		}
 	}
