@@ -17,6 +17,7 @@ func layerFFNDecode(
 	ds *DecodeState,
 	layer *LayerWeights,
 	model *GGUFModel,
+	budget *MemoryBudget,
 	il, tokenID int,
 ) {
 	// 1. RMSNorm FFN input
@@ -31,6 +32,13 @@ func layerFFNDecode(
 	// 3. Expert routing — select top-K experts
 	experts := routeExperts(ds.FfnNormed, layer, il, tokenID)
 
+	// Prefetch selected expert pages
+	activeIDs := make([]int, len(experts))
+	for i, e := range experts {
+		activeIDs[i] = e.idx
+	}
+	model.PrefetchExperts(il, activeIDs)
+
 	// 4. Run routed experts
 	for i := range ds.RoutedOut {
 		ds.RoutedOut[i] = 0
@@ -43,7 +51,10 @@ func layerFFNDecode(
 	// 5. Run shared expert
 	sharedExpertForward(ds, layer)
 
-	// 6. HC post: combine routed + shared outputs
+	// 6. Evict cold expert pages to stay within budget
+	if budget != nil {
+		budget.EvictColdExperts(il, activeIDs)
+	}
 }
 
 // routeExperts selects the top-K experts for a token.
@@ -187,8 +198,12 @@ func layerForwardDecode(
 	layer *LayerWeights,
 	cache *LayerCache,
 	model *GGUFModel,
+	budget *MemoryBudget,
 	pos, il, tokenID int,
 ) {
+	// Prefetch non-expert weights for this layer
+	model.PrefetchLayer(il)
+
 	// Save residual HC for attention sublayer
 	attnResidual := make([]float32, hcDim)
 	copy(attnResidual, ds.CurHC[:hcDim])
@@ -218,7 +233,7 @@ func layerForwardDecode(
 	)
 
 	// Run MoE FFN
-	layerFFNDecode(ds, layer, model, il, tokenID)
+	layerFFNDecode(ds, layer, model, budget, il, tokenID)
 
 	// HC post (routed + shared → HC state)
 	hcPostSumOne(ds.CurHC, ds.RoutedOut, ds.SharedOut, ffnResidual, ds.Post, ds.Comb)

@@ -25,11 +25,25 @@ type Engine struct {
 	Model   *GGUFModel
 	Weights *Weights
 	Vocab   *Vocab
+	Budget  *MemoryBudget
+}
+
+// EngineOptions configures engine loading.
+type EngineOptions struct {
+	ModelPath    string
+	MaxRSSMB     int  // 0 = unlimited
+	PinNonExpert bool // mlock non-expert weights (~6.5 GB)
+	EvictExperts bool // MADV_DONTNEED cold experts after each layer
 }
 
 // OpenEngine loads a GGUF model and prepares the inference engine.
 func OpenEngine(modelPath string) (*Engine, error) {
-	m, err := OpenGGUF(modelPath)
+	return OpenEngineWithOptions(EngineOptions{ModelPath: modelPath})
+}
+
+// OpenEngineWithOptions loads a model with memory budget controls.
+func OpenEngineWithOptions(opts EngineOptions) (*Engine, error) {
+	m, err := OpenGGUF(opts.ModelPath)
 	if err != nil {
 		return nil, fmt.Errorf("open model: %w", err)
 	}
@@ -46,7 +60,17 @@ func OpenEngine(modelPath string) (*Engine, error) {
 		return nil, fmt.Errorf("load vocab: %w", err)
 	}
 
-	return &Engine{Model: m, Weights: w, Vocab: v}, nil
+	budget := &MemoryBudget{
+		MaxResidentMB: opts.MaxRSSMB,
+		PinNonExpert:  opts.PinNonExpert,
+		EvictAfterUse: opts.EvictExperts,
+	}
+	if err := budget.ApplyBudget(m); err != nil {
+		m.Close()
+		return nil, fmt.Errorf("apply budget: %w", err)
+	}
+
+	return &Engine{Model: m, Weights: w, Vocab: v, Budget: budget}, nil
 }
 
 // Close releases the model memory mapping.
@@ -95,6 +119,7 @@ func (s *Session) Eval(token int) {
 			&s.Engine.Weights.Layer[il],
 			&s.KV.Layer[il],
 			s.Engine.Model,
+			s.Engine.Budget,
 			s.Pos, il, token,
 		)
 	}
