@@ -87,17 +87,21 @@ select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 
 ## Speed
 
-These are single-run Metal CLI numbers with the q2 GGUF, `--ctx 32768`,
-`--nothink`, greedy decoding, and `-n 256`. The short prompt is a normal small
-Italian story prompt. The long prompt is 11709 tokens and exercises chunked
-prefill plus long-context decode.
+These are single-run Metal CLI numbers with `--ctx 32768`, `--nothink`, greedy
+decoding, and `-n 256`. The short prompt is a normal small Italian story
+prompt. The long prompts exercise chunked prefill plus long-context decode.
+Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 
-| Machine | Prompt | Prefill | Generation |
-| --- | ---: | ---: | ---: |
-| MacBook Pro M3 Max, 128 GB | short | 58.52 t/s | 26.68 t/s |
-| MacBook Pro M3 Max, 128 GB | 11709 tokens | 250.11 t/s | 21.47 t/s |
-| Mac Studio M3 Ultra, 512 GB | short | 84.43 t/s | 36.86 t/s |
-| Mac Studio M3 Ultra, 512 GB | 11709 tokens | 468.03 t/s | 27.39 t/s |
+| Machine | Quant | Prompt | Prefill | Generation |
+| --- | ---: | ---: | ---: | ---: |
+| MacBook Pro M3 Max, 128 GB | q2 | short | 58.52 t/s | 26.68 t/s |
+| MacBook Pro M3 Max, 128 GB | q2 | 11709 tokens | 250.11 t/s | 21.47 t/s |
+| MacBook Pro M3 Max, 128 GB | q4 | short | N/A | N/A |
+| MacBook Pro M3 Max, 128 GB | q4 | long | N/A | N/A |
+| Mac Studio M3 Ultra, 512 GB | q2 | short | 84.43 t/s | 36.86 t/s |
+| Mac Studio M3 Ultra, 512 GB | q2 | 11709 tokens | 468.03 t/s | 27.39 t/s |
+| Mac Studio M3 Ultra, 512 GB | q4 | short | 78.95 t/s | 35.50 t/s |
+| Mac Studio M3 Ultra, 512 GB | q4 | 12018 tokens | 448.82 t/s | 26.62 t/s |
 
 ## CLI
 

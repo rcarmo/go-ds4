@@ -609,11 +609,12 @@ static void test_run_entry(const ds4_test_entry *entry) {
     int before = test_failures;
     fprintf(stderr, "%s:\n", entry->name);
     entry->fn();
-    fprintf(stderr, "%s: %s%s%s\n",
-            entry->name,
-            test_failures == before ? "\033[32m" : "\033[31m",
-            test_failures == before ? "OK" : "ERR",
-            "\033[0m");
+    fprintf(stderr, "%s: ", entry->name);
+    ds4_log(stderr,
+            test_failures == before ? DS4_LOG_OK : DS4_LOG_ERROR,
+            "%s",
+            test_failures == before ? "OK" : "ERR");
+    fputc('\n', stderr);
 }
 
 int main(int argc, char **argv) {

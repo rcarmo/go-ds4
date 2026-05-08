@@ -503,13 +503,44 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
-static void ds4_timing_printf(const char *fmt, ...) {
-    if (isatty(STDERR_FILENO)) fputs("\x1b[36m", stderr);
+static const char *ds4_log_color_code(ds4_log_type type) {
+    switch (type) {
+    case DS4_LOG_PREFILL:
+    case DS4_LOG_TIMING:
+        return "\x1b[36m";
+    case DS4_LOG_GENERATION:
+    case DS4_LOG_OK:
+        return "\x1b[32m";
+    case DS4_LOG_KVCACHE:
+        return "\x1b[33m";
+    case DS4_LOG_TOOL:
+        return "\x1b[90m";
+    case DS4_LOG_WARNING:
+        return "\x1b[38;5;208m";
+    case DS4_LOG_ERROR:
+        return "\x1b[31m";
+    default:
+        return "";
+    }
+}
+
+bool ds4_log_is_tty(FILE *fp) {
+    int fd = fileno(fp);
+    return fd >= 0 && isatty(fd) != 0;
+}
+
+static void ds4_vlog(FILE *fp, ds4_log_type type, const char *fmt, va_list ap) {
+    const bool colorize = type != DS4_LOG_DEFAULT && ds4_log_is_tty(fp);
+    if (colorize) fputs(ds4_log_color_code(type), fp);
+    vfprintf(fp, fmt, ap);
+    if (colorize) fputs("\x1b[0m", fp);
+}
+
+void ds4_log(FILE *fp, ds4_log_type type, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    ds4_vlog(fp, type, fmt, ap);
     va_end(ap);
-    if (isatty(STDERR_FILENO)) fputs("\x1b[0m", stderr);
 }
 
 static bool write_f32_binary_file(const char *path, const float *data, uint64_t n) {
@@ -1047,7 +1078,10 @@ static void model_prefetch_cpu_mapping(const ds4_model *m) {
 #if defined(POSIX_MADV_WILLNEED)
     const int rc = posix_madvise((void *)m->map, (size_t)m->size, POSIX_MADV_WILLNEED);
     if (rc != 0) {
-        fprintf(stderr, "ds4: warning: POSIX_MADV_WILLNEED failed for CPU model mapping: %s\n", strerror(rc));
+        ds4_log(stderr,
+                DS4_LOG_WARNING,
+                "ds4: warning: POSIX_MADV_WILLNEED failed for CPU model mapping: %s\n",
+                strerror(rc));
     }
 #else
     (void)m;
@@ -1112,7 +1146,8 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
         if (!cursor_u64(c, &t->rel_offset)) ds4_die(c->error);
 
         if (!tensor_nbytes(t->type, t->elements, &t->bytes)) {
-            fprintf(stderr,
+            ds4_log(stderr,
+                DS4_LOG_WARNING,
                 "ds4: warning: tensor %.*s has unsupported GGUF type %u\n",
                 (int)t->name.len, t->name.ptr, t->type);
         }
@@ -14467,7 +14502,8 @@ static int generate_raw_swa_cpu(
 
     const double prefill_s = t_prefill1 - t_prefill0;
     const double decode_s = t_decode1 - t_decode0;
-    ds4_timing_printf(
+    ds4_log(stderr,
+            DS4_LOG_TIMING,
             "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
             decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
@@ -14590,7 +14626,8 @@ static int generate_metal_graph_raw_swa(
 
     const double prefill_s = t_prefill1 - t_prefill0;
     const double decode_s = t_decode1 - t_decode0;
-    ds4_timing_printf(
+    ds4_log(stderr,
+            DS4_LOG_TIMING,
             "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
             decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);

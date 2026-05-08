@@ -224,19 +224,25 @@ static ds4_think_mode cli_effective_think_mode(const cli_generation_options *gen
     return ds4_think_mode_for_context(gen->think_mode, gen->ctx_size);
 }
 
+static bool cli_think_max_downgraded(const cli_generation_options *gen) {
+    return gen->think_mode == DS4_THINK_MAX &&
+           cli_effective_think_mode(gen) != DS4_THINK_MAX;
+}
+
+static void cli_warn_think_max_downgraded(const cli_generation_options *gen, const char *name) {
+    if (!cli_think_max_downgraded(gen)) return;
+    ds4_log(stderr,
+        DS4_LOG_WARNING,
+        "ds4: warning: %s needs --ctx >= %u; ctx=%d uses normal thinking instead\n",
+        name,
+        ds4_think_max_min_context(),
+        gen->ctx_size);
+}
+
 static double cli_now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
-}
-
-static void cli_timing_printf(const char *fmt, ...) {
-    if (isatty(STDERR_FILENO)) fputs("\x1b[36m", stderr);
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
-    va_end(ap);
-    if (isatty(STDERR_FILENO)) fputs("\x1b[0m", stderr);
 }
 
 static char *read_prompt_file(const char *path, bool fatal);
@@ -259,12 +265,15 @@ static void cli_prefill_progress_cb(void *ud, const char *event, int current, in
     if (pct > 100.0) pct = 100.0;
 
     if (p->use_color) {
-        fprintf(stderr,
-                "\r\x1b[36mprocessing %d input tokens: %d/%d (%.1f%%)\x1b[0m\x1b[K",
+        fputc('\r', stderr);
+        ds4_log(stderr,
+                DS4_LOG_PREFILL,
+                "processing %d input tokens: %d/%d (%.1f%%)",
                 p->input_tokens,
                 processed,
                 p->input_tokens,
                 pct);
+        fputs("\x1b[K", stderr);
         if (processed >= p->input_tokens) fputc('\n', stderr);
     } else {
         fprintf(stderr,
@@ -435,7 +444,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     cli_prefill_progress progress = {
         .base_tokens = 0,
         .input_tokens = prompt->len,
-        .use_color = isatty(STDERR_FILENO) != 0,
+        .use_color = ds4_log_is_tty(stderr),
     };
 
     const double t_prefill0 = cli_now_sec();
@@ -511,9 +520,11 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
     const double prefill_s = t_prefill1 - t_prefill0;
     const double decode_s = t_decode1 - t_decode0;
-    cli_timing_printf("ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
-                      prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
-                      decode_s > 0.0 ? (double)generated / decode_s : 0.0);
+    ds4_log(stderr,
+            DS4_LOG_TIMING,
+            "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
+            prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
+            decode_s > 0.0 ? (double)generated / decode_s : 0.0);
 
     ds4_session_free(session);
     return 0;
@@ -597,7 +608,7 @@ static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4
     cli_prefill_progress progress = {
         .base_tokens = 0,
         .input_tokens = prompt->len,
-        .use_color = isatty(STDERR_FILENO) != 0,
+        .use_color = ds4_log_is_tty(stderr),
     };
     ds4_session_set_progress(session, cli_prefill_progress_cb, &progress);
     if (ds4_session_sync(session, prompt, err, sizeof(err)) != 0) {
@@ -725,7 +736,7 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
         cli_prefill_progress progress = {
             .base_tokens = 0,
             .input_tokens = prompt.len,
-            .use_color = isatty(STDERR_FILENO) != 0,
+            .use_color = ds4_log_is_tty(stderr),
         };
         rc = ds4_engine_generate_argmax(engine, &prompt, cfg->gen.n_predict,
                                         cfg->gen.ctx_size,
@@ -882,7 +893,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     cli_prefill_progress progress = {
         .base_tokens = cached,
         .input_tokens = suffix,
-        .use_color = isatty(STDERR_FILENO) != 0,
+        .use_color = ds4_log_is_tty(stderr),
     };
     const double t_prefill0 = cli_now_sec();
     ds4_session_set_progress(chat->session, cli_prefill_progress_cb, &progress);
@@ -978,9 +989,11 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
     const double prefill_s = t_prefill1 - t_prefill0;
     const double decode_s = t_decode1 - t_decode0;
     if (interrupted) cli_interrupt_clear();
-    cli_timing_printf("ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
-                      prefill_s > 0.0 ? (double)suffix / prefill_s : 0.0,
-                      decode_s > 0.0 ? (double)generated / decode_s : 0.0);
+    ds4_log(stderr,
+            DS4_LOG_TIMING,
+            "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
+            prefill_s > 0.0 ? (double)suffix / prefill_s : 0.0,
+            decode_s > 0.0 ? (double)generated / decode_s : 0.0);
     return 0;
 }
 
@@ -1033,6 +1046,7 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
             bool active = ds4_think_mode_for_context(cfg->gen.think_mode,
                                                      chat.ctx_size) == DS4_THINK_MAX;
             repl_chat_apply_max_prefix(engine, &chat, active);
+            cli_warn_think_max_downgraded(&cfg->gen, "/think-max");
             printf("Thinking mode: %s.\n", active ? "max" : "high (ctx below 393216)");
         } else if (!strcmp(cmd, "/nothink")) {
             cfg->gen.think_mode = DS4_THINK_NONE;
@@ -1053,6 +1067,7 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
                 bool active = ds4_think_mode_for_context(cfg->gen.think_mode,
                                                          chat.ctx_size) == DS4_THINK_MAX;
                 repl_chat_apply_max_prefix(engine, &chat, active);
+                cli_warn_think_max_downgraded(&cfg->gen, "/ctx");
             }
         } else if (!strcmp(cmd, "/quit") || !strcmp(cmd, "/exit")) {
             linenoiseFree(line);
@@ -1253,6 +1268,7 @@ int main(int argc, char **argv) {
     cli_config cfg = parse_options(argc, argv);
     if (!cfg.inspect) {
         log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
+        cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
     }
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) {

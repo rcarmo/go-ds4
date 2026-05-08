@@ -10,6 +10,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "ds4.h"
 #include "ds4_metal.h"
 
 /*
@@ -302,6 +303,28 @@ static double ds4_metal_now_ms(void) {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
 }
 
+static int ds4_metal_progress_enabled(void) {
+    return ds4_log_is_tty(stderr);
+}
+
+static void ds4_metal_progress_begin(const char *what) {
+    if (!ds4_metal_progress_enabled()) return;
+    fprintf(stderr, "ds4: %s...", what);
+    fflush(stderr);
+}
+
+static void ds4_metal_progress_done(void) {
+    if (!ds4_metal_progress_enabled()) return;
+    fputs(" done\n", stderr);
+    fflush(stderr);
+}
+
+static void ds4_metal_progress_failed(void) {
+    if (!ds4_metal_progress_enabled()) return;
+    fputs(" failed\n", stderr);
+    fflush(stderr);
+}
+
 static void ds4_metal_model_views_clear(void) {
     for (uint32_t i = 0; i < g_model_view_count; i++) {
         g_model_views[i].buffer = nil;
@@ -449,12 +472,19 @@ static int ds4_metal_map_model_views(
     }
 
     const double t_mapped = ds4_metal_now_ms();
-    if (!ds4_metal_model_residency_request_views()) return 0;
+    const int request_residency = getenv("DS4_METAL_NO_RESIDENCY") == NULL;
+    if (request_residency) ds4_metal_progress_begin("requesting Metal residency (may take tens of seconds)");
+    if (!ds4_metal_model_residency_request_views()) {
+        if (request_residency) ds4_metal_progress_failed();
+        return 0;
+    }
+    if (request_residency) ds4_metal_progress_done();
     const double t_resident = ds4_metal_now_ms();
     int warmed = 1;
     const double t_warm0 = ds4_metal_now_ms();
-    if (getenv("DS4_METAL_NO_RESIDENCY") == NULL &&
-        getenv("DS4_METAL_NO_MODEL_WARMUP") == NULL) {
+    const int warm_model_views = getenv("DS4_METAL_NO_RESIDENCY") == NULL &&
+                                 getenv("DS4_METAL_NO_MODEL_WARMUP") == NULL;
+    if (warm_model_views) {
         /*
          * The first GPU command touching no-copy mmap storage can pay command
          * queue setup, page-table validation, and shared-allocation residency
@@ -464,7 +494,10 @@ static int ds4_metal_map_model_views(
          * dense prefetch would create exactly the kind of memory pressure and
          * startup stalls this path is designed to avoid.
          */
+        ds4_metal_progress_begin("warming Metal model views");
         warmed = ds4_metal_warm_model_views();
+        if (warmed) ds4_metal_progress_done();
+        else ds4_metal_progress_failed();
     }
     const double t_warm = ds4_metal_now_ms();
     fprintf(stderr,
