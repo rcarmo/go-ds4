@@ -243,6 +243,17 @@ func matvecQ8_0(out []float32, wQ8 []byte, x []float32, inDim, outDim int) {
 	})
 }
 
+// matvecQ8_0GPU tries GPU dispatch first, falls back to CPU.
+// tensorName is the GGUF tensor name used as GPU buffer key.
+func matvecQ8_0GPU(out []float32, wQ8 []byte, x []float32, inDim, outDim int, engine interface{}, tensorName string) {
+	if engine != nil {
+		if e, ok := engine.(*Engine); ok && e.gpuMatvecQ8_0(out, tensorName, x, inDim, outDim) {
+			return
+		}
+	}
+	matvecQ8_0(out, wQ8, x, inDim, outDim)
+}
+
 // matvecQ8_0Grouped computes grouped output projection.
 func matvecQ8_0Grouped(out []float32, wQ8 []byte, x []float32, inDim, outDim, groupSize int) {
 	rowBytes := (inDim / 32) * BlockQ8_0Size

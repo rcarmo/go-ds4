@@ -124,10 +124,12 @@ func (e *Engine) Close() {
 
 // NewSession creates a new inference session with the given context size.
 func (e *Engine) NewSession(ctxSize int) *Session {
+	ds := NewDecodeState(ctxSize)
+	ds.Engine = e
 	return &Session{
 		Engine:  e,
 		KV:      NewKVCache(ctxSize),
-		Decode:  NewDecodeState(ctxSize),
+		Decode:  ds,
 		Tokens:  make([]int, 0, ctxSize),
 		CtxSize: ctxSize,
 		Logits:  make([]float32, NVocab),

@@ -67,6 +67,9 @@ type DecodeState struct {
 	HCSumTmp     []float32 // [NEmbd] HC post sum scratch
 	Post         []float32 // [NHC]
 	Comb         []float32 // [NHC * NHC]
+
+	// Engine back-reference (for GPU dispatch)
+	Engine interface{}
 }
 
 // NewDecodeState allocates decode buffers for a given context size.
@@ -147,8 +150,8 @@ func layerAttnDecode(
 	copy(ds.QRNorm, ds.QR)
 	rmsNorm(ds.QRNorm, qrNormW)
 
-	// attn_q_b: Q8_0 [NLoraQ, NHead*NHeadDim] → q[NHead*NHeadDim]
-	matvecQ8_0(ds.Q, layer.AttnQB, ds.QRNorm, NLoraQ, NHead*NHeadDim)
+	// attn_q_b: Q8_0 [NLoraQ, NHead*NHeadDim] → q[NHead*NHeadDim] — GPU if available
+	matvecQ8_0GPU(ds.Q, layer.AttnQB, ds.QRNorm, NLoraQ, NHead*NHeadDim, ds.Engine, "")
 
 	// Per-head RMSNorm
 	for h := 0; h < NHead; h++ {

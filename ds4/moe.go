@@ -456,7 +456,8 @@ func outputLogits(ds *DecodeState, logits []float32, hcState []float32, w *Weigh
 
 	outputNormW := tensorF32Unsafe(w.OutputNorm)
 	rmsNorm(collapsed, outputNormW)
-	matvecQ8_0(logits, w.Output, collapsed, NEmbd, NVocab)
+	// 3. Output projection: Q8_0 [NEmbd, NVocab] — GPU-accelerated if available
+	matvecQ8_0GPU(logits, w.Output, collapsed, NEmbd, NVocab, ds.Engine, "output.weight")
 }
 
 // Argmax returns the index of the maximum value.
