@@ -94,26 +94,6 @@ func vecDotQ2KQ8K_scalar(n int, xQ2K []byte, yQ8K []byte) float32 {
 		sumMinS := int32(0)
 		isum := int32(0)
 
-		// Process 2 chunks of 128 Q2 values (32 packed bytes each)
-		// Each chunk covers 8 groups of 16 values
-		for chunk := 0; chunk < 2; chunk++ {
-			qOff := chunk * 32  // 32 packed bytes = 128 Q2 values
-			yOff := chunk * 128 // 128 Q8 values
-
-			// AVX2: dot 128 Q2 × 128 Q8 (ignoring per-group scales)
-			rawDot := simd.DotQ2x32(
-				unsafe.Pointer(&qs[qOff]),
-				unsafe.Pointer(&yqs[yOff]),
-			)
-
-			// For the unscaled approach: since scLo differs per group,
-			// we need per-group dots. BUT if most scales are the same
-			// (common in practice), the raw dot is a good first approx.
-			// For correctness, fall back to per-group for now.
-			_ = rawDot
-		}
-
-		// Per-group processing (still needed for scale correctness)
 		for j := 0; j < 16; j++ {
 			sc := scales[j]
 			scHi := int32(sc >> 4)
@@ -122,20 +102,11 @@ func vecDotQ2KQ8K_scalar(n int, xQ2K []byte, yQ8K []byte) float32 {
 			bs := *(*int16)(unsafe.Pointer(&ybsums[j*2]))
 			sumMinS += scHi * int32(bs)
 
-			qOff := j * 4
-			yOff := j * 16
-			dot := int32(0)
-			for k := 0; k < 4; k++ {
-				qByte := qs[qOff+k]
-				y0 := int32(int8(yqs[yOff+k*4]))
-				y1 := int32(int8(yqs[yOff+k*4+1]))
-				y2 := int32(int8(yqs[yOff+k*4+2]))
-				y3 := int32(int8(yqs[yOff+k*4+3]))
-				dot += int32(qByte&3)*y0 +
-					int32((qByte>>2)&3)*y1 +
-					int32((qByte>>4)&3)*y2 +
-					int32((qByte>>6)&3)*y3
-			}
+			// AVX2: unpack 16 Q2 values + dot with 16 Q8 values
+			dot := simd.DotQ2Group16(
+				unsafe.Pointer(&qs[j*4]),
+				unsafe.Pointer(&yqs[j*16]),
+			)
 			isum += scLo * dot
 		}
 
