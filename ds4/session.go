@@ -22,11 +22,12 @@ type Session struct {
 
 // Engine holds the loaded model and weights.
 type Engine struct {
-	Model    *GGUFModel
-	Weights  *Weights
-	Vocab    *Vocab
-	Budget   *MemoryBudget
-	Streamer *DiskStreamer // non-nil when StreamExperts is enabled
+	Model       *GGUFModel
+	Weights     *Weights
+	Vocab       *Vocab
+	Budget      *MemoryBudget
+	Streamer    *DiskStreamer // non-nil when StreamExperts is enabled
+	FastExperts bool          // use top-4 instead of top-6
 }
 
 // EngineOptions configures engine loading.
@@ -36,6 +37,7 @@ type EngineOptions struct {
 	PinNonExpert  bool // mlock non-expert weights (~6.5 GB)
 	EvictExperts  bool // MADV_DONTNEED cold experts after each layer
 	StreamExperts bool // read expert weights from disk instead of mmap
+	FastExperts   bool // use top-4 instead of top-6 experts (faster, slight quality loss)
 }
 
 // OpenEngine loads a GGUF model with sensible defaults for low-memory operation.
@@ -78,7 +80,7 @@ func OpenEngineWithOptions(opts EngineOptions) (*Engine, error) {
 		return nil, fmt.Errorf("apply budget: %w", err)
 	}
 
-	e := &Engine{Model: m, Weights: w, Vocab: v, Budget: budget}
+	e := &Engine{Model: m, Weights: w, Vocab: v, Budget: budget, FastExperts: opts.FastExperts}
 
 	// Open disk streamer if requested
 	if opts.StreamExperts {
@@ -139,6 +141,10 @@ func (s *Session) Eval(token int) {
 	}
 
 	// Run all 43 layers
+	nExperts := NExpertUsed
+	if s.Engine.FastExperts {
+		nExperts = NExpertUsedFast
+	}
 	for il := 0; il < NLayer; il++ {
 		layerForwardDecode(
 			s.Decode,
@@ -147,7 +153,7 @@ func (s *Session) Eval(token int) {
 			s.Engine.Model,
 			s.Engine.Budget,
 			s.Engine.Streamer,
-			s.Pos, il, token,
+			s.Pos, il, token, nExperts,
 		)
 	}
 

@@ -22,6 +22,7 @@ func layerFFNDecode(
 	budget *MemoryBudget,
 	streamer *DiskStreamer,
 	il, tokenID int,
+	nExperts int,
 ) {
 	// 1. RMSNorm FFN input (from HC-pre output)
 	normW := tensorF32Unsafe(layer.FfnNorm)
@@ -32,7 +33,7 @@ func layerFFNDecode(
 	QuantizeRowQ8K(ds.FfnNormed, ds.RoutedXQ)
 
 	// 3. Expert routing — select top-K experts
-	experts := routeExperts(ds, ds.FfnNormed, layer, il, tokenID)
+	experts := routeExperts(ds, ds.FfnNormed, layer, il, tokenID, nExperts)
 
 	// Prefetch selected expert pages
 	var activeIDsBuf [NExpertUsed]int
@@ -86,7 +87,7 @@ func layerFFNDecode(
 }
 
 // routeExperts selects the top-K experts for a token.
-func routeExperts(ds *DecodeState, normed []float32, layer *LayerWeights, il, tokenID int) []expertScore {
+func routeExperts(ds *DecodeState, normed []float32, layer *LayerWeights, il, tokenID, nExperts int) []expertScore {
 	// Check for hash routing (3 hash layers)
 	if layer.FfnGateTid2Eid != nil {
 		table := unsafe.Slice((*int32)(unsafe.Pointer(&layer.FfnGateTid2Eid[0])), NExpertUsed*NVocab)
@@ -132,7 +133,7 @@ func routeExperts(ds *DecodeState, normed []float32, layer *LayerWeights, il, to
 	})
 
 	// Normalize top-K weights
-	topK := scores[:NExpertUsed]
+	topK := scores[:nExperts]
 	sum := float32(0)
 	for _, s := range topK {
 		sum += s.score
@@ -384,7 +385,7 @@ func layerForwardDecode(
 	model *GGUFModel,
 	budget *MemoryBudget,
 	streamer *DiskStreamer,
-	pos, il, tokenID int,
+	pos, il, tokenID, nExperts int,
 ) {
 	// Prefetch non-expert weights for this layer
 	model.PrefetchLayer(il)
@@ -420,7 +421,7 @@ func layerForwardDecode(
 	)
 
 	// Run MoE FFN
-	layerFFNDecode(ds, layer, model, budget, streamer, il, tokenID)
+	layerFFNDecode(ds, layer, model, budget, streamer, il, tokenID, nExperts)
 
 	// HC post (routed + shared → HC state)
 	hcPostSumOne(ds.CurHC, ds.RoutedOut, ds.SharedOut, ffnResidual, ds.Post, ds.Comb, ds.HCSumTmp)

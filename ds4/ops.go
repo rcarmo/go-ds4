@@ -191,7 +191,7 @@ func matvecF16(out []float32, wF16 []byte, x []float32, inDim, outDim int) {
 }
 
 // matvecQ8_0 computes out[outDim] = Q8_0_weight[outDim, inDim] · x[inDim].
-// Parallelized across rows.
+// Uses SIMD DotQ8_0F32 (VPMOVSXBD+VCVTDQ2PS+FMA) directly on each row.
 func matvecQ8_0(out []float32, wQ8 []byte, x []float32, inDim, outDim int) {
 	rowBytes := (inDim / 32) * BlockQ8_0Size
 	parallelFor(outDim, func(start, end int) {
@@ -203,7 +203,6 @@ func matvecQ8_0(out []float32, wQ8 []byte, x []float32, inDim, outDim int) {
 }
 
 // matvecQ8_0Grouped computes grouped output projection.
-// Weight is [outDim, inDim] Q8_0, but processed in groups of NOutGroup=8.
 func matvecQ8_0Grouped(out []float32, wQ8 []byte, x []float32, inDim, outDim, groupSize int) {
 	rowBytes := (inDim / 32) * BlockQ8_0Size
 	nGroups := outDim / groupSize

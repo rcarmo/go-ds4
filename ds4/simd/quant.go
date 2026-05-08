@@ -30,6 +30,7 @@ func DotI8(a, b unsafe.Pointer, n int) int32
 // DotQ8_0PrequantF16 computes one DS4 Q8_0 row dot with prequantized activation.
 // Row layout per block: f16 scale + int8[32] values (34 bytes).
 // xq layout per block: int8[32], xscale: float32 per block.
+// Uses fused AVX2 VPMADDUBSW+VPMADDWD inner loop on amd64.
 //
 //go:noescape
-func DotQ8_0PrequantF16(row unsafe.Pointer, xq unsafe.Pointer, xscale unsafe.Pointer, nBlocks int) float32
+func DotQ8_0PrequantI8(row unsafe.Pointer, xq unsafe.Pointer, xscale unsafe.Pointer, nBlocks int) float32

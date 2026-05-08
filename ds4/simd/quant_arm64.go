@@ -33,8 +33,8 @@ func f16tof32Arm(h uint16) float32 {
 }
 
 // quantizeQ8KScalar is the Go scalar implementation called by the arm64 asm stub.
-// DotQ8_0PrequantF16 scalar fallback on arm64 (DS4 layout: 34-byte blocks).
-func DotQ8_0PrequantF16(row unsafe.Pointer, xq unsafe.Pointer, xscale unsafe.Pointer, nBlocks int) float32 {
+// DotQ8_0PrequantI8 scalar fallback on arm64 (DS4 layout: 34-byte blocks).
+func DotQ8_0PrequantI8(row unsafe.Pointer, xq unsafe.Pointer, xscale unsafe.Pointer, nBlocks int) float32 {
 	rp := (*[1 << 30]byte)(row)
 	xqp := (*[1 << 30]int8)(xq)
 	xsp := (*[1 << 30]float32)(xscale)

@@ -16,6 +16,7 @@ const (
 	NLoraO          = 1024 // O low-rank bottleneck
 	NExpert         = 256
 	NExpertUsed     = 6
+	NExpertUsedFast = 4 // reduced expert count for speed mode
 	NExpertShared   = 1
 	NFFExp          = 2048 // expert FFN hidden width
 	NHashLayer      = 3    // layers with token-ID→expert-ID hash routing
