@@ -306,7 +306,7 @@ func (s *Session) SavePayload(w io.Writer) error {
 	if err := binary.Write(w, binary.LittleEndian, uint32(0x34565344)); err != nil { // "DSV4"
 		return err
 	}
-	if err := binary.Write(w, binary.LittleEndian, uint32(3)); err != nil { // version
+	if err := binary.Write(w, binary.LittleEndian, uint32(4)); err != nil { // version
 		return err
 	}
 	if err := binary.Write(w, binary.LittleEndian, uint32(s.Pos)); err != nil {
@@ -332,6 +332,9 @@ func (s *Session) SavePayload(w io.Writer) error {
 			if err := binary.Write(w, binary.LittleEndian, uint32(lc.NComp)); err != nil {
 				return err
 			}
+			if err := binary.Write(w, binary.LittleEndian, uint32(lc.CompWrite)); err != nil {
+				return err
+			}
 			if err := binary.Write(w, binary.LittleEndian, lc.CompKV); err != nil {
 				return err
 			}
@@ -343,6 +346,9 @@ func (s *Session) SavePayload(w io.Writer) error {
 			}
 			if lc.CompressRatio == 4 {
 				if err := binary.Write(w, binary.LittleEndian, uint32(lc.NIndexComp)); err != nil {
+					return err
+				}
+				if err := binary.Write(w, binary.LittleEndian, uint32(lc.IndexCompWrite)); err != nil {
 					return err
 				}
 				if err := binary.Write(w, binary.LittleEndian, lc.IndexCompKV); err != nil {
@@ -383,7 +389,7 @@ func (s *Session) LoadPayload(r io.Reader) error {
 	if err := binary.Read(r, binary.LittleEndian, &version); err != nil {
 		return err
 	}
-	if version != 1 && version != 2 && version != 3 {
+	if version != 1 && version != 2 && version != 3 && version != 4 {
 		return fmt.Errorf("unsupported session version %d", version)
 	}
 	if err := binary.Read(r, binary.LittleEndian, &pos); err != nil {
@@ -424,6 +430,19 @@ func (s *Session) LoadPayload(r io.Reader) error {
 				return err
 			}
 			lc.NComp = int(nComp)
+			if version >= 4 {
+				var compWrite uint32
+				if err := binary.Read(r, binary.LittleEndian, &compWrite); err != nil {
+					return err
+				}
+				if lc.CompCap > 0 {
+					lc.CompWrite = int(compWrite) % lc.CompCap
+				}
+			} else {
+				if lc.CompCap > 0 {
+					lc.CompWrite = lc.NComp % lc.CompCap
+				}
+			}
 			if err := binary.Read(r, binary.LittleEndian, lc.CompKV); err != nil {
 				return err
 			}
@@ -440,6 +459,19 @@ func (s *Session) LoadPayload(r io.Reader) error {
 						return err
 					}
 					lc.NIndexComp = int(nIndexComp)
+					if version >= 4 {
+						var indexWrite uint32
+						if err := binary.Read(r, binary.LittleEndian, &indexWrite); err != nil {
+							return err
+						}
+						if lc.CompCap > 0 {
+							lc.IndexCompWrite = int(indexWrite) % lc.CompCap
+						}
+					} else {
+						if lc.CompCap > 0 {
+							lc.IndexCompWrite = lc.NIndexComp % lc.CompCap
+						}
+					}
 					if err := binary.Read(r, binary.LittleEndian, lc.IndexCompKV); err != nil {
 						return err
 					}

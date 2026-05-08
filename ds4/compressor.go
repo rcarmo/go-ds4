@@ -152,9 +152,13 @@ func indexerAllowedDecodeOne(
 	layer *LayerWeights,
 	cur []float32,
 	qrNorm []float32,
-	indexComp []float32,
-	nComp, il, pos int,
+	cache *LayerCache,
+	il, pos int,
 ) []bool {
+	nComp := cache.NIndexComp
+	if nComp > cache.CompCap {
+		nComp = cache.CompCap
+	}
 	if nComp == 0 || len(layer.IndexerQB) == 0 || len(layer.IndexerProj) == 0 {
 		return nil
 	}
@@ -186,8 +190,13 @@ func indexerAllowedDecodeOne(
 	}
 
 	scores := ds.IndexScores[:nComp]
+	start := cache.indexCompStart()
 	for c := 0; c < nComp; c++ {
-		kv := indexComp[c*NIndexerHeadDim : (c+1)*NIndexerHeadDim]
+		idx := start + c
+		if idx >= cache.CompCap {
+			idx -= cache.CompCap
+		}
+		kv := cache.IndexCompKV[idx*NIndexerHeadDim : (idx+1)*NIndexerHeadDim]
 		s := float32(0)
 		for h := 0; h < NIndexerHead; h++ {
 			qh := ds.IndexQ[h*NIndexerHeadDim : (h+1)*NIndexerHeadDim]

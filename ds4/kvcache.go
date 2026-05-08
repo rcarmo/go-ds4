@@ -9,10 +9,11 @@ type LayerCache struct {
 	RawWrite int       // next physical write slot in RawKV
 
 	// Compressed KV (for layers with compress_ratio > 0)
-	CompressRatio int       // 0=none, 2=2:1, 4=4:1
+	CompressRatio int       // 0=none, 4=4:1, 128=128:1
 	CompKV        []float32 // [compCap, NHeadDim]
-	NComp         int       // live compressed rows
+	NComp         int       // live compressed rows (<= CompCap)
 	CompCap       int
+	CompWrite     int // next physical write slot in CompKV
 
 	// Compressor state (learned aggregator)
 	CompStateKV    []float32
@@ -20,7 +21,8 @@ type LayerCache struct {
 
 	// Indexer compressed KV (ratio-4 layers only)
 	IndexCompKV     []float32 // [compCap, NIndexerHeadDim]
-	NIndexComp      int
+	NIndexComp      int       // live rows (<= CompCap)
+	IndexCompWrite  int       // next physical write slot in IndexCompKV
 	IndexStateKV    []float32
 	IndexStateScore []float32
 }
@@ -119,20 +121,68 @@ func (lc *LayerCache) RawRow(i int) []float32 {
 	return lc.RawKV[idx*NHeadDim : (idx+1)*NHeadDim]
 }
 
-// PushCompKV appends one compressed attention KV row.
+// PushCompKV appends one compressed attention KV row using a logical ring.
 func (lc *LayerCache) PushCompKV(kv []float32) {
-	if lc.NComp >= lc.CompCap {
+	if lc.CompCap == 0 {
 		return
 	}
-	copy(lc.CompKV[lc.NComp*NHeadDim:(lc.NComp+1)*NHeadDim], kv)
-	lc.NComp++
+	idx := lc.CompWrite
+	copy(lc.CompKV[idx*NHeadDim:(idx+1)*NHeadDim], kv)
+	lc.CompWrite++
+	if lc.CompWrite >= lc.CompCap {
+		lc.CompWrite = 0
+	}
+	if lc.NComp < lc.CompCap {
+		lc.NComp++
+	}
 }
 
-// PushIndexCompKV appends one compressed indexer KV row.
+func (lc *LayerCache) compStart() int {
+	start := lc.CompWrite - lc.NComp
+	if start < 0 {
+		start += lc.CompCap
+	}
+	return start
+}
+
+// CompRow returns compressed attention row i in chronological order.
+func (lc *LayerCache) CompRow(i int) []float32 {
+	idx := lc.compStart() + i
+	if idx >= lc.CompCap {
+		idx -= lc.CompCap
+	}
+	return lc.CompKV[idx*NHeadDim : (idx+1)*NHeadDim]
+}
+
+// PushIndexCompKV appends one compressed indexer KV row using a logical ring.
 func (lc *LayerCache) PushIndexCompKV(kv []float32) {
-	if lc.NIndexComp >= lc.CompCap {
+	if lc.CompCap == 0 {
 		return
 	}
-	copy(lc.IndexCompKV[lc.NIndexComp*NIndexerHeadDim:(lc.NIndexComp+1)*NIndexerHeadDim], kv)
-	lc.NIndexComp++
+	idx := lc.IndexCompWrite
+	copy(lc.IndexCompKV[idx*NIndexerHeadDim:(idx+1)*NIndexerHeadDim], kv)
+	lc.IndexCompWrite++
+	if lc.IndexCompWrite >= lc.CompCap {
+		lc.IndexCompWrite = 0
+	}
+	if lc.NIndexComp < lc.CompCap {
+		lc.NIndexComp++
+	}
+}
+
+func (lc *LayerCache) indexCompStart() int {
+	start := lc.IndexCompWrite - lc.NIndexComp
+	if start < 0 {
+		start += lc.CompCap
+	}
+	return start
+}
+
+// IndexCompRow returns compressed indexer row i in chronological order.
+func (lc *LayerCache) IndexCompRow(i int) []float32 {
+	idx := lc.indexCompStart() + i
+	if idx >= lc.CompCap {
+		idx -= lc.CompCap
+	}
+	return lc.IndexCompKV[idx*NIndexerHeadDim : (idx+1)*NIndexerHeadDim]
 }
