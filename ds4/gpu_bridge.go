@@ -47,12 +47,12 @@ func (e *Engine) InitGPU() error {
 				fmt.Printf("[gpu] expert pool alloc failed: %v\n", err)
 			}
 
-			// Allocate expert cache (top-16 per layer, ~4.5 GB)
+			// Allocate expert cache (demand-filled, up to 16 per layer)
 			const cachedPerLayer = 16
 			cache, err := gpu.NewExpertCache(cachedPerLayer)
 			if err == nil {
 				ce.expertCache = cache
-				e.loadExpertCache(ce, cachedPerLayer)
+				fmt.Printf("[gpu] Expert cache ready: %d slots/layer (demand-filled)\n", cachedPerLayer)
 			} else {
 				fmt.Printf("[gpu] expert cache alloc failed: %v\n", err)
 			}
@@ -231,7 +231,14 @@ func (e *Engine) gpuExpertForward(
 	upRowBytes := gateRowBytes
 	downRowBytes := (NFFExp / 256) * BlockQ2KSize
 
-	// Check if all experts are cached
+	// Demand-cache: upload any uncached experts to VRAM
+	expertIdxs := make([]int, len(experts))
+	for i, exp := range experts {
+		expertIdxs[i] = exp.idx
+	}
+	e.cacheExpertsOnDemand(ce, il, expertIdxs)
+
+	// Check if all experts are now cached
 	allCached := true
 	for _, exp := range experts {
 		if !ce.expertCache.IsCached(il, exp.idx) {
@@ -295,29 +302,27 @@ func (e *Engine) gpuExpertForward(
 	return true
 }
 
-// loadExpertCache pre-loads top-N experts per layer into VRAM.
-func (e *Engine) loadExpertCache(ce *CUDAEngine, nPerLayer int) {
+// loadExpertCache pre-loads expert weights into VRAM on demand.
+// Called with actual routed experts — caches them for future reuse.
+func (e *Engine) cacheExpertsOnDemand(ce *CUDAEngine, il int, expertIdxs []int) {
+	if ce.expertCache == nil {
+		return
+	}
 	gateRowBytes := (NEmbd / 256) * BlockIQ2XXSSize
 	upRowBytes := gateRowBytes
 	downRowBytes := (NFFExp / 256) * BlockQ2KSize
 
-	loaded := 0
-	for il := 0; il < NLayer; il++ {
-		l := &e.Weights.Layer[il]
-		if len(l.FfnGateExps) == 0 {
+	l := &e.Weights.Layer[il]
+	if len(l.FfnGateExps) == 0 {
+		return
+	}
+	for _, eidx := range expertIdxs {
+		if ce.expertCache.IsCached(il, eidx) {
 			continue
 		}
-		for eidx := 0; eidx < nPerLayer && eidx < NExpert; eidx++ {
-			gateBase := l.FfnGateExps[eidx*gateRowBytes*NFFExp : (eidx+1)*gateRowBytes*NFFExp]
-			upBase := l.FfnUpExps[eidx*upRowBytes*NFFExp : (eidx+1)*upRowBytes*NFFExp]
-			downBase := l.FfnDownExps[eidx*downRowBytes*NEmbd : (eidx+1)*downRowBytes*NEmbd]
-			if err := ce.expertCache.LoadExpert(il, eidx, gateBase, upBase, downBase); err != nil {
-				fmt.Printf("[gpu] expert cache layer %d expert %d: %v\n", il, eidx, err)
-				return
-			}
-			loaded++
-		}
+		gateBase := l.FfnGateExps[eidx*gateRowBytes*NFFExp : (eidx+1)*gateRowBytes*NFFExp]
+		upBase := l.FfnUpExps[eidx*upRowBytes*NFFExp : (eidx+1)*upRowBytes*NFFExp]
+		downBase := l.FfnDownExps[eidx*downRowBytes*NEmbd : (eidx+1)*downRowBytes*NEmbd]
+		ce.expertCache.LoadExpert(il, eidx, gateBase, upBase, downBase)
 	}
-	fmt.Printf("[gpu] Expert cache: %d experts loaded (%.1f GB VRAM)\n",
-		loaded, float64(ce.expertCache.TotalVRAM())/(1024*1024*1024))
 }
