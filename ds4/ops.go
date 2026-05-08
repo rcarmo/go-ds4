@@ -293,13 +293,21 @@ func quantizeQ8_0Activation(x []float32, xq []int8, xscale []float32, xsum []flo
 }
 
 func dotQ8_0Prequant(row []byte, xq []int8, xscale []float32, xsum []float32, nBlocks int) float32 {
-	return simd.DotQ8_0PrequantI8(
-		unsafe.Pointer(&row[0]),
-		unsafe.Pointer(&xq[0]),
-		unsafe.Pointer(&xscale[0]),
-		unsafe.Pointer(&xsum[0]),
-		nBlocks,
-	)
+	// Use the straightforward C-equivalent loop. The older amd64 asm helper is
+	// currently kept only for vet/link compatibility; this path is the reference
+	// for correctness.
+	_ = xsum
+	acc := float32(0)
+	for b := 0; b < nBlocks; b++ {
+		off := b * BlockQ8_0Size
+		d := F16ToF32(*(*uint16)(unsafe.Pointer(&row[off])))
+		dot := int32(0)
+		for i := 0; i < 32; i++ {
+			dot += int32(int8(row[off+2+i])) * int32(xq[b*32+i])
+		}
+		acc += d * xscale[b] * float32(dot)
+	}
+	return acc
 }
 
 // matvecQ8_0 computes out[outDim] = Q8_0_weight[outDim, inDim] · x[inDim].

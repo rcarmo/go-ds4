@@ -59,24 +59,35 @@ func quantizeQ8KScalar(x unsafe.Pointer, out unsafe.Pointer, n int) {
 		bOff := b * 292
 		xOff := b * 256
 		amax := float32(0)
+		maxv := float32(0)
 		for i := 0; i < 256; i++ {
 			v := xp[xOff+i]
-			if v < 0 {
-				v = -v
+			av := v
+			if av < 0 {
+				av = -av
 			}
-			if v > amax {
-				amax = v
+			if av > amax {
+				amax = av
+				maxv = v
 			}
 		}
-		d := amax / 127.0
-		*(*float32)(unsafe.Pointer(&op[bOff])) = d
-		var id float32
-		if d != 0 {
-			id = 1.0 / d
-		}
-		for i := 0; i < 256; i++ {
-			q := int8(math.Round(float64(xp[xOff+i] * id)))
-			op[bOff+4+i] = byte(q)
+		if amax == 0 {
+			*(*float32)(unsafe.Pointer(&op[bOff])) = 0
+			for i := 0; i < 256; i++ {
+				op[bOff+4+i] = 0
+			}
+		} else {
+			iscale := -127.0 / maxv
+			*(*float32)(unsafe.Pointer(&op[bOff])) = 1.0 / iscale
+			for i := 0; i < 256; i++ {
+				q := int(math.RoundToEven(float64(xp[xOff+i] * iscale)))
+				if q > 127 {
+					q = 127
+				} else if q < -128 {
+					q = -128
+				}
+				op[bOff+4+i] = byte(int8(q))
+			}
 		}
 		for j := 0; j < 16; j++ {
 			sum := int16(0)

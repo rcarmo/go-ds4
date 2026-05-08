@@ -83,22 +83,23 @@ func QuantizeQ8K_fast(x []float32, out []byte) {
 		xOff := b * 256
 		block := x[xOff : xOff+256]
 
-		// Find absmax using SIMD-friendly unrolled loop
+		// Match ds4.c ds4_quantize_row_q8_K: keep the signed value whose
+		// absolute magnitude is maximal, use iscale=-127/max, and store d=1/iscale.
 		amax := float32(0)
+		maxv := float32(0)
 		for _, v := range block {
-			if v < 0 {
-				if -v > amax {
-					amax = -v
-				}
-			} else if v > amax {
-				amax = v
+			av := v
+			if av < 0 {
+				av = -av
+			}
+			if av > amax {
+				amax = av
+				maxv = v
 			}
 		}
 
-		d := amax / 127.0
-		*(*float32)(unsafe.Pointer(&out[bOff])) = d
-
 		if amax == 0 {
+			*(*float32)(unsafe.Pointer(&out[bOff])) = 0
 			for i := 0; i < 256; i++ {
 				out[bOff+4+i] = 0
 			}
@@ -108,21 +109,15 @@ func QuantizeQ8K_fast(x []float32, out []byte) {
 			continue
 		}
 
-		id := 127.0 / amax
+		iscale := -127.0 / maxv
+		*(*float32)(unsafe.Pointer(&out[bOff])) = 1.0 / iscale
 
-		// Quantize with simple rounding (avoid math.Round)
 		for i := 0; i < 256; i++ {
-			v := block[i] * id
-			var q int32
-			if v >= 0 {
-				q = int32(v + 0.5)
-			} else {
-				q = int32(v - 0.5)
-			}
+			q := int32(math.RoundToEven(float64(block[i] * iscale)))
 			if q > 127 {
 				q = 127
-			} else if q < -127 {
-				q = -127
+			} else if q < -128 {
+				q = -128
 			}
 			out[bOff+4+i] = byte(int8(q))
 		}
