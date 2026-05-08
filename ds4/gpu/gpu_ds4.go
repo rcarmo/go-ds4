@@ -24,6 +24,7 @@ package gpu
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"unsafe"
 )
@@ -60,11 +61,14 @@ func GPUInit() *GPUEngine {
 	}
 
 	// Pre-compile kernels from embedded SPIR-V
-	if k, err := VkKernelCreate(SPIRVGemvF32, 3, 8); err == nil {
-		g.gemvF32 = k
-	}
-	if k, err := VkKernelCreate(SPIRVGemvQ8_0F16Scale, 3, 12); err == nil {
-		g.gemvQ8_0 = k
+	// Skip on software renderers (llvmpipe) — they crash on some SPIR-V
+	if g.devName != "" && !strings.Contains(g.devName, "llvmpipe") {
+		if k, err := VkKernelCreate(SPIRVGemvF32, 3, 8); err == nil {
+			g.gemvF32 = k
+		}
+		if k, err := VkKernelCreate(SPIRVGemvQ8_0F16Scale, 3, 12); err == nil {
+			g.gemvQ8_0 = k
+		}
 	}
 
 	fmt.Printf("[gpu] Vulkan compute ready: %s\n", g.devName)
