@@ -102,7 +102,7 @@ func layerFFNDecode(
 					midQ := ds.ExpertMidQ[idx*midQStride : (idx+1)*midQStride]
 					gate := ds.ExpertGate[idx*NFFExp : (idx+1)*NFFExp]
 					up := ds.ExpertUp[idx*NFFExp : (idx+1)*NFFExp]
-					expertForwardFast(out, ds.RoutedXQ, midQ, gate, up, layer, e.idx, e.score, streamer, model, il)
+					expertForwardFast(out, ds.RoutedXQ, midQ, ds.Cfg(), gate, up, layer, e.idx, e.score, streamer, model, il)
 				}(i, exp)
 			}
 			wg.Wait()
@@ -128,6 +128,7 @@ func layerFFNDecode(
 
 // routeExperts selects the top-K experts for a token.
 func routeExperts(ds *DecodeState, normed []float32, layer *LayerWeights, il, tokenID, nExperts int) []expertScore {
+	cfg := ds.Cfg()
 	// Check for hash routing (3 hash layers)
 	if layer.FfnGateTid2Eid != nil {
 		nHash := nExperts
@@ -144,7 +145,6 @@ func routeExperts(ds *DecodeState, normed []float32, layer *LayerWeights, il, to
 	}
 
 	// Standard routing: gate logits from normed activation
-	cfg := ds.Cfg()
 	nExp := cfg.NExpert
 	logits := ds.RouteLogits[:nExp]
 
@@ -228,14 +228,19 @@ func hashRouteExperts(layer *LayerWeights, tokenID int) []expertScore {
 }
 
 // expertForwardFast runs a single expert with pre-allocated buffers.
-func expertForwardFast(out []float32, xQ8K, midQ []byte,
+func expertForwardFast(out []float32, xQ8K, midQ []byte, cfg *ModelConfig,
 	gate, up []float32,
 	layer *LayerWeights, expertIdx int, weight float32,
 	streamer *DiskStreamer, model *GGUFModel, il int) {
 
-	gateRowBytes := (NEmbd / QK_K) * BlockIQ2XXSSize
-	upRowBytes := gateRowBytes
-	downRowBytes := (NFFExp / QK_K) * BlockQ2KSize
+	ed := detectExpertDims(layer, cfg)
+	gateRowBytes := ed.gateRowBytes
+	upRowBytes := ed.upRowBytes
+	downRowBytes := ed.downRowBytes
+	ffnDim := ed.outDim
+	if ffnDim == 0 {
+		ffnDim = NFFExp
+	}
 
 	var gateBase, upBase, downBase []byte
 
@@ -260,15 +265,23 @@ func expertForwardFast(out []float32, xQ8K, midQ []byte,
 			streamer.ReturnBuffer(downBase)
 		}()
 	} else {
-		gateBase = layer.FfnGateExps[expertIdx*gateRowBytes*NFFExp:]
-		upBase = layer.FfnUpExps[expertIdx*upRowBytes*NFFExp:]
-		downBase = layer.FfnDownExps[expertIdx*downRowBytes*NEmbd:]
+		gateBase = layer.FfnGateExps[expertIdx*gateRowBytes*ffnDim:]
+		upBase = layer.FfnUpExps[expertIdx*upRowBytes*ffnDim:]
+		downBase = layer.FfnDownExps[expertIdx*downRowBytes*cfg.NEmbd:]
 	}
 
 	// IQ2_XXS gate+up projections
-	for o := 0; o < NFFExp; o++ {
-		gate[o] = VecDotIQ2XXSQ8K(NEmbd, gateBase[o*gateRowBytes:(o+1)*gateRowBytes], xQ8K)
-		up[o] = VecDotIQ2XXSQ8K(NEmbd, upBase[o*upRowBytes:(o+1)*upRowBytes], xQ8K)
+	for o := 0; o < ffnDim; o++ {
+		if ed.gateIsIQ2 {
+			gate[o] = VecDotIQ2XXSQ8K(cfg.NEmbd, gateBase[o*gateRowBytes:(o+1)*gateRowBytes], xQ8K)
+		} else {
+			gate[o] = VecDotQ2KQ8K(cfg.NEmbd, gateBase[o*gateRowBytes:(o+1)*gateRowBytes], xQ8K)
+		}
+		if ed.gateIsIQ2 {
+			up[o] = VecDotIQ2XXSQ8K(cfg.NEmbd, upBase[o*upRowBytes:(o+1)*upRowBytes], xQ8K)
+		} else {
+			up[o] = VecDotQ2KQ8K(cfg.NEmbd, upBase[o*upRowBytes:(o+1)*upRowBytes], xQ8K)
+		}
 	}
 
 	// SwiGLU
@@ -278,88 +291,26 @@ func expertForwardFast(out []float32, xQ8K, midQ []byte,
 	QuantizeRowQ8K(gate, midQ)
 
 	// Q2_K down projection
-	for o := 0; o < NEmbd; o++ {
-		out[o] += weight * VecDotQ2KQ8K(NFFExp, downBase[o*downRowBytes:(o+1)*downRowBytes], midQ)
+	for o := 0; o < cfg.NEmbd; o++ {
+		out[o] += weight * VecDotQ2KQ8K(ffnDim, downBase[o*downRowBytes:(o+1)*downRowBytes], midQ)
 	}
 }
 
 // expertForwardInto runs a single routed expert into a provided output buffer.
-// Thread-safe: uses provided scratch buffers instead of shared DecodeState.
-func expertForwardInto(out []float32, xQ8K, midQ []byte,
-	layer *LayerWeights, expertIdx int, weight float32,
-	streamer *DiskStreamer, model *GGUFModel, il int) {
-
-	gateRowBytes := (NEmbd / QK_K) * BlockIQ2XXSSize
-	upRowBytes := gateRowBytes
-	downRowBytes := (NFFExp / QK_K) * BlockQ2KSize
-
-	var gateBase, upBase, downBase []byte
-
-	if streamer != nil {
-		prefix := fmt.Sprintf("blk.%d.", il)
-		gateTensor := model.Tensors[prefix+"ffn_gate_exps.weight"]
-		upTensor := model.Tensors[prefix+"ffn_up_exps.weight"]
-		downTensor := model.Tensors[prefix+"ffn_down_exps.weight"]
-		var err error
-		gateBase, err = streamer.ReadExpertTensor(gateTensor, expertIdx)
-		if err != nil {
-			return
-		}
-		upBase, err = streamer.ReadExpertTensor(upTensor, expertIdx)
-		if err != nil {
-			return
-		}
-		downBase, err = streamer.ReadExpertTensor(downTensor, expertIdx)
-		if err != nil {
-			return
-		}
-		defer func() {
-			streamer.ReturnBuffer(gateBase)
-			streamer.ReturnBuffer(upBase)
-			streamer.ReturnBuffer(downBase)
-		}()
-	} else {
-		gateBase = layer.FfnGateExps[expertIdx*gateRowBytes*NFFExp:]
-		upBase = layer.FfnUpExps[expertIdx*upRowBytes*NFFExp:]
-		downBase = layer.FfnDownExps[expertIdx*downRowBytes*NEmbd:]
-	}
-
-	gate := make([]float32, NFFExp)
-	up := make([]float32, NFFExp)
-
-	for o := 0; o < NFFExp; o++ {
-		gateRow := gateBase[o*gateRowBytes : (o+1)*gateRowBytes]
-		upRow := upBase[o*upRowBytes : (o+1)*upRowBytes]
-		gate[o] = VecDotIQ2XXSQ8K(NEmbd, gateRow, xQ8K)
-		up[o] = VecDotIQ2XXSQ8K(NEmbd, upRow, xQ8K)
-	}
-
-	swiGLU(gate, gate, up)
-
-	for i := range gate {
-		if gate[i] > SwiGLUClampExp {
-			gate[i] = SwiGLUClampExp
-		}
-		if gate[i] < -SwiGLUClampExp {
-			gate[i] = -SwiGLUClampExp
-		}
-	}
-
-	QuantizeRowQ8K(gate, midQ)
-
-	for o := 0; o < NEmbd; o++ {
-		downRow := downBase[o*downRowBytes : (o+1)*downRowBytes]
-		out[o] += weight * VecDotQ2KQ8K(NFFExp, downRow, midQ)
-	}
-}
 
 // expertForward runs a single routed expert: gate·up (IQ2_XXS) → SwiGLU → down (Q2_K).
 // If streamer is non-nil, expert weights are read from disk instead of mmap.
 func expertForward(ds *DecodeState, layer *LayerWeights, expertIdx int, weight float32,
 	streamer *DiskStreamer, model *GGUFModel, il int) {
-	gateRowBytes := (NEmbd / QK_K) * BlockIQ2XXSSize
-	upRowBytes := gateRowBytes
-	downRowBytes := (NFFExp / QK_K) * BlockQ2KSize
+	cfg := ds.Cfg()
+	ed := detectExpertDims(layer, cfg)
+	gateRowBytes := ed.gateRowBytes
+	upRowBytes := ed.upRowBytes
+	downRowBytes := ed.downRowBytes
+	ffnDim := ed.outDim
+	if ffnDim == 0 {
+		ffnDim = NFFExp
+	}
 
 	var gateBase, upBase, downBase []byte
 
@@ -390,16 +341,16 @@ func expertForward(ds *DecodeState, layer *LayerWeights, expertIdx int, weight f
 		}()
 	} else {
 		// mmap path: slice into the contiguous expert tensor
-		gateBase = layer.FfnGateExps[expertIdx*gateRowBytes*NFFExp:]
-		upBase = layer.FfnUpExps[expertIdx*upRowBytes*NFFExp:]
-		downBase = layer.FfnDownExps[expertIdx*downRowBytes*NEmbd:]
+		gateBase = layer.FfnGateExps[expertIdx*gateRowBytes*ffnDim:]
+		upBase = layer.FfnUpExps[expertIdx*upRowBytes*ffnDim:]
+		downBase = layer.FfnDownExps[expertIdx*downRowBytes*cfg.NEmbd:]
 	}
 
 	gate := make([]float32, NFFExp)
 	up := make([]float32, NFFExp)
 
 	// Gate/Up: IQ2_XXS weight × Q8_K activation
-	for o := 0; o < NFFExp; o++ {
+	for o := 0; o < ffnDim; o++ {
 		gateRow := gateBase[o*gateRowBytes : (o+1)*gateRowBytes]
 		upRow := upBase[o*upRowBytes : (o+1)*upRowBytes]
 		gate[o] = VecDotIQ2XXSQ8K(NEmbd, gateRow, ds.RoutedXQ)
@@ -423,7 +374,7 @@ func expertForward(ds *DecodeState, layer *LayerWeights, expertIdx int, weight f
 	QuantizeRowQ8K(gate, midQ)
 
 	// Down projection: Q2_K [NEmbd, NFFExp] × Q8_K hidden
-	for o := 0; o < NEmbd; o++ {
+	for o := 0; o < cfg.NEmbd; o++ {
 		downRow := downBase[o*downRowBytes : (o+1)*downRowBytes]
 		ds.RoutedOut[o] += weight * VecDotQ2KQ8K(NFFExp, downRow, midQ)
 	}
@@ -431,12 +382,25 @@ func expertForward(ds *DecodeState, layer *LayerWeights, expertIdx int, weight f
 
 // sharedExpertForward runs the always-active shared expert (Q8_0).
 func sharedExpertForward(ds *DecodeState, layer *LayerWeights) {
-	gate := ds.SharedGate
-	up := ds.SharedUp
-	matvecQ8_0GPULayer(gate, layer.FfnGateShexp, ds.FfnNormed, NEmbd, NFFExp, ds, "ffn_gate_shexp.weight")
-	matvecQ8_0GPULayer(up, layer.FfnUpShexp, ds.FfnNormed, NEmbd, NFFExp, ds, "ffn_up_shexp.weight")
+	// Detect shared expert FFN dim from tensor size
+	cfg := ds.Cfg()
+	sharedFFN := cfg.NFFExp
+	if len(layer.FfnGateShexp) > 0 {
+		// Q8_0: rowBytes = (inDim/32)*34, nRows = len/rowBytes
+		rowBytes := (cfg.NEmbd / 32) * BlockQ8_0Size
+		if rowBytes > 0 {
+			detected := len(layer.FfnGateShexp) / rowBytes
+			if detected > 0 {
+				sharedFFN = detected
+			}
+		}
+	}
+	gate := make([]float32, sharedFFN)
+	up := make([]float32, sharedFFN)
+	matvecQ8_0(gate, layer.FfnGateShexp, ds.FfnNormed, cfg.NEmbd, sharedFFN)
+	matvecQ8_0(up, layer.FfnUpShexp, ds.FfnNormed, cfg.NEmbd, sharedFFN)
 	swiGLU(gate, gate, up)
-	matvecQ8_0GPULayer(ds.SharedOut, layer.FfnDownShexp, gate, NFFExp, NEmbd, ds, "ffn_down_shexp.weight")
+	matvecQ8_0(ds.SharedOut, layer.FfnDownShexp, gate, sharedFFN, cfg.NEmbd)
 }
 
 // layerForwardDecode runs one full transformer layer for a single decode token.
