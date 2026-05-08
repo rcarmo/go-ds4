@@ -60,17 +60,17 @@ func NewKVCache(ctxSize int) *KVCache {
 // layerCompressRatio returns the KV compression ratio for a given layer.
 // Mirrors ds4_layer_compress_ratio() in ds4.c.
 func layerCompressRatio(il int) int {
-	// Layer 0: no compression (dense attention)
-	// Layers 1-3: ratio 4 (with indexer)
-	// Layers 4+: ratio 2 (compressed, no indexer)
-	// This is model-specific — should match the GGUF metadata.
-	if il == 0 {
+	// DeepSeek V4 Flash layout (from ds4.c):
+	// - Layers 0-1: dense attention (no compression)
+	// - Even layers >= 2: ratio-4 compression (with indexer)
+	// - Odd layers >= 3: ratio-128 compression (no indexer)
+	if il < 2 {
 		return 0
 	}
-	if il <= 3 {
+	if il&1 == 0 {
 		return 4
 	}
-	return 2
+	return 128
 }
 
 // PushRawKV appends a new KV row to the sliding window (circular buffer).
