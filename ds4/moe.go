@@ -488,35 +488,44 @@ func layerForwardDecode(
 
 // outputLogits computes the LM head: HC collapse → RMSNorm → Q8_0 matmul → logits.
 func outputLogits(ds *DecodeState, logits []float32, hcState []float32, w *Weights) {
-	hcBase := tensorF32Unsafe(w.OutputHCBase)
-	hcScale := tensorF32Unsafe(w.OutputHCScale)
-	hcFnU16 := unsafe.Slice((*uint16)(unsafe.Pointer(&w.OutputHCFn[0])), hcDim*NHC)
+	cfg := ds.Cfg()
 
-	flat := ds.OutFlat
-	copy(flat, hcState[:hcDim])
-	rmsNormNoScale(flat)
+	var collapsed []float32
+	if cfg.NHC > 0 && len(w.OutputHCBase) > 0 {
+		// V4: HC collapse (sigmoid-weighted 4-stream sum)
+		hcBase := tensorF32Unsafe(w.OutputHCBase)
+		hcScale := tensorF32Unsafe(w.OutputHCScale)
+		hcFnU16 := unsafe.Slice((*uint16)(unsafe.Pointer(&w.OutputHCFn[0])), hcDim*NHC)
 
-	hcWeights := ds.OutHCWeights
-	for j := 0; j < NHC; j++ {
-		row := hcFnU16[j*hcDim : (j+1)*hcDim]
-		hcWeights[j] = sigmoid(hcScale[0]*DotF16(row, flat) + hcBase[j])
-	}
+		flat := ds.OutFlat
+		copy(flat, hcState[:hcDim])
+		rmsNormNoScale(flat)
 
-	collapsed := ds.OutCollapsed
-	for i := range collapsed {
-		collapsed[i] = 0
-	}
-	for s := 0; s < NHC; s++ {
-		wt := hcWeights[s]
-		for i := 0; i < NEmbd; i++ {
-			collapsed[i] += wt * hcState[s*NEmbd+i]
+		hcWeights := ds.OutHCWeights
+		for j := 0; j < NHC; j++ {
+			row := hcFnU16[j*hcDim : (j+1)*hcDim]
+			hcWeights[j] = sigmoid(hcScale[0]*DotF16(row, flat) + hcBase[j])
 		}
+
+		collapsed = ds.OutCollapsed
+		for i := range collapsed {
+			collapsed[i] = 0
+		}
+		for s := 0; s < NHC; s++ {
+			wt := hcWeights[s]
+			for i := 0; i < NEmbd; i++ {
+				collapsed[i] += wt * hcState[s*NEmbd+i]
+			}
+		}
+	} else {
+		// V2: no HC, just use stream 0
+		collapsed = make([]float32, cfg.NEmbd)
+		copy(collapsed, hcState[:cfg.NEmbd])
 	}
 
 	outputNormW := tensorF32Unsafe(w.OutputNorm)
 	rmsNorm(collapsed, outputNormW)
-	// 3. Output projection: Q8_0 [NEmbd, NVocab] — GPU-accelerated if available
-	matvecQ8_0GPU(logits, w.Output, collapsed, NEmbd, NVocab, ds.Engine, "output.weight")
+	matvecAuto(logits, w.Output, collapsed, cfg.NEmbd, cfg.NVocab)
 }
 
 // Argmax returns the index of the maximum value.

@@ -50,6 +50,7 @@ const (
 	TensorQ2_K   = 10
 	TensorQ4_K   = 12
 	TensorQ5_K   = 13
+	TensorQ3_K   = 11
 	TensorIQ2XXS = 16
 	TensorI32    = 26
 )
@@ -76,6 +77,8 @@ func TensorTypeSize(typ uint32) (bytesPerBlock int, elementsPerBlock int) {
 		return BlockQ2KSize, QK_K
 	case TensorQ4_K:
 		return BlockQ4KSize, QK_K
+	case TensorQ3_K:
+		return BlockQ3KSize, QK_K
 	case TensorQ5_K:
 		return BlockQ5KSize, QK_K
 	case TensorIQ2XXS:

@@ -148,7 +148,7 @@ func layerAttnDecode(
 	if isV2 {
 		// V2 Lite: direct Q projection + split KV
 		// Q: [NEmbd, NHead*NHeadDim]
-		matvecQ8_0(ds.Q, layer.AttnQ, ds.AttnNormed, cfg.NEmbd, cfg.NHead*(cfg.NHeadDim))
+		matvecAuto(ds.Q, layer.AttnQ, ds.AttnNormed, cfg.NEmbd, cfg.NHead*(cfg.NHeadDim))
 
 		// KV: two-stage: kv_a_mqa [NEmbd, kv_lora_rank+NRot] then kv_b [kv_lora_rank, NHead*NHeadDim]
 		// For simplicity: compute KV_A, norm, then KV_B
@@ -157,7 +157,7 @@ func layerAttnDecode(
 			kvLoraRank = 512
 		}
 		kvA := make([]float32, kvLoraRank+cfg.NRot)
-		matvecQ8_0(kvA, layer.AttnKVA_MQA, ds.AttnNormed, cfg.NEmbd, kvLoraRank+cfg.NRot)
+		matvecAuto(kvA, layer.AttnKVA_MQA, ds.AttnNormed, cfg.NEmbd, kvLoraRank+cfg.NRot)
 
 		// Norm the non-RoPE part
 		if len(layer.AttnKVANorm) > 0 {
@@ -166,7 +166,7 @@ func layerAttnDecode(
 		}
 
 		// KV_B: expand [kvLoraRank] -> [NHead*NHeadDim]
-		matvecQ8_0(ds.KV, layer.AttnKVB, kvA[:kvLoraRank], kvLoraRank, cfg.NHeadDim)
+		matvecAuto(ds.KV, layer.AttnKVB, kvA[:kvLoraRank], kvLoraRank, cfg.NHeadDim)
 
 		// Per-head RMSNorm on Q
 		for h := 0; h < cfg.NHead; h++ {
@@ -344,8 +344,8 @@ func layerAttnDecode(
 	ropeYaRNTailInplace(ds.Heads, pos, cfg.NHead, cfg.NHeadDim, cfg.NRot, freqBase, freqScale, true)
 
 	if isV2 {
-		// V2: direct output projection
-		matvecQ8_0(ds.AttnOut, layer.AttnOutput, ds.Heads, cfg.NHead*cfg.NHeadDim, cfg.NEmbd)
+		// V2: direct output projection (may be Q3_K or Q8_0)
+		matvecAuto(ds.AttnOut, layer.AttnOutput, ds.Heads, cfg.NHead*cfg.NHeadDim, cfg.NEmbd)
 	} else {
 		// V4: grouped LoRA output
 		matvecQ8_0Grouped(ds.TmpLoRA, layer.AttnOutputA, ds.Heads, NHead*NValueDim, NLoraO, NOutGroup)

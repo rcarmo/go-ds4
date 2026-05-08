@@ -309,3 +309,49 @@ func parallelFor(n int, fn func(start, end int)) {
 	}
 	wg.Wait()
 }
+
+// matvecAuto detects the quantization format from tensor size and dispatches.
+func matvecAuto(out []float32, w []byte, x []float32, inDim, outDim int) {
+	if len(w) == 0 {
+		return
+	}
+	bytesPerRow := len(w) / outDim
+	q8RowBytes := (inDim / 32) * BlockQ8_0Size
+	q3kRowBytes := ((inDim + QK_K - 1) / QK_K) * BlockQ3KSize
+	q2kRowBytes := ((inDim + QK_K - 1) / QK_K) * BlockQ2KSize
+
+	switch {
+	case bytesPerRow == q8RowBytes:
+		// Q8_0
+		matvecQ8_0(out, w, x, inDim, outDim)
+	case bytesPerRow == q3kRowBytes:
+		// Q3_K — need Q8_K quantized activation
+		xQ8K := make([]byte, ((inDim+QK_K-1)/QK_K)*BlockQ8KSize)
+		padded := make([]float32, ((inDim+QK_K-1)/QK_K)*QK_K)
+		copy(padded, x)
+		QuantizeRowQ8K(padded, xQ8K)
+		parallelFor(outDim, func(start, end int) {
+			for o := start; o < end; o++ {
+				row := w[o*bytesPerRow : (o+1)*bytesPerRow]
+				out[o] = VecDotQ3KQ8K(inDim, row, xQ8K)
+			}
+		})
+	case bytesPerRow == q2kRowBytes:
+		// Q2_K
+		xQ8K := make([]byte, ((inDim+QK_K-1)/QK_K)*BlockQ8KSize)
+		padded := make([]float32, ((inDim+QK_K-1)/QK_K)*QK_K)
+		copy(padded, x)
+		QuantizeRowQ8K(padded, xQ8K)
+		parallelFor(outDim, func(start, end int) {
+			for o := start; o < end; o++ {
+				row := w[o*bytesPerRow : (o+1)*bytesPerRow]
+				out[o] = VecDotQ2KQ8K(inDim, row, xQ8K)
+			}
+		})
+	default:
+		// Unknown format — zero output
+		for i := range out[:outDim] {
+			out[i] = 0
+		}
+	}
+}
