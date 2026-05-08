@@ -28,6 +28,7 @@ type Engine struct {
 	Budget      *MemoryBudget
 	Streamer    *DiskStreamer // non-nil when StreamExperts is enabled
 	FastExperts bool          // use top-4 instead of top-6
+	GPU         interface{}   // *gpu.GPUEngine when GPU available (avoid import cycle)
 }
 
 // EngineOptions configures engine loading.
@@ -38,6 +39,7 @@ type EngineOptions struct {
 	EvictExperts  bool // MADV_DONTNEED cold experts after each layer
 	StreamExperts bool // read expert weights from disk instead of mmap
 	FastExperts   bool // use top-4 instead of top-6 experts (faster, slight quality loss)
+	UseGPU        bool // attempt Vulkan GPU acceleration for dense projections
 }
 
 // OpenEngine loads a GGUF model with sensible defaults for low-memory operation.
