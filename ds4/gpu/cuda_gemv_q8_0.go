@@ -190,3 +190,88 @@ func CUDAMatvecQ8_0(output, activation *Buffer, weightPtr CUdeviceptr, inDim, ou
 
 	return LaunchKernel(cudaGemvQ8_0, uint32(outDim), 1, 1, 256, 1, 1, 256*4, args...)
 }
+
+// SwiGLU PTX kernel: dst[i] = silu(a[i]) * b[i] = a[i] * sigmoid(a[i]) * b[i]
+const DS4SwiGLUPTX = `.version 7.0
+.target sm_80
+.address_size 64
+.visible .entry swiglu(
+    .param .u64 param_a,
+    .param .u64 param_b,
+    .param .u64 param_dst,
+    .param .u32 param_n
+) {
+    .reg .u32 %r<4>;
+    .reg .u64 %rd<8>;
+    .reg .f32 %f<8>;
+    .reg .pred %p0;
+    mov.u32 %r0, %ctaid.x;
+    mov.u32 %r1, %ntid.x;
+    mov.u32 %r2, %tid.x;
+    mad.lo.u32 %r2, %r0, %r1, %r2;
+    ld.param.u32 %r3, [param_n];
+    setp.ge.u32 %p0, %r2, %r3;
+    @%p0 bra done;
+    ld.param.u64 %rd0, [param_a];
+    ld.param.u64 %rd1, [param_b];
+    ld.param.u64 %rd2, [param_dst];
+    mul.wide.u32 %rd3, %r2, 4;
+    add.u64 %rd4, %rd0, %rd3;
+    add.u64 %rd5, %rd1, %rd3;
+    add.u64 %rd6, %rd2, %rd3;
+    ld.global.f32 %f0, [%rd4];
+    ld.global.f32 %f1, [%rd5];
+    // sigmoid(x) = 1/(1+exp(-x))
+    neg.f32 %f2, %f0;
+    ex2.approx.f32 %f2, %f2;    // exp2(-x) ≈ exp(-x*1.4427)... need proper exp
+    // Actually use: 1/(1+exp(-x)) via logistic approx
+    // Better: use __expf via mul by -1.4426950408 then ex2
+    mul.f32 %f2, %f0, 0fBFB8AA3B;  // -1/ln(2) = -1.4426950408
+    ex2.approx.f32 %f2, %f2;         // 2^(-x/ln2) = e^(-x)
+    add.f32 %f3, %f2, 0f3F800000;    // 1 + exp(-x)
+    rcp.approx.f32 %f3, %f3;          // 1/(1+exp(-x)) = sigmoid
+    mul.f32 %f4, %f0, %f3;            // x * sigmoid(x) = silu(x)
+    mul.f32 %f4, %f4, %f1;            // silu(x) * b
+    st.global.f32 [%rd6], %f4;
+done:
+    ret;
+}
+`
+
+var cudaSwiGLU CUfunction
+var cudaSwiGLUReady bool
+
+func InitCUDASwiGLU() bool {
+	if cudaSwiGLUReady {
+		return true
+	}
+	if !Available() {
+		return false
+	}
+	EnsureContext()
+	fn, err := LoadPTX(DS4SwiGLUPTX, "swiglu")
+	if err != nil {
+		fmt.Printf("[gpu] SwiGLU PTX load failed: %v\n", err)
+		return false
+	}
+	cudaSwiGLU = fn
+	cudaSwiGLUReady = true
+	return true
+}
+
+// CUDASwiGLU dispatches dst[i] = silu(a[i]) * b[i] on GPU.
+func CUDASwiGLU(dst, a, b *Buffer, n int) error {
+	if !cudaSwiGLUReady {
+		return fmt.Errorf("SwiGLU not compiled")
+	}
+	nn := uint32(n)
+	aPtr, bPtr, dPtr := a.Ptr, b.Ptr, dst.Ptr
+	args := []unsafe.Pointer{
+		unsafe.Pointer(&aPtr), unsafe.Pointer(&bPtr),
+		unsafe.Pointer(&dPtr), unsafe.Pointer(&nn),
+	}
+	groups := (nn + 255) / 256
+	return LaunchKernel(cudaSwiGLU, groups, 1, 1, 256, 1, 1, 0, args...)
+}
+
+func CudaSwiGLUReady() bool { return cudaSwiGLUReady }

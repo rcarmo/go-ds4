@@ -31,6 +31,7 @@ func (e *Engine) InitGPU() error {
 
 			// Init IQ2/Q2K kernels too
 			gpu.InitCUDAGemvQ2K()
+			gpu.InitCUDASwiGLU()
 			// Init IQ2 kernel with grid table
 			gridSlice := (*[256 * 128 * 8]int8)(unsafe.Pointer(&iq2xxsSignedGrid[0]))
 			gpu.InitCUDAGemvIQ2(gridSlice[:])
@@ -216,82 +217,64 @@ func (ce *CUDAEngine) Close() {
 	ce.ready = false
 }
 
-// gpuExpertForward runs cached experts on GPU, skips uncached ones.
-// Returns true only if ALL experts were handled on GPU.
+// gpuExpertForward runs all expert compute on GPU without CPU round-trips.
+// Gate → Up → SwiGLU → Down all execute on GPU. Single sync at the end.
 func (e *Engine) gpuExpertForward(
 	ds *DecodeState, layer *LayerWeights,
 	experts []expertScore, il int,
 ) bool {
 	ce, ok := e.GPU.(*CUDAEngine)
-	if !ok || !ce.ready || ce.expertCache == nil || !gpu.CudaGemvIQ2Ready() || !gpu.CudaGemvQ2KReady() {
+	if !ok || !ce.ready || ce.expertCache == nil {
+		return false
+	}
+	if !gpu.CudaGemvIQ2Ready() || !gpu.CudaGemvQ2KReady() || !gpu.CudaSwiGLUReady() {
 		return false
 	}
 
-	gateRowBytes := (NEmbd / 256) * BlockIQ2XXSSize
-	upRowBytes := gateRowBytes
-	downRowBytes := (NFFExp / 256) * BlockQ2KSize
-
-	// Demand-cache: upload any uncached experts to VRAM
 	expertIdxs := make([]int, len(experts))
 	for i, exp := range experts {
 		expertIdxs[i] = exp.idx
 	}
 	e.cacheExpertsOnDemand(ce, il, expertIdxs)
-
-	// Check if all experts are now cached
-	allCached := true
 	for _, exp := range experts {
 		if !ce.expertCache.IsCached(il, exp.idx) {
-			allCached = false
-			break
+			return false
 		}
 	}
-	if !allCached {
-		return false // fall back to CPU for entire batch
-	}
 
-	// Upload f32 activation once
 	actBuf := ce.expertCache.ActBuf(il)
+	outBuf := ce.expertCache.OutBuf(il)
+	midBuf := ce.expertCache.MidBuf(il)
+	gateRowBytes := (NEmbd / 256) * BlockIQ2XXSSize
+	upRowBytes := gateRowBytes
+	downRowBytes := (NFFExp / 256) * BlockQ2KSize
+
+	// Single activation upload
 	actBuf.Upload(ds.FfnNormed)
 
 	for _, exp := range experts {
 		gatePtr, upPtr, downPtr, _ := ce.expertCache.Get(il, exp.idx)
 
-		// Gate: IQ2_XXS
-		outBuf := ce.expertCache.OutBuf(il)
-		if err := gpu.CUDAMatvecIQ2(outBuf, actBuf, gatePtr,
-			NEmbd, NFFExp, gateRowBytes*NFFExp); err != nil {
-			return false
-		}
+		// All on GPU, no sync between:
+		// 1. IQ2 gate: actBuf → outBuf [NFFExp]
+		gpu.CUDAMatvecIQ2(outBuf, actBuf, gatePtr, NEmbd, NFFExp, gateRowBytes*NFFExp)
+		// 2. IQ2 up: actBuf → midBuf [NFFExp]
+		gpu.CUDAMatvecIQ2(midBuf, actBuf, upPtr, NEmbd, NFFExp, upRowBytes*NFFExp)
+		// 3. SwiGLU on GPU: outBuf = silu(outBuf) * midBuf
+		gpu.CUDASwiGLU(outBuf, outBuf, midBuf, NFFExp)
+		// 4. Q2K down: outBuf[NFFExp] → midBuf reused as act → ...
+		// Need outBuf as activation for Q2K. But outBuf has NFFExp=2048 floats, actBuf has NEmbd=4096.
+		// Use midBuf as the SwiGLU output, feed to Q2K:
+		// Actually: after SwiGLU, outBuf has the hidden state [NFFExp].
+		// Q2K down: weight[NEmbd, NFFExp] × hidden[NFFExp] → result[NEmbd]
+		// We need a separate buffer for Q2K input (outBuf) and output.
+		// Reuse actBuf (which we no longer need for this expert):
+		gpu.CUDAMatvecQ2K(actBuf, outBuf, downPtr, NFFExp, NEmbd, downRowBytes*NEmbd)
 
-		// Up: IQ2_XXS (reuse midBuf for up result)
-		midBuf := ce.expertCache.MidBuf(il)
-		if err := gpu.CUDAMatvecIQ2(midBuf, actBuf, upPtr,
-			NEmbd, NFFExp, upRowBytes*NFFExp); err != nil {
-			return false
-		}
-
-		// Download gate and up
-		gate := ds.ExpertGate[:NFFExp]
-		up := ds.ExpertUp[:NFFExp]
-		outBuf.Download(gate)
-		midBuf.Download(up)
-
-		// SwiGLU on CPU
-		swiGLU(gate, gate, up)
-
-		// Upload for Q2K down
-		actBuf.Upload(gate)
-
-		// Down: Q2_K
-		if err := gpu.CUDAMatvecQ2K(outBuf, actBuf, downPtr,
-			NFFExp, NEmbd, downRowBytes*NEmbd); err != nil {
-			return false
-		}
-
-		// Download and accumulate
+		// Only sync + download at the end of this expert
+		gpu.Sync()
 		result := ds.ExpertOut[:NEmbd]
-		outBuf.Download(result)
+		actBuf.Download(result)
 		for i := 0; i < NEmbd; i++ {
 			ds.RoutedOut[i] += exp.score * result[i]
 		}

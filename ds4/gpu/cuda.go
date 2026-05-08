@@ -114,6 +114,9 @@ func Init() bool {
 		regFn(&cuCtxSetCurrent, lib, "cuCtxSetCurrent")
 		regFn(&cuMemcpyDtoD, lib, "cuMemcpyDtoD_v2", "cuMemcpyDtoD")
 		regFn(&cuMemcpyDtoDAsync, lib, "cuMemcpyDtoDAsync_v2", "cuMemcpyDtoDAsync")
+		regFn(&cuStreamCreate, lib, "cuStreamCreate")
+		regFn(&cuStreamDestroy, lib, "cuStreamDestroy_v2", "cuStreamDestroy")
+		regFn(&cuStreamSynchronize, lib, "cuStreamSynchronize")
 
 		// Streams, events, graphs
 		regFn(&cuMemGetInfo, lib, "cuMemGetInfo_v2", "cuMemGetInfo")
@@ -340,4 +343,71 @@ func Shutdown() {
 	gpuName = ""
 	gpuSMs = 0
 	gpuOnce = sync.Once{}
+}
+
+// CUDA stream functions
+var (
+	cuStreamCreate      func(*uintptr, uint32) CUresult
+	cuStreamDestroy     func(uintptr) CUresult
+	cuStreamSynchronize func(uintptr) CUresult
+)
+
+type CUstream = uintptr
+
+// StreamCreate creates a non-blocking CUDA stream.
+func StreamCreate() (CUstream, error) {
+	EnsureContext()
+	var s uintptr
+	if r := cuStreamCreate(&s, 1); r != CUDA_SUCCESS { // 1 = CU_STREAM_NON_BLOCKING
+		return 0, fmt.Errorf("cuStreamCreate: %d", r)
+	}
+	return s, nil
+}
+
+// StreamSync waits for all operations on a stream to complete.
+func StreamSync(s CUstream) {
+	if s != 0 && cuStreamSynchronize != nil {
+		cuStreamSynchronize(s)
+	}
+}
+
+// StreamDestroy destroys a CUDA stream.
+func StreamDestroy(s CUstream) {
+	if s != 0 && cuStreamDestroy != nil {
+		cuStreamDestroy(s)
+	}
+}
+
+// LaunchKernelStream launches a kernel on a specific stream.
+func LaunchKernelStream(fn CUfunction, gridX, gridY, gridZ, blockX, blockY, blockZ, sharedMem uint32, stream CUstream, args ...unsafe.Pointer) error {
+	var argPtrs unsafe.Pointer
+	if len(args) > 0 {
+		argPtrs = unsafe.Pointer(&args[0])
+	}
+	if r := cuLaunchKernel(fn, gridX, gridY, gridZ, blockX, blockY, blockZ, sharedMem, stream, argPtrs, nil); r != CUDA_SUCCESS {
+		return fmt.Errorf("cuLaunchKernel(stream): error %d", r)
+	}
+	return nil
+}
+
+// UploadAsync copies host data to device on a stream.
+func (b *Buffer) UploadAsync(data []float32, stream CUstream) {
+	EnsureContext()
+	if cuMemcpyHtoDAsync != nil && stream != 0 {
+		cuMemcpyHtoDAsync(b.Ptr, unsafe.Pointer(&data[0]), uint64(len(data)*4), stream)
+	} else {
+		cuMemcpyHtoD(b.Ptr, unsafe.Pointer(&data[0]), uint64(len(data)*4))
+	}
+	runtime.KeepAlive(data)
+}
+
+// DownloadAsync copies device data to host on a stream.
+func (b *Buffer) DownloadAsync(data []float32, stream CUstream) {
+	EnsureContext()
+	if cuMemcpyDtoHAsync != nil && stream != 0 {
+		cuMemcpyDtoHAsync(unsafe.Pointer(&data[0]), b.Ptr, uint64(len(data)*4), stream)
+	} else {
+		cuMemcpyDtoH(unsafe.Pointer(&data[0]), b.Ptr, uint64(len(data)*4))
+	}
+	runtime.KeepAlive(data)
 }
