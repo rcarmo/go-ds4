@@ -108,7 +108,7 @@ func NewDecodeStateWithConfig(ctxSize int, cfg *ModelConfig) *DecodeState {
 	if hcd < nEmbd {
 		hcd = nEmbd // min size for V2 path
 	}
-	hcMix := nHC * nHC
+	hcMix := 2*nHC + nHC*nHC
 	if hcMix == 0 {
 		hcMix = 1
 	}
