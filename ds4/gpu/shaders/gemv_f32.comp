@@ -1,0 +1,45 @@
+#version 450
+layout(local_size_x = 256) in;
+
+// Buffers:
+// binding 0: float activation[inDim]
+// binding 1: float weight[outDim * inDim] (row-major, F32 for now)
+// binding 2: float output[outDim]
+layout(set=0, binding=0) readonly buffer Act { float activation[]; };
+layout(set=0, binding=1) readonly buffer Wt  { float weight[]; };
+layout(set=0, binding=2) writeonly buffer Out { float result[]; };
+
+layout(push_constant) uniform Params {
+    uint inDim;
+    uint outDim;
+};
+
+shared float sdata[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= outDim) return;
+
+    // Each thread accumulates a partial sum over the input dimension
+    float sum = 0.0;
+    uint base = row * inDim;
+    for (uint i = tid; i < inDim; i += 256) {
+        sum += weight[base + i] * activation[i];
+    }
+
+    sdata[tid] = sum;
+    barrier();
+
+    // Tree reduction in shared memory
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        barrier();
+    }
+
+    if (tid == 0) {
+        result[row] = sdata[0];
+    }
+}

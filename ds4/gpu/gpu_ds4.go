@@ -41,8 +41,8 @@ type GPUEngine struct {
 	outBuf *VkBuf // [maxOutDim] float32
 
 	// Compiled kernels
-	gemvF32 *VkComputeKernel // F32 weight × F32 activation → F32
-	// Q8_0 kernel would need per-block F16 decode in shader — complex but doable
+	gemvF32  *VkComputeKernel // F32 weight × F32 activation → F32
+	gemvQ8_0 *VkComputeKernel // Q8_0 weight × F32 activation → F32
 
 	mu sync.Mutex
 }
@@ -58,7 +58,22 @@ func GPUInit() *GPUEngine {
 		devName:    vkDevName,
 		weightBufs: make(map[string]*VkBuf),
 	}
+
+	// Pre-compile kernels from embedded SPIR-V
+	if k, err := VkKernelCreate(SPIRVGemvF32, 3, 8); err == nil {
+		g.gemvF32 = k
+	}
+	if k, err := VkKernelCreate(SPIRVGemvQ8_0F16Scale, 3, 12); err == nil {
+		g.gemvQ8_0 = k
+	}
+
 	fmt.Printf("[gpu] Vulkan compute ready: %s\n", g.devName)
+	if g.gemvF32 != nil {
+		fmt.Println("[gpu]   F32 GEMV kernel: ok")
+	}
+	if g.gemvQ8_0 != nil {
+		fmt.Println("[gpu]   Q8_0 GEMV kernel: ok")
+	}
 	return g
 }
 
@@ -93,18 +108,21 @@ func (g *GPUEngine) UploadWeights(name string, data []byte) error {
 	return nil
 }
 
-// MatvecF32GPU dispatches F32 weight × F32 activation on GPU.
-// out[outDim] = weight[outDim, inDim] · x[inDim]
-func (g *GPUEngine) MatvecF32GPU(out []float32, weightName string, x []float32, inDim, outDim int) error {
+// MatvecQ8_0GPU dispatches DS4 Q8_0 weight × F32 activation on GPU.
+// Weight must have been pre-uploaded as raw bytes via UploadWeights.
+// Returns false if kernel unavailable (caller should fall back to CPU).
+func (g *GPUEngine) MatvecQ8_0GPU(out []float32, weightName string, x []float32, inDim, outDim int) bool {
+	if g.gemvQ8_0 == nil {
+		return false
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	wBuf, ok := g.weightBufs[weightName]
 	if !ok {
-		return fmt.Errorf("weight %q not on GPU", weightName)
+		return false
 	}
 
-	// Ensure activation buffer is big enough
 	actSize := inDim * 4
 	if g.actBuf == nil || int(g.actBuf.size) < actSize {
 		if g.actBuf != nil {
@@ -113,11 +131,9 @@ func (g *GPUEngine) MatvecF32GPU(out []float32, weightName string, x []float32, 
 		var err error
 		g.actBuf, err = VkBufAlloc(actSize)
 		if err != nil {
-			return err
+			return false
 		}
 	}
-
-	// Ensure output buffer
 	outSize := outDim * 4
 	if g.outBuf == nil || int(g.outBuf.size) < outSize {
 		if g.outBuf != nil {
@@ -126,36 +142,26 @@ func (g *GPUEngine) MatvecF32GPU(out []float32, weightName string, x []float32, 
 		var err error
 		g.outBuf, err = VkBufAlloc(outSize)
 		if err != nil {
-			return err
+			return false
 		}
 	}
 
-	// Upload activation
 	g.actBuf.Upload(x[:inDim])
 
-	// Dispatch GEMV: one workgroup per output row
-	if g.gemvF32 == nil {
-		k, err := VkKernelCreate(spirvGemvF32, 3, 8) // 3 buffers, 8 bytes push (inDim, outDim)
-		if err != nil {
-			return fmt.Errorf("create gemv kernel: %w", err)
-		}
-		g.gemvF32 = k
-	}
-
+	nBlocks := inDim / 32
+	rowStride := uint32((nBlocks*34 + 3) / 4) // ceil to uint32 units
 	params := struct {
-		inDim  uint32
-		outDim uint32
-	}{uint32(inDim), uint32(outDim)}
+		inDim, outDim, rowStride uint32
+	}{uint32(inDim), uint32(outDim), rowStride}
 
-	if err := g.gemvF32.Dispatch(uint32(outDim), 1, 1,
+	if err := g.gemvQ8_0.Dispatch(uint32(outDim), 1, 1,
 		[]*VkBuf{g.actBuf, wBuf, g.outBuf},
 		unsafe.Pointer(&params)); err != nil {
-		return err
+		return false
 	}
 
-	// Download result
 	g.outBuf.Download(out[:outDim])
-	return nil
+	return true
 }
 
 // Close releases all GPU resources.

@@ -94,6 +94,13 @@ func OpenEngineWithOptions(opts EngineOptions) (*Engine, error) {
 		e.Streamer = streamer
 	}
 
+	// Initialize GPU if requested
+	if opts.UseGPU {
+		if err := e.InitGPU(); err != nil {
+			fmt.Printf("[gpu] init failed (CPU fallback): %v\n", err)
+		}
+	}
+
 	return e, nil
 }
 

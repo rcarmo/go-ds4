@@ -1,0 +1,104 @@
+#version 450
+layout(local_size_x = 256) in;
+
+// DS4 Q8_0 GEMV: quantized int8 weight (F16 scale per 32-element block) × F32 activation
+//
+// Weight layout per block (34 bytes): uint16 f16_scale + int8[32] quantized values
+// Packed into uint32[] buffer for GPU access.
+//
+// One workgroup = one output row. 256 threads cooperatively reduce.
+
+layout(set=0, binding=0) readonly buffer Act { float activation[]; };
+layout(set=0, binding=1) readonly buffer Wt  { uint weight_raw[]; };  // raw bytes as uint32
+layout(set=0, binding=2) writeonly buffer Out { float result[]; };
+
+layout(push_constant) uniform Params {
+    uint inDim;     // input dimension (must be multiple of 32)
+    uint outDim;    // output dimension
+    uint rowStride; // stride in uint32 units per row = (inDim/32)*34/4 rounded up
+};
+
+shared float sdata[256];
+
+// Decode F16 to F32 (software, no extension needed)
+float f16_decode(uint bits) {
+    uint sign = (bits >> 15) & 1u;
+    uint exp  = (bits >> 10) & 0x1Fu;
+    uint mant = bits & 0x3FFu;
+    if (exp == 0u) {
+        if (mant == 0u) return sign != 0u ? -0.0 : 0.0;
+        // subnormal
+        float val = float(mant) * 5.960464477539063e-8; // 2^-24 * mant
+        return sign != 0u ? -val : val;
+    }
+    if (exp == 31u) return sign != 0u ? -1.0/0.0 : 1.0/0.0; // inf
+    float val = float(1024 + mant) * exp2(float(int(exp) - 25));
+    return sign != 0u ? -val : val;
+}
+
+// Read a byte from the raw uint32 buffer
+int readInt8(uint byteOffset) {
+    uint wordIdx = byteOffset >> 2;
+    uint bytePos = byteOffset & 3u;
+    uint word = weight_raw[wordIdx];
+    uint shifted = (word >> (bytePos * 8u)) & 0xFFu;
+    // Sign extend from 8 bits
+    return int(shifted) - (int(shifted) >= 128 ? 256 : 0);
+}
+
+// Read uint16 from raw buffer
+uint readUint16(uint byteOffset) {
+    uint wordIdx = byteOffset >> 2;
+    uint bytePos = byteOffset & 3u;
+    uint word = weight_raw[wordIdx];
+    if (bytePos <= 2u) {
+        return (word >> (bytePos * 8u)) & 0xFFFFu;
+    }
+    // Crosses word boundary
+    uint lo = (word >> 24u) & 0xFFu;
+    uint hi = weight_raw[wordIdx + 1u] & 0xFFu;
+    return lo | (hi << 8u);
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= outDim) return;
+
+    uint nBlocks = inDim / 32u;
+    uint rowByteOff = row * rowStride * 4u;  // byte offset for this row
+
+    float sum = 0.0;
+    for (uint b = tid; b < nBlocks; b += 256u) {
+        uint blockByteOff = rowByteOff + b * 34u;
+
+        // Read F16 scale (2 bytes)
+        uint scaleBits = readUint16(blockByteOff);
+        float scale = f16_decode(scaleBits);
+
+        // Dot int8[32] × float32[32]
+        float dot = 0.0;
+        uint qsOff = blockByteOff + 2u;
+        uint actOff = b * 32u;
+        for (uint i = 0u; i < 32u; i++) {
+            int q = readInt8(qsOff + i);
+            dot += float(q) * activation[actOff + i];
+        }
+        sum += scale * dot;
+    }
+
+    sdata[tid] = sum;
+    barrier();
+
+    // Tree reduction
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        result[row] = sdata[0];
+    }
+}
