@@ -59,13 +59,13 @@ func (cfg *TurboQuantConfig) Encode(x []float32, out []byte) {
 	}
 
 	// FWHT
-	fwht(tmp)
+	Fwht(tmp)
 	invSqrt := float32(1.0 / math.Sqrt(float64(padDim)))
 	for i := range tmp {
 		tmp[i] *= invSqrt
 	}
 
-	// Find actual range for uniform quantization
+	// Find actual range of transformed values
 	vmin, vmax := tmp[0], tmp[0]
 	for i := 1; i < padDim; i++ {
 		if tmp[i] < vmin {
@@ -74,6 +74,9 @@ func (cfg *TurboQuantConfig) Encode(x []float32, out []byte) {
 		if tmp[i] > vmax {
 			vmax = tmp[i]
 		}
+	}
+	if vmin == vmax {
+		vmax = vmin + 1
 	}
 	*(*float32)(unsafe.Pointer(&out[4])) = vmin
 	*(*float32)(unsafe.Pointer(&out[8])) = vmax
@@ -122,8 +125,11 @@ func (cfg *TurboQuantConfig) Decode(compressed []byte, out []float32) {
 		return
 	}
 
-	// Unpack indices → dequantize to [-1, 1]
-	data := compressed[4:]
+	// Unpack indices → dequantize
+	vmin := *(*float32)(unsafe.Pointer(&compressed[4]))
+	vmax := *(*float32)(unsafe.Pointer(&compressed[8]))
+	span := vmax - vmin
+	data := compressed[12:]
 	tmp := make([]float32, padDim)
 	bitPos := 0
 	for i := 0; i < padDim; i++ {
@@ -133,8 +139,8 @@ func (cfg *TurboQuantConfig) Decode(compressed []byte, out []float32) {
 		if bitOff+bits > 8 {
 			idx |= (data[byteIdx+1] << (8 - bitOff)) & mask
 		}
-		// Map [0, nLevels-1] → [-1, 1]
-		tmp[i] = float32(idx)/float32(nLevels-1)*2 - 1
+		// Map [0, nLevels-1] → [vmin, vmax]
+		tmp[i] = float32(idx)/float32(nLevels-1)*span + vmin
 		bitPos += bits
 	}
 
@@ -145,7 +151,7 @@ func (cfg *TurboQuantConfig) Decode(compressed []byte, out []float32) {
 	for i := range tmp {
 		tmp[i] *= float32(math.Sqrt(float64(padDim)))
 	}
-	fwht(tmp)
+	Fwht(tmp)
 	scale := norm / float32(padDim)
 	for i := 0; i < dim; i++ {
 		out[i] = tmp[i] * scale
@@ -153,7 +159,7 @@ func (cfg *TurboQuantConfig) Decode(compressed []byte, out []float32) {
 }
 
 // fwht performs the in-place Fast Walsh-Hadamard Transform.
-func fwht(x []float32) {
+func Fwht(x []float32) {
 	n := len(x)
 	h := 1
 	for h < n {
