@@ -12,10 +12,10 @@ type Vocab struct {
 	TokenMap map[string]int // string → token ID
 	Merges   map[string]int // "tok1 tok2" → merge rank
 
-	BOS       int // beginning of sequence
-	EOS       int // end of sequence
-	User      int // <|User|>
-	Assistant int // <|Assistant|>
+	BOS        int // beginning of sequence
+	EOS        int // end of sequence
+	User       int // <|User|>
+	Assistant  int // <|Assistant|>
 	ThinkStart int // <think>
 	ThinkEnd   int // </think>
 }
@@ -328,6 +328,17 @@ func (v *Vocab) joyAIPreTokenize(text string, out *[]int) {
 func (v *Vocab) EncodeChatPrompt(system, userPrompt string, thinkMode bool) []int {
 	tokens := []int{v.BOS}
 
+	if v.User < 0 {
+		// Text-based chat template (V2 Lite style)
+		if system != "" {
+			tokens = append(tokens, v.Tokenize(system+"\n\n")...)
+		}
+		if userPrompt != "" {
+			tokens = append(tokens, v.Tokenize("User: "+userPrompt+"\n\nAssistant:")...)
+		}
+		return tokens
+	}
+
 	if system != "" {
 		tokens = append(tokens, v.User)
 		tokens = append(tokens, v.Tokenize(system)...)
@@ -355,7 +366,7 @@ func (v *Vocab) TokenText(id int) string {
 	if id < 0 || id >= len(v.Tokens) {
 		return ""
 	}
-	return v.Tokens[id]
+	return DecodeTokenText(v.Tokens[id])
 }
 
 func errorf(format string, args ...interface{}) error {
@@ -371,4 +382,30 @@ func sprintf(format string, args ...interface{}) string {
 		return format
 	}
 	return format // simplified — no fmt dependency
+}
+
+// gpt2DecodeTable maps GPT-2 Unicode codepoints back to raw bytes.
+var gpt2DecodeTable map[rune]byte
+
+func init() {
+	gpt2DecodeTable = make(map[rune]byte, 256)
+	for i := 0; i < 256; i++ {
+		gpt2DecodeTable[gpt2ByteTable[i]] = byte(i)
+	}
+}
+
+// DecodeTokenText converts a GPT-2 BPE token string back to UTF-8.
+func DecodeTokenText(s string) string {
+	raw := make([]byte, 0, len(s))
+	for _, r := range s {
+		if b, ok := gpt2DecodeTable[r]; ok {
+			raw = append(raw, b)
+		} else {
+			// Pass through non-BPE runes as UTF-8
+			buf := make([]byte, 4)
+			n := copy(buf, []byte(string(r)))
+			raw = append(raw, buf[:n]...)
+		}
+	}
+	return string(raw)
 }

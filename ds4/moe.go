@@ -32,8 +32,6 @@ func layerFFNDecode(
 	// Dense layer (no experts): just run shared expert as standard FFN
 	if len(layer.FfnGateInp) == 0 && len(layer.FfnGateExps) == 0 {
 		sharedExpertForward(ds, layer)
-		if hasNaNF32(ds.SharedOut[:NEmbd]) {
-		}
 		copy(ds.RoutedOut, ds.SharedOut)
 		for i := range ds.SharedOut {
 			ds.SharedOut[i] = 0
@@ -46,6 +44,8 @@ func layerFFNDecode(
 
 	// 3. Expert routing — select top-K experts
 	experts := routeExperts(ds, ds.FfnNormed, layer, il, tokenID, nExperts)
+	if il < 3 {
+	}
 
 	// Prefetch selected expert pages
 	var activeIDsBuf [NExpertUsed]int
@@ -100,20 +100,20 @@ func layerFFNDecode(
 				wg.Add(1)
 				go func(idx int, e expertScore) {
 					defer wg.Done()
-					out := ds.ExpertOut[idx*NEmbd : (idx+1)*NEmbd]
+					out := ds.ExpertOut[idx*cfg.NEmbd : (idx+1)*cfg.NEmbd]
 					for j := range out {
 						out[j] = 0
 					}
 					midQ := ds.ExpertMidQ[idx*midQStride : (idx+1)*midQStride]
-					gate := ds.ExpertGate[idx*NFFExp : (idx+1)*NFFExp]
-					up := ds.ExpertUp[idx*NFFExp : (idx+1)*NFFExp]
+					gate := ds.ExpertGate[idx*cfg.NFFExp : (idx+1)*cfg.NFFExp]
+					up := ds.ExpertUp[idx*cfg.NFFExp : (idx+1)*cfg.NFFExp]
 					expertForwardFast(out, ds.RoutedXQ, midQ, ds.Cfg(), gate, up, layer, e.idx, e.score, streamer, model, il)
 				}(i, exp)
 			}
 			wg.Wait()
 			for i := range experts {
-				out := ds.ExpertOut[i*NEmbd : (i+1)*NEmbd]
-				for j := 0; j < NEmbd; j++ {
+				out := ds.ExpertOut[i*cfg.NEmbd : (i+1)*cfg.NEmbd]
+				for j := 0; j < cfg.NEmbd; j++ {
 					ds.RoutedOut[j] += out[j]
 				}
 			}
@@ -187,7 +187,7 @@ func routeExperts(ds *DecodeState, normed []float32, layer *LayerWeights, il, to
 
 	// Scale
 	for e := range logits[:nExp] {
-		logits[e] *= ExpertWeightScale
+		logits[e] *= cfg.ExpertWeightScale
 	}
 
 	// Top-K selection
@@ -257,7 +257,7 @@ func expertForwardFast(out []float32, xQ8K, midQ []byte, cfg *ModelConfig,
 	downRowBytes := ed.downRowBytes
 	ffnDim := ed.outDim
 	if ffnDim == 0 {
-		ffnDim = NFFExp
+		ffnDim = cfg.NFFExp
 	}
 
 	var gateBase, upBase, downBase []byte
@@ -333,7 +333,7 @@ func expertForward(ds *DecodeState, layer *LayerWeights, expertIdx int, weight f
 	downRowBytes := ed.downRowBytes
 	ffnDim := ed.outDim
 	if ffnDim == 0 {
-		ffnDim = NFFExp
+		ffnDim = cfg.NFFExp
 	}
 
 	var gateBase, upBase, downBase []byte
@@ -370,15 +370,15 @@ func expertForward(ds *DecodeState, layer *LayerWeights, expertIdx int, weight f
 		downBase = layer.FfnDownExps[expertIdx*downRowBytes*cfg.NEmbd:]
 	}
 
-	gate := make([]float32, NFFExp)
-	up := make([]float32, NFFExp)
+	gate := make([]float32, cfg.NFFExp)
+	up := make([]float32, cfg.NFFExp)
 
 	// Gate/Up: IQ2_XXS weight × Q8_K activation
 	for o := 0; o < ffnDim; o++ {
 		gateRow := gateBase[o*gateRowBytes : (o+1)*gateRowBytes]
 		upRow := upBase[o*upRowBytes : (o+1)*upRowBytes]
-		gate[o] = VecDotIQ2XXSQ8K(NEmbd, gateRow, ds.RoutedXQ)
-		up[o] = VecDotIQ2XXSQ8K(NEmbd, upRow, ds.RoutedXQ)
+		gate[o] = VecDotIQ2XXSQ8K(cfg.NEmbd, gateRow, ds.RoutedXQ)
+		up[o] = VecDotIQ2XXSQ8K(cfg.NEmbd, upRow, ds.RoutedXQ)
 	}
 
 	// SwiGLU: dst = silu(gate) * up
@@ -400,23 +400,17 @@ func expertForward(ds *DecodeState, layer *LayerWeights, expertIdx int, weight f
 	// Down projection: Q2_K [NEmbd, NFFExp] × Q8_K hidden
 	for o := 0; o < cfg.NEmbd; o++ {
 		downRow := downBase[o*downRowBytes : (o+1)*downRowBytes]
-		ds.RoutedOut[o] += weight * VecDotQ2KQ8K(NFFExp, downRow, midQ)
+		ds.RoutedOut[o] += weight * VecDotQ2KQ8K(cfg.NFFExp, downRow, midQ)
 	}
 }
 
 // sharedExpertForward runs the always-active shared expert (Q8_0).
 func sharedExpertForward(ds *DecodeState, layer *LayerWeights) {
-	// Detect shared expert FFN dim from tensor size
 	cfg := ds.Cfg()
 	sharedFFN := cfg.NFFExp
 	if len(layer.FfnGateShexp) > 0 {
-		// Q8_0: rowBytes = (inDim/32)*34, nRows = len/rowBytes
-		rowBytes := (cfg.NEmbd / 32) * BlockQ8_0Size
-		if rowBytes > 0 {
-			detected := len(layer.FfnGateShexp) / rowBytes
-			if detected > 0 {
-				sharedFFN = detected
-			}
+		if d := detectOutDim(layer.FfnGateShexp, cfg.NEmbd); d > 0 {
+			sharedFFN = d
 		}
 	}
 	gate := make([]float32, sharedFFN)
@@ -466,22 +460,15 @@ func layerForwardDecode(
 		hcPostSumOne(ds.CurHC, ds.RoutedOut, ds.SharedOut, ffnResidual, ds.Post, ds.Comb, ds.HCSumTmp)
 	} else {
 		// Standard residual (V2 Lite)
-		normW := tensorF32Unsafe(layer.AttnNorm)
-		copy(ds.AttnCur, ds.CurHC[:cfg.NEmbd])
-		rmsNorm(ds.AttnCur[:cfg.NEmbd], normW[:cfg.NEmbd])
-		layerAttnDecodeV2(ds, layer, cache, pos, il)
+		copy(ds.AttnCur[:cfg.NEmbd], ds.CurHC[:cfg.NEmbd])
+		for i := 0; i < cfg.NEmbd; i++ {
+			ds.AttnOut[i] = 0
+		} // DISABLED attn
 		for i := 0; i < cfg.NEmbd; i++ {
 			ds.CurHC[i] += ds.AttnOut[i]
 		}
-		ffnNormW := tensorF32Unsafe(layer.FfnNorm)
-		copy(ds.FfnCur, ds.CurHC[:cfg.NEmbd])
-		copy(ds.FfnNormed, ds.CurHC[:cfg.NEmbd])
-		rmsNorm(ds.FfnNormed[:cfg.NEmbd], ffnNormW[:cfg.NEmbd])
+		copy(ds.FfnCur[:cfg.NEmbd], ds.CurHC[:cfg.NEmbd])
 		layerFFNDecode(ds, layer, model, budget, streamer, il, tokenID, nExperts)
-		if hasNaNF32(ds.SharedOut[:NEmbd]) {
-		}
-		if hasNaNF32(ds.RoutedOut[:cfg.NEmbd]) {
-		}
 		for i := 0; i < cfg.NEmbd; i++ {
 			ds.CurHC[i] += ds.RoutedOut[i] + ds.SharedOut[i]
 		}
@@ -524,6 +511,7 @@ func outputLogits(ds *DecodeState, logits []float32, hcState []float32, w *Weigh
 	rmsNorm(collapsed, outputNormW[:cfg.NEmbd])
 	matvecAuto(logits, w.Output, collapsed, cfg.NEmbd, cfg.NVocab)
 }
+
 func Argmax(x []float32) int {
 	best := 0
 	bestVal := x[0]

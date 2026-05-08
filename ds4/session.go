@@ -137,21 +137,34 @@ func (e *Engine) Close() {
 
 // NewSession creates a new inference session with the given context size.
 func (e *Engine) NewSession(ctxSize int) *Session {
-	ds := NewDecodeState(ctxSize)
+	ds := NewDecodeStateWithConfig(ctxSize, e.Config)
 	ds.Engine = e
+	kv := NewKVCacheN(ctxSize, e.Config.NLayer)
+	if e.Config.NHC == 0 {
+		// V2 Lite: KV cache stores compressed kvA (kvLoraRank + NRot)
+		kvLoraRank := 512
+		if v, ok := e.Model.MetaU32("deepseek2.attention.kv_lora_rank"); ok {
+			kvLoraRank = int(v)
+		}
+		rowDim := kvLoraRank + e.Config.NRot
+		for il := 0; il < e.Config.NLayer; il++ {
+			kv.Layer[il].RowDim = rowDim
+			kv.Layer[il].RawKV = make([]float32, kv.Layer[il].CapRaw*rowDim)
+		}
+	}
 	return &Session{
 		Engine:  e,
-		KV:      NewKVCacheN(ctxSize, e.Config.NLayer),
+		KV:      kv,
 		Decode:  ds,
 		Tokens:  make([]int, 0, ctxSize),
 		CtxSize: ctxSize,
-		Logits:  make([]float32, NVocab),
+		Logits:  make([]float32, e.Config.NVocab),
 	}
 }
 
 // Eval processes one token: runs the full forward pass and produces logits.
 func (s *Session) Eval(token int) {
-	if token < 0 || token >= NVocab {
+	if token < 0 || token >= len(s.Logits) {
 		return // skip invalid tokens
 	}
 	s.Tokens = append(s.Tokens, token)

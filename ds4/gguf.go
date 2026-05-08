@@ -393,3 +393,18 @@ func (m *GGUFModel) MetaStrArray(key string) ([]string, bool) {
 	}
 	return strs, true
 }
+
+func (m *GGUFModel) MetaF32(key string) (float32, bool) {
+	v, ok := m.Meta[key]
+	if !ok {
+		return 0, false
+	}
+	switch x := v.(type) {
+	case float32:
+		return x, true
+	case float64:
+		return float32(x), true
+	default:
+		return 0, false
+	}
+}

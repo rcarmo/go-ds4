@@ -2,6 +2,7 @@ package ds4
 
 // LayerCache holds the per-layer KV cache state.
 type LayerCache struct {
+	RowDim int // width of each KV row (NHeadDim for V4, kvADim for V2)
 	// Raw SWA (sliding window attention) KV rows, logical ring buffer.
 	RawKV    []float32 // [capRaw, NHeadDim]
 	NRaw     int       // live rows in raw window (<= CapRaw)
@@ -41,6 +42,7 @@ func NewKVCacheN(ctxSize, nLayers int) *KVCache {
 	kv := &KVCache{}
 	for il := 0; il < nLayers; il++ {
 		lc := &kv.Layer[il]
+		lc.RowDim = NHeadDim
 		lc.CapRaw = NSWA
 		lc.RawKV = make([]float32, lc.CapRaw*NHeadDim)
 
@@ -97,7 +99,8 @@ func layerCompressRatio(il int) int {
 // Oldest rows are overwritten when full, with no memmove.
 func (lc *LayerCache) PushRawKV(kv []float32) {
 	idx := lc.RawWrite
-	copy(lc.RawKV[idx*NHeadDim:(idx+1)*NHeadDim], kv)
+	rd := lc.RowDim
+	copy(lc.RawKV[idx*rd:(idx+1)*rd], kv[:rd])
 	lc.RawWrite++
 	if lc.RawWrite >= lc.CapRaw {
 		lc.RawWrite = 0
@@ -122,7 +125,8 @@ func (lc *LayerCache) RawRow(i int) []float32 {
 	if idx >= lc.CapRaw {
 		idx -= lc.CapRaw
 	}
-	return lc.RawKV[idx*NHeadDim : (idx+1)*NHeadDim]
+	rd := lc.RowDim
+	return lc.RawKV[idx*rd : (idx+1)*rd]
 }
 
 // PushCompKV appends one compressed attention KV row using a logical ring.

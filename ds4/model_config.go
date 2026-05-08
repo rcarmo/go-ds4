@@ -72,11 +72,12 @@ func DS2LiteConfig() *ModelConfig {
 		NLayer: 27, NEmbd: 2048, NVocab: 102400,
 		NHead: 16, NHeadKV: 1, NHeadDim: 192, NValueDim: 128,
 		NRot: 64, NOutGroup: 4, NLoraQ: 512, NLoraO: 512,
-		NExpert: 64, NExpertUsed: 6, NExpertShared: 2,
+		NExpert: 64, NExpertUsed: 6,
+		ExpertWeightScale: 1.0, NExpertShared: 2,
 		NFFExp: 1408, NHashLayer: 0,
 		NSWA: 128, NIndexerHead: 0, NIndexerHeadDim: 0, NIndexerTopK: 0,
 		NHC: 0, NHCSinkhornIter: 0, // V2 Lite uses standard residual
-		RMSEps: 1e-6, HCEps: 0, ExpertWeightScale: 1.0,
+		RMSEps: 1e-6, HCEps: 0,
 		SwiGLUClampExp: 10.0, RoPEFreqBase: 10000.0,
 		RoPEScaleFactor: 1.0, RoPEYarnBetaFast: 32.0, RoPEYarnBetaSlow: 1.0,
 		CompressRoPEFreqBase: 0, RoPEOrigCtx: 4096,
@@ -113,6 +114,11 @@ func DetectModelConfig(m *GGUFModel) *ModelConfig {
 		}
 		if v, ok := m.MetaU32("deepseek2.num_experts_per_tok"); ok {
 			cfg.NExpertUsed = int(v)
+		}
+		if v, ok := m.MetaF32("deepseek2.expert_weights_scale"); ok {
+			cfg.ExpertWeightScale = v
+		} else if v, ok := m.MetaF32("deepseek4.expert_weights_scale"); ok {
+			cfg.ExpertWeightScale = v
 		}
 		if v, ok := m.MetaU32("deepseek2.vocab_size"); ok {
 			cfg.NVocab = int(v)

@@ -45,14 +45,8 @@ func layerAttnDecodeV2(ds *DecodeState, layer *LayerWeights, cache *LayerCache, 
 	kvBFull := make([]float32, nHead*kvBHeadDim)
 	matvecAuto(kvBFull, layer.AttnKVB, kvA[:kvLoraRank], kvLoraRank, nHead*kvBHeadDim)
 
-	cacheRow := make([]float32, kvADim)
-	copy(cacheRow, kvA)
-	// Store in padded raw cache
-	padded := make([]float32, NHeadDim)
-	if kvADim <= NHeadDim {
-		copy(padded, cacheRow)
-	}
-	cache.PushRawKV(padded)
+	// Push compressed kvA to cache
+	cache.PushRawKV(kvA)
 
 	nRaw := cache.NRaw
 	if nRaw > cache.CapRaw {

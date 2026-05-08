@@ -75,57 +75,104 @@ type DecodeState struct {
 
 // NewDecodeState allocates decode buffers for a given context size.
 func NewDecodeState(ctxSize int) *DecodeState {
-	maxScores := NSWA + ctxSize/2 + 2 // raw + max compressed
+	return NewDecodeStateWithConfig(ctxSize, nil)
+}
+
+func NewDecodeStateWithConfig(ctxSize int, cfg *ModelConfig) *DecodeState {
+	nEmbd := NEmbd
+	nHead := NHead
+	nHeadDim := NHeadDim
+	nLoraQ := NLoraQ
+	nLoraO := NLoraO
+	nFFExp := NFFExp
+	nExpert := NExpert
+	nExpertUsed := NExpertUsed
+	nHC := NHC
+	nIndexerHead := NIndexerHead
+	nIndexerHeadDim := NIndexerHeadDim
+	if cfg != nil {
+		nEmbd = cfg.NEmbd
+		nHead = cfg.NHead
+		nHeadDim = cfg.NHeadDim
+		nLoraQ = cfg.NLoraQ
+		nLoraO = cfg.NLoraO
+		nFFExp = cfg.NFFExp
+		nExpert = cfg.NExpert
+		nExpertUsed = cfg.NExpertUsed
+		nHC = cfg.NHC
+		nIndexerHead = cfg.NIndexerHead
+		nIndexerHeadDim = cfg.NIndexerHeadDim
+	}
+
+	hcd := nHC * nEmbd
+	if hcd < nEmbd {
+		hcd = nEmbd // min size for V2 path
+	}
+	hcMix := nHC * nHC
+	if hcMix == 0 {
+		hcMix = 1
+	}
+
+	maxScores := NSWA + ctxSize/2 + 2
+	maxFFN := nFFExp
+	if maxFFN < 1 {
+		maxFFN = 1
+	}
+	midQSize := nExpertUsed * ((maxFFN + QK_K - 1) / QK_K) * BlockQ8KSize
+	if midQSize < 1 {
+		midQSize = 1
+	}
+
 	return &DecodeState{
-		CurHC:           make([]float32, hcDim),
-		NextHC:          make([]float32, hcDim),
-		AttnCur:         make([]float32, NEmbd),
-		AttnNormed:      make([]float32, NEmbd),
-		QR:              make([]float32, NLoraQ),
-		QRNorm:          make([]float32, NLoraQ),
-		Q:               make([]float32, NHead*NHeadDim),
-		KV:              make([]float32, NHeadDim),
-		Heads:           make([]float32, NHead*NHeadDim),
-		AttnOut:         make([]float32, NEmbd),
+		CurHC:           make([]float32, hcd),
+		NextHC:          make([]float32, hcd),
+		AttnCur:         make([]float32, nEmbd),
+		AttnNormed:      make([]float32, nEmbd),
+		QR:              make([]float32, nLoraQ),
+		QRNorm:          make([]float32, nLoraQ),
+		Q:               make([]float32, nHead*nHeadDim),
+		KV:              make([]float32, nHeadDim),
+		Heads:           make([]float32, nHead*nHeadDim),
+		AttnOut:         make([]float32, nEmbd),
 		AttnScore:       make([]float32, maxScores),
-		KVCacheRow:      make([]float32, NHeadDim),
-		TmpLoRA:         make([]float32, NLoraO),
-		CompKVCur:       make([]float32, 2*NHeadDim),
-		CompScoreCur:    make([]float32, 2*NHeadDim),
-		CompPooled:      make([]float32, NHeadDim),
-		CompOut:         make([]float32, NHeadDim),
-		IndexCompKVCur:  make([]float32, 2*NIndexerHeadDim),
-		IndexCompScore:  make([]float32, 2*NIndexerHeadDim),
-		IndexCompPooled: make([]float32, NIndexerHeadDim),
-		IndexCompOut:    make([]float32, NIndexerHeadDim),
-		IndexQ:          make([]float32, NIndexerHead*NIndexerHeadDim),
-		IndexWeights:    make([]float32, NIndexerHead),
+		KVCacheRow:      make([]float32, nHeadDim),
+		TmpLoRA:         make([]float32, max(nLoraO, 1)),
+		CompKVCur:       make([]float32, 2*nHeadDim),
+		CompScoreCur:    make([]float32, 2*nHeadDim),
+		CompPooled:      make([]float32, nHeadDim),
+		CompOut:         make([]float32, nHeadDim),
+		IndexCompKVCur:  make([]float32, max(2*nIndexerHeadDim, 1)),
+		IndexCompScore:  make([]float32, max(2*nIndexerHeadDim, 1)),
+		IndexCompPooled: make([]float32, max(nIndexerHeadDim, 1)),
+		IndexCompOut:    make([]float32, max(nIndexerHeadDim, 1)),
+		IndexQ:          make([]float32, max(nIndexerHead*nIndexerHeadDim, 1)),
+		IndexWeights:    make([]float32, max(nIndexerHead, 1)),
 		IndexScores:     make([]float32, ctxSize/4+2),
 		IndexAllowed:    make([]bool, ctxSize/4+2),
-		FfnCur:          make([]float32, NEmbd),
-		FfnNormed:       make([]float32, NEmbd),
-		RoutedXQ:        make([]byte, (NEmbd/QK_K)*BlockQ8KSize),
-		RoutedMidQ:      make([]byte, NExpertUsed*(NFFExp/QK_K)*BlockQ8KSize),
-		RoutedOut:       make([]float32, NEmbd),
-		SharedOut:       make([]float32, NEmbd),
-		SharedGate:      make([]float32, NFFExp),
-		SharedUp:        make([]float32, NFFExp),
-		RouteLogits:     make([]float32, NExpert),
-		RouteScores:     make([]expertScore, NExpert),
-		ExpertMidQ:      make([]byte, NExpertUsed*(NFFExp/QK_K)*BlockQ8KSize),
-		ExpertGate:      make([]float32, NExpertUsed*NFFExp),
-		ExpertUp:        make([]float32, NExpertUsed*NFFExp),
-		ExpertOut:       make([]float32, NExpertUsed*NEmbd),
-		AttnResidual:    make([]float32, hcDim),
-		FfnResidual:     make([]float32, hcDim),
-		OutFlat:         make([]float32, hcDim),
-		OutHCWeights:    make([]float32, NHC),
-		OutCollapsed:    make([]float32, NEmbd),
-		HCFlat:          make([]float32, hcDim),
-		HCMix:           make([]float32, hcMixDim),
-		HCSumTmp:        make([]float32, NEmbd),
-		Post:            make([]float32, NHC),
-		Comb:            make([]float32, NHC*NHC),
+		FfnCur:          make([]float32, nEmbd),
+		FfnNormed:       make([]float32, nEmbd),
+		RoutedXQ:        make([]byte, ((nEmbd+QK_K-1)/QK_K)*BlockQ8KSize),
+		RoutedMidQ:      make([]byte, midQSize),
+		RoutedOut:       make([]float32, nEmbd),
+		SharedOut:       make([]float32, nEmbd),
+		SharedGate:      make([]float32, maxFFN),
+		SharedUp:        make([]float32, maxFFN),
+		RouteLogits:     make([]float32, max(nExpert, 1)),
+		RouteScores:     make([]expertScore, max(nExpert, 1)),
+		ExpertMidQ:      make([]byte, midQSize),
+		ExpertGate:      make([]float32, max(nExpertUsed*maxFFN, 1)),
+		ExpertUp:        make([]float32, max(nExpertUsed*maxFFN, 1)),
+		ExpertOut:       make([]float32, max(nExpertUsed*nEmbd, 1)),
+		AttnResidual:    make([]float32, hcd),
+		FfnResidual:     make([]float32, hcd),
+		OutFlat:         make([]float32, hcd),
+		OutHCWeights:    make([]float32, max(nHC, 1)),
+		OutCollapsed:    make([]float32, nEmbd),
+		HCFlat:          make([]float32, hcd),
+		HCMix:           make([]float32, hcMix),
+		HCSumTmp:        make([]float32, nEmbd),
+		Post:            make([]float32, max(nHC, 1)),
+		Comb:            make([]float32, max(nHC*nHC, 1)),
 	}
 }
 

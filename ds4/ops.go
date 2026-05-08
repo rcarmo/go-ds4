@@ -65,42 +65,58 @@ func swiGLU(dst, a, b []float32) {
 func ropeYaRNTailInplace(q []float32, pos int, nHead, headDim, nRot int,
 	freqBase, freqScale float32, inverse bool) {
 
-	// YaRN correction dimensions
-	loFreq := float64(RoPEYarnBetaSlow)
-	hiFreq := float64(RoPEYarnBetaFast)
-	origCtx := float64(RoPEOrigCtx)
-	scale := float64(freqScale)
+	// YaRN correction dimensions (matching ds4.c exactly)
+	thetaScale := math.Pow(float64(freqBase), -2.0/float64(nRot))
+	sinSign := 1.0
+	if inverse {
+		sinSign = -1.0
+	}
 
-	corrLo := math.Max(math.Log(origCtx/(loFreq*2*math.Pi))/(2*math.Log(float64(freqBase))), 0)
-	corrHi := math.Min(math.Log(origCtx/(hiFreq*2*math.Pi))/(2*math.Log(float64(freqBase))), float64(nRot/2-1))
+	// Compute correction dimensions for YaRN ramp
+	var corrDims [2]float64
+	extFactorBase := 0.0
+	if freqScale != 1.0 {
+		// ext_factor from attn_factor: 1.0 for non-identity freq_scale
+		extFactorBase = 1.0
+		corrDims[0] = math.Max(ropeYaRNCorrDim(nRot, RoPEOrigCtx, float64(freqBase), float64(RoPEYarnBetaFast)), 0)
+		corrDims[1] = math.Min(ropeYaRNCorrDim(nRot, RoPEOrigCtx, float64(freqBase), float64(RoPEYarnBetaSlow)), float64(nRot/2-1))
+	}
 
 	for h := 0; h < nHead; h++ {
-		hOff := h * headDim
-		tailOff := hOff + (headDim - nRot) // NoPE dims at the front
+		tail := h*headDim + (headDim - nRot) // offset to rope dims
+		thetaExtrap := float64(pos)
 
-		for i := 0; i < nRot/2; i++ {
-			// Frequency for this dimension pair
-			dimF := float64(i)
-			rampMix := math.Min(math.Max((dimF-corrLo)/(corrHi-corrLo), 0), 1)
-			extFactor := 1.0 - rampMix // interpolation factor
+		for i := 0; i < nRot; i += 2 {
+			thetaInterp := float64(freqScale) * thetaExtrap
+			theta := thetaInterp
+			mscale := 1.0 // attn_factor default
 
-			freq := 1.0 / (math.Pow(float64(freqBase), 2.0*dimF/float64(nRot)) * (extFactor*scale + (1 - extFactor)))
-			theta := freq * float64(pos)
-
-			cosT := float32(math.Cos(theta))
-			sinT := float32(math.Sin(theta))
-			if inverse {
-				sinT = -sinT
+			if extFactorBase != 0.0 {
+				rampMix := ropeYaRNRamp(corrDims[0], corrDims[1], i) * extFactorBase
+				theta = thetaInterp*(1.0-rampMix) + thetaExtrap*rampMix
+				mscale *= 1.0 + 0.1*math.Log(1.0/float64(freqScale))
 			}
 
-			idx0 := tailOff + i
-			idx1 := tailOff + nRot/2 + i
-			v0 := q[idx0]
-			v1 := q[idx1]
-			q[idx0] = v0*cosT - v1*sinT
-			q[idx1] = v0*sinT + v1*cosT
+			c := float32(math.Cos(theta) * mscale)
+			s := float32(sinSign * math.Sin(theta) * mscale)
+
+			x0 := q[tail+i+0]
+			x1 := q[tail+i+1]
+			q[tail+i+0] = x0*c - x1*s
+			q[tail+i+1] = x0*s + x1*c
+
+			thetaExtrap *= thetaScale
 		}
 	}
+}
+
+func ropeYaRNRamp(low, high float64, i int) float64 {
+	y := (float64(i/2) - low) / math.Max(0.001, high-low)
+	return 1.0 - math.Min(1.0, math.Max(0.0, y))
+}
+
+func ropeYaRNCorrDim(nRot int, origCtx uint64, base, beta float64) float64 {
+	return float64(nRot) * math.Log(float64(origCtx)/(beta*2*math.Pi)) / (2 * math.Log(base))
 }
 
 // FP8 E4M3FN quantization for KV cache compression.
@@ -392,4 +408,23 @@ func hasNaNF32(x []float32) bool {
 		} // NaN != NaN
 	}
 	return false
+}
+
+// detectOutDim tries all known quant formats to determine the output dimension
+// of a weight tensor given its byte length and input dimension.
+func detectOutDim(w []byte, inDim int) int {
+	totalBytes := len(w)
+	candidates := []int{
+		(inDim / 32) * BlockQ8_0Size,                     // Q8_0: 34 bytes per 32 elements
+		((inDim + QK_K - 1) / QK_K) * BlockQ2KSize,       // Q2_K: 84 bytes per 256 elements
+		((inDim + QK_K - 1) / QK_K) * 110,                // Q3_K: 110 bytes per 256 elements
+		((inDim + QK_K - 1) / QK_K) * 210,                // Q6_K: 210 bytes per 256 elements
+		((inDim + QK4_NL - 1) / QK4_NL) * BlockIQ4NLSize, // IQ4_NL: 18 bytes per 32 elements
+	}
+	for _, rowBytes := range candidates {
+		if rowBytes > 0 && totalBytes%rowBytes == 0 {
+			return totalBytes / rowBytes
+		}
+	}
+	return 0
 }
