@@ -14,6 +14,12 @@ A pure Go inference engine for [DeepSeek V4 Flash](https://huggingface.co/deepse
 
 The default build produces a **fully self-contained static binary** with no C dependencies. All hot paths use hand-written SIMD assembly (AVX2+FMA on amd64, NEON stubs on arm64). GPU acceleration via CUDA PTX is opt-in and loaded at runtime via `purego` (no CGo, no CUDA toolkit dependency).
 
+## Motivation
+Even though I have no hardware able to really _run_ this (the only 128GB RAM machine I have is a hypervisor, and the only discrete GPU I have is an RTX3060), I wanted to:
+
+* Prepare for the day when the RAMpocalypse lifts and I can actually obtain hardware to use this properly
+* Understand the model structure and cross-polinate  [rcarmo/go-pherence](https://github.com/rcarmo/go-pherence) with whatever I manage to glean from it
+* Help foster local inference so that we have alternatives
 ## Quick Start
 
 ```bash

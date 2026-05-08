@@ -89,7 +89,10 @@ func layerFFNDecode(
 		// CPU: only run experts not already handled by GPU
 		if len(experts) > 1 {
 			// Parallel with preallocated per-expert scratch (no per-token allocs)
-			midQStride := (NFFExp / QK_K) * BlockQ8KSize
+			cfg := ds.Cfg()
+			ed := detectExpertDims(layer, cfg)
+			ffnAligned := ((ed.outDim + QK_K - 1) / QK_K) * QK_K
+			midQStride := (ffnAligned / QK_K) * BlockQ8KSize
 			var wg sync.WaitGroup
 			for i, exp := range experts {
 				wg.Add(1)
@@ -227,6 +230,19 @@ func hashRouteExperts(layer *LayerWeights, tokenID int) []expertScore {
 	return experts
 }
 
+// quantizeQ8KPadded pads input to QK_K alignment before quantizing.
+func quantizeQ8KPadded(x []float32, out []byte) {
+	n := len(x)
+	aligned := ((n + QK_K - 1) / QK_K) * QK_K
+	if aligned == n {
+		QuantizeRowQ8K(x, out)
+		return
+	}
+	padded := make([]float32, aligned)
+	copy(padded, x)
+	QuantizeRowQ8K(padded, out)
+}
+
 // expertForwardFast runs a single expert with pre-allocated buffers.
 func expertForwardFast(out []float32, xQ8K, midQ []byte, cfg *ModelConfig,
 	gate, up []float32,
@@ -289,7 +305,7 @@ func expertForwardFast(out []float32, xQ8K, midQ []byte, cfg *ModelConfig,
 	swiGLU(gate, gate, up)
 
 	// Quantize hidden
-	QuantizeRowQ8K(gate, midQ)
+	quantizeQ8KPadded(gate[:ffnDim], midQ)
 
 	// Q2_K down projection
 	for o := 0; o < cfg.NEmbd; o++ {
@@ -379,7 +395,7 @@ func expertForward(ds *DecodeState, layer *LayerWeights, expertIdx int, weight f
 
 	// Quantize hidden to Q8_K for down projection
 	midQ := ds.RoutedMidQ // reuse scratch
-	QuantizeRowQ8K(gate, midQ)
+	quantizeQ8KPadded(gate[:ffnDim], midQ)
 
 	// Down projection: Q2_K [NEmbd, NFFExp] × Q8_K hidden
 	for o := 0; o < cfg.NEmbd; o++ {

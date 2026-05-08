@@ -78,8 +78,7 @@ func main() {
 	fmt.Println("\nOpening engine (streaming mode)...")
 	t0 = time.Now()
 	engine, err := ds4.OpenEngineWithOptions(ds4.EngineOptions{
-		ModelPath:     path,
-		StreamExperts: true,
+		ModelPath: path,
 	})
 	if err != nil {
 		fmt.Printf("  Engine open failed: %v\n", err)
