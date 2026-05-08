@@ -222,10 +222,8 @@ const DS4SwiGLUPTX = `.version 7.0
     ld.global.f32 %f0, [%rd4];
     ld.global.f32 %f1, [%rd5];
     // sigmoid(x) = 1/(1+exp(-x))
-    neg.f32 %f2, %f0;
-    ex2.approx.f32 %f2, %f2;    // exp2(-x) ≈ exp(-x*1.4427)... need proper exp
-    // Actually use: 1/(1+exp(-x)) via logistic approx
-    // Better: use __expf via mul by -1.4426950408 then ex2
+    // silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+    // exp(-x) = 2^(-x/ln2) via ex2.approx
     mul.f32 %f2, %f0, 0fBFB8AA3B;  // -1/ln(2) = -1.4426950408
     ex2.approx.f32 %f2, %f2;         // 2^(-x/ln2) = e^(-x)
     add.f32 %f3, %f2, 0f3F800000;    // 1 + exp(-x)

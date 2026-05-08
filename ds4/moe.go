@@ -61,6 +61,8 @@ func layerFFNDecode(
 	if ds.Engine != nil {
 		if eng, ok := ds.Engine.(*Engine); ok {
 			gpuDone = eng.gpuExpertForward(ds, layer, experts, il)
+			if !gpuDone && il == 2 {
+			}
 		}
 	}
 
@@ -109,10 +111,14 @@ func layerFFNDecode(
 func routeExperts(ds *DecodeState, normed []float32, layer *LayerWeights, il, tokenID, nExperts int) []expertScore {
 	// Check for hash routing (3 hash layers)
 	if layer.FfnGateTid2Eid != nil {
+		nHash := nExperts
+		if nHash > NExpertUsed {
+			nHash = NExpertUsed
+		}
 		table := unsafe.Slice((*int32)(unsafe.Pointer(&layer.FfnGateTid2Eid[0])), NExpertUsed*NVocab)
-		top := ds.RouteScores[:NExpertUsed]
-		w := float32(1.0 / float32(NExpertUsed))
-		for k := 0; k < NExpertUsed; k++ {
+		top := ds.RouteScores[:nHash]
+		w := float32(1.0 / float32(nHash))
+		for k := 0; k < nHash; k++ {
 			top[k] = expertScore{idx: int(table[k*NVocab+tokenID]), score: w}
 		}
 		return top
