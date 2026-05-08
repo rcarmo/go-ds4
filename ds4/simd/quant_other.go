@@ -7,18 +7,18 @@ import (
 	"unsafe"
 )
 
-// DotQ8_0F32 scalar fallback.
+// DotQ8_0F32 scalar fallback (DS4 layout: f16 scale + int8[32], 34 bytes).
 func DotQ8_0F32(wq8 unsafe.Pointer, x unsafe.Pointer, nBlocks int) float32 {
 	wp := (*[1 << 30]byte)(wq8)
 	xp := (*[1 << 30]float32)(x)
 	sum := float32(0)
 	for b := 0; b < nBlocks; b++ {
-		off := b * 36
-		scale := *(*float32)(unsafe.Pointer(&wp[off]))
+		off := b * 34
+		scale := f16tof32(*(*uint16)(unsafe.Pointer(&wp[off])))
 		xOff := b * 32
 		var fsum float32
 		for i := 0; i < 32; i++ {
-			fsum += float32(int8(wp[off+4+i])) * xp[xOff+i]
+			fsum += float32(int8(wp[off+2+i])) * xp[xOff+i]
 		}
 		sum += scale * fsum
 	}
@@ -46,7 +46,7 @@ func f16tof32(h uint16) float32 {
 	if exp == 31 {
 		return math.Float32frombits(sign | 0x7f800000)
 	}
-	return math.Float32frombits(sign | ((exp+127-15)<<23) | (mant << 13))
+	return math.Float32frombits(sign | ((exp + 127 - 15) << 23) | (mant << 13))
 }
 
 // QuantizeQ8K scalar fallback.
@@ -65,6 +65,24 @@ func DotI8(a, b unsafe.Pointer, n int) int32 {
 	return sum
 }
 
+// DotQ8_0PrequantF16 scalar fallback.
+func DotQ8_0PrequantF16(row unsafe.Pointer, xq unsafe.Pointer, xscale unsafe.Pointer, nBlocks int) float32 {
+	rp := (*[1 << 30]byte)(row)
+	xqp := (*[1 << 30]int8)(xq)
+	xsp := (*[1 << 30]float32)(xscale)
+	sum := float32(0)
+	for b := 0; b < nBlocks; b++ {
+		off := b * 34
+		d := f16tof32(*(*uint16)(unsafe.Pointer(&rp[off])))
+		dot := int32(0)
+		for i := 0; i < 32; i++ {
+			dot += int32(int8(rp[off+2+i])) * int32(xqp[b*32+i])
+		}
+		sum += d * xsp[b] * float32(dot)
+	}
+	return sum
+}
+
 func quantizeQ8KScalar(x unsafe.Pointer, out unsafe.Pointer, n int) {
 	xp := (*[1 << 30]float32)(x)
 	op := (*[1 << 30]byte)(out)
@@ -75,13 +93,19 @@ func quantizeQ8KScalar(x unsafe.Pointer, out unsafe.Pointer, n int) {
 		amax := float32(0)
 		for i := 0; i < 256; i++ {
 			v := xp[xOff+i]
-			if v < 0 { v = -v }
-			if v > amax { amax = v }
+			if v < 0 {
+				v = -v
+			}
+			if v > amax {
+				amax = v
+			}
 		}
 		d := amax / 127.0
 		*(*float32)(unsafe.Pointer(&op[bOff])) = d
 		var id float32
-		if d != 0 { id = 1.0 / d }
+		if d != 0 {
+			id = 1.0 / d
+		}
 		for i := 0; i < 256; i++ {
 			q := int8(math.Round(float64(xp[xOff+i] * id)))
 			op[bOff+4+i] = byte(q)

@@ -9,35 +9,6 @@ import (
 	"github.com/rcarmo/go-ds4/ds4/simd"
 )
 
-// Small scratch pools for Q8_0 activation quantization (reduce alloc churn).
-type scratchI8Pool struct{ p sync.Pool }
-type scratchF32Pool struct{ p sync.Pool }
-
-func (sp *scratchI8Pool) Get(n int) []int8 {
-	if v := sp.p.Get(); v != nil {
-		b := v.([]int8)
-		if cap(b) >= n {
-			return b[:n]
-		}
-	}
-	return make([]int8, n)
-}
-func (sp *scratchI8Pool) Put(b []int8) { sp.p.Put(b[:cap(b)]) }
-
-func (sp *scratchF32Pool) Get(n int) []float32 {
-	if v := sp.p.Get(); v != nil {
-		b := v.([]float32)
-		if cap(b) >= n {
-			return b[:n]
-		}
-	}
-	return make([]float32, n)
-}
-func (sp *scratchF32Pool) Put(b []float32) { sp.p.Put(b[:cap(b)]) }
-
-var scratchQ8I8 scratchI8Pool
-var scratchQ8F32 scratchF32Pool
-
 // rmsNorm computes RMSNorm(x, w) in-place: x = w * x / rms(x).
 func rmsNorm(x, w []float32) {
 	simd.RMSNorm(x, w, RMSEps)
@@ -219,73 +190,14 @@ func matvecF16(out []float32, wF16 []byte, x []float32, inDim, outDim int) {
 	})
 }
 
-// quantizeQ8_0Activation quantizes activation to per-block int8 with f32 scales.
-func quantizeQ8_0Activation(x []float32, xq []int8, xscale []float32) {
-	nBlocks := len(x) / 32
-	for b := 0; b < nBlocks; b++ {
-		off := b * 32
-		amax := float32(0)
-		for i := 0; i < 32; i++ {
-			v := x[off+i]
-			if v < 0 {
-				v = -v
-			}
-			if v > amax {
-				amax = v
-			}
-		}
-		if amax == 0 {
-			xscale[b] = 0
-			for i := 0; i < 32; i++ {
-				xq[off+i] = 0
-			}
-			continue
-		}
-		xscale[b] = amax / 127.0
-		inv := 127.0 / amax
-		for i := 0; i < 32; i++ {
-			v := x[off+i] * inv
-			if v >= 0 {
-				xq[off+i] = int8(v + 0.5)
-			} else {
-				xq[off+i] = int8(v - 0.5)
-			}
-		}
-	}
-}
-
-// dotQ8_0RowPrequant computes one row dot using prequantized activation.
-func dotQ8_0RowPrequant(row []byte, xq []int8, xscale []float32, inDim int) float32 {
-	nBlocks := inDim / 32
-	sum := float32(0)
-	for b := 0; b < nBlocks; b++ {
-		off := b * BlockQ8_0Size
-		d := F16ToF32(*(*uint16)(unsafe.Pointer(&row[off])))
-		dot := simd.DotI8(
-			unsafe.Pointer(&row[off+2]),
-			unsafe.Pointer(&xq[b*32]),
-			32,
-		)
-		sum += d * xscale[b] * float32(dot)
-	}
-	return sum
-}
-
 // matvecQ8_0 computes out[outDim] = Q8_0_weight[outDim, inDim] · x[inDim].
-// Quantizes x once, then SIMD int8 dot per row (matches ds4.c strategy).
+// Parallelized across rows.
 func matvecQ8_0(out []float32, wQ8 []byte, x []float32, inDim, outDim int) {
-	nBlocks := inDim / 32
-	xq := scratchQ8I8.Get(nBlocks * 32)
-	xscale := scratchQ8F32.Get(nBlocks)
-	defer scratchQ8I8.Put(xq)
-	defer scratchQ8F32.Put(xscale)
-	quantizeQ8_0Activation(x, xq, xscale)
-
-	rowBytes := nBlocks * BlockQ8_0Size
+	rowBytes := (inDim / 32) * BlockQ8_0Size
 	parallelFor(outDim, func(start, end int) {
 		for o := start; o < end; o++ {
 			row := wQ8[o*rowBytes : (o+1)*rowBytes]
-			out[o] = dotQ8_0RowPrequant(row, xq, xscale, inDim)
+			out[o] = DotQ8_0F32(row, x, inDim)
 		}
 	})
 }
@@ -293,21 +205,14 @@ func matvecQ8_0(out []float32, wQ8 []byte, x []float32, inDim, outDim int) {
 // matvecQ8_0Grouped computes grouped output projection.
 // Weight is [outDim, inDim] Q8_0, but processed in groups of NOutGroup=8.
 func matvecQ8_0Grouped(out []float32, wQ8 []byte, x []float32, inDim, outDim, groupSize int) {
-	nBlocks := inDim / 32
-	xq := scratchQ8I8.Get(nBlocks * 32)
-	xscale := scratchQ8F32.Get(nBlocks)
-	defer scratchQ8I8.Put(xq)
-	defer scratchQ8F32.Put(xscale)
-	quantizeQ8_0Activation(x, xq, xscale)
-
-	rowBytes := nBlocks * BlockQ8_0Size
+	rowBytes := (inDim / 32) * BlockQ8_0Size
 	nGroups := outDim / groupSize
 	parallelFor(nGroups, func(gStart, gEnd int) {
 		for g := gStart; g < gEnd; g++ {
 			for j := 0; j < groupSize; j++ {
 				o := g*groupSize + j
 				row := wQ8[o*rowBytes : (o+1)*rowBytes]
-				out[o] = dotQ8_0RowPrequant(row, xq, xscale, inDim)
+				out[o] = DotQ8_0F32(row, x, inDim)
 			}
 		}
 	})

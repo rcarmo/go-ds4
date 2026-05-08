@@ -26,3 +26,10 @@ func QuantizeQ8K(x unsafe.Pointer, out unsafe.Pointer, n int)
 //
 //go:noescape
 func DotI8(a, b unsafe.Pointer, n int) int32
+
+// DotQ8_0PrequantF16 computes one DS4 Q8_0 row dot with prequantized activation.
+// Row layout per block: f16 scale + int8[32] values (34 bytes).
+// xq layout per block: int8[32], xscale: float32 per block.
+//
+//go:noescape
+func DotQ8_0PrequantF16(row unsafe.Pointer, xq unsafe.Pointer, xscale unsafe.Pointer, nBlocks int) float32

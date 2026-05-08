@@ -50,25 +50,13 @@ func F32ToF16(f float32) uint16 {
 }
 
 // Q8_0: 32-element blocks. Used for attention projections, shared experts, output.
-// Layout: f16 scale (2 bytes) + int8[32] quantized values = 34 bytes.
+// DS4 layout: f16 scale (2 bytes) + int8[32] quantized values = 34 bytes.
 
 // DotQ8_0F32 computes dot(Q8_0 weight row, float32 activation) for n elements.
-// DS4 Q8_0 uses f16 scales (34-byte blocks), so we use the reference scalar path.
+// Uses SIMD on amd64/arm64 via simd.DotQ8_0F32 (DS4 34-byte layout).
 func DotQ8_0F32(wq8 []byte, x []float32, n int) float32 {
 	nBlocks := n / 32
-	sum := float32(0)
-	for b := 0; b < nBlocks; b++ {
-		off := b * BlockQ8_0Size
-		d := F16ToF32(*(*uint16)(unsafe.Pointer(&wq8[off])))
-		qs := wq8[off+2 : off+34]
-		dot := float32(0)
-		xoff := b * 32
-		for i := 0; i < 32; i++ {
-			dot += float32(int8(qs[i])) * x[xoff+i]
-		}
-		sum += d * dot
-	}
-	return sum
+	return simd.DotQ8_0F32(unsafe.Pointer(&wq8[0]), unsafe.Pointer(&x[0]), nBlocks)
 }
 
 // QuantizeRowQ8K quantizes a float32 row to Q8_K blocks.

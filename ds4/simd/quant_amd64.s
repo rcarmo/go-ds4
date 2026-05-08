@@ -1,6 +1,6 @@
 // quant_amd64.s — AVX2+FMA quantized dot product kernels for DS4.
 //
-// DotQ8_0F32: Q8_0 weight × F32 activation
+// DotQ8_0F32: DS4 Q8_0 (f16 scale + 32 int8, 34 bytes) × F32 activation
 // DotF16F32:  F16 weight × F32 activation (VCVTPH2PS, F16C extension)
 // QuantizeQ8K: F32 → Q8_K quantization
 // DotI8: int8 × int8 → int32 dot product
@@ -9,10 +9,9 @@
 
 // func DotQ8_0F32(wq8 unsafe.Pointer, x unsafe.Pointer, nBlocks int) float32
 //
-// Per block (36 bytes = 4 scale + 32 int8):
-//   VBROADCASTSS scale
+// Per block (34 bytes = 2-byte f16 scale + 32 int8):
+//   VCVTPH2PS load scale (lane0), VBROADCASTSS scale
 //   4× (VPMOVSXBD 8 int8→8 int32, VCVTDQ2PS, VMULPS scale, VFMADD231PS with x)
-//   = 32 elements per block
 TEXT ·DotQ8_0F32(SB), NOSPLIT, $0-28
     MOVQ    wq8+0(FP), SI       // SI = Q8_0 blocks
     MOVQ    x+8(FP), DI         // DI = float32 activation
@@ -24,35 +23,36 @@ TEXT ·DotQ8_0F32(SB), NOSPLIT, $0-28
     JZ      q8f32_done
 
 q8f32_block:
-    // Broadcast scale
-    VBROADCASTSS (SI), Y1       // Y1 = [scale × 8]
+    // Load f16 scale and broadcast
+    VCVTPH2PS (SI), X1          // lane0 = scale
+    VBROADCASTSS X1, Y1         // Y1 = [scale × 8]
 
     // Process 32 int8 values in 4 groups of 8
-    // Group 0: bytes 4-11
-    VPMOVSXBD 4(SI), Y2         // sign-extend 8 int8 → 8 int32
+    // Group 0: bytes 2-9
+    VPMOVSXBD 2(SI), Y2         // sign-extend 8 int8 → 8 int32
     VCVTDQ2PS Y2, Y2            // int32 → float32
     VMULPS  Y1, Y2, Y2          // × scale
     VFMADD231PS (DI), Y2, Y0    // Y0 += Y2 * x[0:8]
 
-    // Group 1: bytes 12-19
-    VPMOVSXBD 12(SI), Y2
+    // Group 1: bytes 10-17
+    VPMOVSXBD 10(SI), Y2
     VCVTDQ2PS Y2, Y2
     VMULPS  Y1, Y2, Y2
     VFMADD231PS 32(DI), Y2, Y0
 
-    // Group 2: bytes 20-27
-    VPMOVSXBD 20(SI), Y2
+    // Group 2: bytes 18-25
+    VPMOVSXBD 18(SI), Y2
     VCVTDQ2PS Y2, Y2
     VMULPS  Y1, Y2, Y2
     VFMADD231PS 64(DI), Y2, Y0
 
-    // Group 3: bytes 28-35
-    VPMOVSXBD 28(SI), Y2
+    // Group 3: bytes 26-33
+    VPMOVSXBD 26(SI), Y2
     VCVTDQ2PS Y2, Y2
     VMULPS  Y1, Y2, Y2
     VFMADD231PS 96(DI), Y2, Y0
 
-    ADDQ    $36, SI              // next Q8_0 block
+    ADDQ    $34, SI              // next Q8_0 block
     ADDQ    $128, DI             // next 32 floats
     DECQ    CX
     JNZ     q8f32_block
@@ -123,6 +123,79 @@ f16f32_tail:
 TEXT ·QuantizeQ8K(SB), NOSPLIT, $0-24
     JMP     ·quantizeQ8KGo(SB)
 
+
+// func DotQ8_0PrequantF16(row, xq, xscale unsafe.Pointer, nBlocks int) float32
+//
+// DS4 Q8_0 layout per block: f16 scale + int8[32] (34 bytes).
+// Computes Σ_b f16(scale_b) * xscale[b] * dot_i8_32(row_qs[b], xq[b]).
+TEXT ·DotQ8_0PrequantF16(SB), NOSPLIT, $0-36
+    MOVQ    row+0(FP), SI
+    MOVQ    xq+8(FP), DI
+    MOVQ    xscale+16(FP), DX
+    MOVQ    nBlocks+24(FP), CX
+
+    VXORPS  X0, X0, X0          // scalar accumulator
+
+    TESTQ   CX, CX
+    JZ      dq8pf16_done
+
+    VMOVDQU di8_128<>(SB), Y4   // [128 x 32]
+    VMOVDQU di8_ones<>(SB), Y5  // int16 ones
+
+dq8pf16_loop:
+    // scale = f16_to_f32(*(uint16*)row)
+    // VCVTPH2PS m64 -> xmm converts 4 halfs; lane0 is our scale.
+    VCVTPH2PS (SI), X1
+
+    // dot_i8_32(row[2:34], xq[0:32]) using signed*signed trick.
+    VMOVDQU 2(SI), Y2
+    VMOVDQU (DI), Y3
+
+    VPADDB  Y4, Y2, Y6
+    VPMADDUBSW Y3, Y6, Y7
+    VPMADDWD Y5, Y7, Y7
+
+    // horizontal sum raw dot: Y7 -> X8[0]
+    VEXTRACTI128 $1, Y7, X8
+    VPADDD  X8, X7, X7
+    VPSHUFD $0x4E, X7, X8
+    VPADDD  X8, X7, X7
+    VPSHUFD $0xB1, X7, X8
+    VPADDD  X8, X7, X8          // X8[0] = raw
+
+    // correction = 128 * sum(xq)
+    VPMOVSXBW X3, Y9
+    VPMADDWD Y5, Y9, Y9
+    VEXTRACTI128 $1, Y3, X10
+    VPMOVSXBW X10, Y10
+    VPMADDWD Y5, Y10, Y10
+    VPADDD  Y10, Y9, Y9
+
+    VEXTRACTI128 $1, Y9, X11
+    VPADDD  X11, X9, X9
+    VPSHUFD $0x4E, X9, X11
+    VPADDD  X11, X9, X9
+    VPSHUFD $0xB1, X9, X11
+    VPADDD  X11, X9, X9         // X9[0] = sum(xq)
+
+    VPSLLD  $7, X9, X9
+    VPSUBD  X9, X8, X8          // X8[0] = signed dot
+
+    VCVTDQ2PS X8, X8            // dot -> float32
+    MULSS   X1, X8              // * row scale
+    MULSS   (DX), X8            // * activation scale
+    ADDSS   X8, X0
+
+    ADDQ    $34, SI
+    ADDQ    $32, DI
+    ADDQ    $4, DX
+    DECQ    CX
+    JNZ     dq8pf16_loop
+
+dq8pf16_done:
+    MOVSS   X0, ret+32(FP)
+    VZEROUPPER
+    RET
 
 // func DotI8(a, b unsafe.Pointer, n int) int32
 //
