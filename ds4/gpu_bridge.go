@@ -16,6 +16,7 @@ type CUDAEngine struct {
 	expertPool  *gpu.ExpertPool
 	expertCache *gpu.ExpertCache
 	batchBufs   *gpu.BatchedExpertBufs
+	stream      gpu.CUstream
 }
 
 // InitGPU initializes GPU acceleration (CUDA or Vulkan).
@@ -34,6 +35,7 @@ func (e *Engine) InitGPU() error {
 			gpu.InitCUDAGemvQ2K()
 			gpu.InitCUDASwiGLU()
 			gpu.InitCUDAGemvIQ2Opt()
+			gpu.InitCUDAGemvQ2KOpt()
 			// Init IQ2 kernel with grid table
 			gridSlice := (*[256 * 128 * 8]int8)(unsafe.Pointer(&iq2xxsSignedGrid[0]))
 			gpu.InitCUDAGemvIQ2(gridSlice[:])
@@ -60,6 +62,10 @@ func (e *Engine) InitGPU() error {
 				bb, berr := gpu.NewBatchedExpertBufs(NExpertUsedFast, NEmbd, NFFExp)
 				if berr == nil {
 					ce.batchBufs = bb
+					if s, err := gpu.StreamCreate(); err == nil {
+						ce.stream = s
+						fmt.Println("[gpu] CUDA stream created")
+					}
 					fmt.Println("[gpu] Batched expert buffers ready")
 				}
 			} else {
@@ -99,9 +105,14 @@ func (e *Engine) uploadCUDAWeights(ce *CUDAEngine) (int, int64) {
 		p := fmt.Sprintf("blk.%d.", il)
 		// Only the high-value Q8_0 projections (~2 GB total, fits in 12 GB VRAM)
 		uploads = append(uploads,
-			upload{p + "attn_q_b.weight", l.AttnQB, NHead * NHeadDim},  // 1024→32768 (34 MB)
-			upload{p + "attn_output_b.weight", l.AttnOutputB, NEmbd},   // 1024→4096 (34 MB)
-			upload{p + "ffn_down_shexp.weight", l.FfnDownShexp, NEmbd}, // 2048→4096 (8.5 MB)
+			upload{p + "attn_q_a.weight", l.AttnQA, NLoraQ},
+			upload{p + "attn_q_b.weight", l.AttnQB, NHead * NHeadDim},
+			upload{p + "attn_kv.weight", l.AttnKV, NHeadDim},
+			upload{p + "attn_output_a.weight", l.AttnOutputA, NLoraO},
+			upload{p + "attn_output_b.weight", l.AttnOutputB, NEmbd},
+			upload{p + "ffn_gate_shexp.weight", l.FfnGateShexp, NFFExp},
+			upload{p + "ffn_up_shexp.weight", l.FfnUpShexp, NFFExp},
+			upload{p + "ffn_down_shexp.weight", l.FfnDownShexp, NEmbd},
 		)
 	}
 
@@ -158,7 +169,7 @@ func (ce *CUDAEngine) matvecQ8_0(out []float32, tensorName string, x []float32, 
 		return false
 	}
 	// Only GPU-dispatch for large outputs where kernel speedup exceeds PCIe overhead
-	if outDim < 4096 {
+	if outDim < 2048 {
 		return false
 	}
 	wtPtr, ok := ce.weightPtrs[tensorName]
@@ -223,6 +234,9 @@ func (ce *CUDAEngine) Close() {
 		ce.expertCache.Free()
 		if ce.batchBufs != nil {
 			ce.batchBufs.Free()
+			if ce.stream != 0 {
+				gpu.StreamDestroy(ce.stream)
+			}
 		}
 	}
 	ce.ready = false
@@ -270,27 +284,27 @@ func (e *Engine) gpuExpertForward(
 	}
 
 	// Upload activation once
-	bb.ActBuf.Upload(ds.FfnNormed)
+	bb.ActBuf.UploadAsync(ds.FfnNormed, ce.stream)
 
 	// Batched gate: nExp*NFFExp output rows, each reading from its expert slice
 	// The kernel processes rows sequentially; row r reads weight at offset r*rowBytes
 	// where rowBytes = per-row IQ2 size. The batched buffer has expert weights
 	// concatenated, so rows 0..NFFExp-1 are expert 0, NFFExp..2*NFFExp-1 are expert 1, etc.
-	gpu.CUDAMatvecIQ2Opt(bb.GateOut, bb.ActBuf, bb.GateBuf, NEmbd, nExp*NFFExp, gateRowBytes)
+	gpu.CUDAMatvecIQ2OptStream(bb.GateOut, bb.ActBuf, bb.GateBuf, NEmbd, nExp*NFFExp, gateRowBytes, ce.stream)
 
 	// Batched up
-	gpu.CUDAMatvecIQ2Opt(bb.UpOut, bb.ActBuf, bb.UpBuf, NEmbd, nExp*NFFExp, upRowBytes)
+	gpu.CUDAMatvecIQ2OptStream(bb.UpOut, bb.ActBuf, bb.UpBuf, NEmbd, nExp*NFFExp, upRowBytes, ce.stream)
 
 	// Batched SwiGLU on all nExp*NFFExp elements
-	gpu.CUDASwiGLU(bb.GateOut, bb.GateOut, bb.UpOut, nExp*NFFExp)
+	gpu.CUDASwiGLUStream(bb.GateOut, bb.GateOut, bb.UpOut, nExp*NFFExp, ce.stream)
 
 	// Batched Q2K down: nExp*NEmbd output rows
-	gpu.CUDAMatvecQ2K(bb.DownOut, bb.GateOut, bb.DownBuf, NFFExp, nExp*NEmbd, downRowBytes)
+	gpu.CUDAMatvecQ2KOptStream(bb.DownOut, bb.GateOut, bb.DownBuf, NFFExp, nExp*NEmbd, downRowBytes, ce.stream)
 
 	// Single sync + download
-	gpu.Sync()
+	gpu.StreamSync(ce.stream)
 	result := make([]float32, nExp*NEmbd)
-	bb.DownOut.Download(result)
+	bb.DownOut.DownloadAsync(result, ce.stream)
 
 	// Accumulate per-expert results with weights
 	for slot, exp := range experts {

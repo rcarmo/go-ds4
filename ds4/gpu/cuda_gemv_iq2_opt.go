@@ -281,3 +281,21 @@ func CUDAMatvecIQ2Opt(output, activation *Buffer, weightPtr CUdeviceptr, inDim, 
 	}
 	return LaunchKernel(cudaGemvIQ2Opt, uint32(outDim), 1, 1, 256, 1, 1, 256*4, args...)
 }
+
+func CUDAMatvecIQ2OptStream(output, activation *Buffer, weightPtr CUdeviceptr, inDim, outDim, rowBytes int, stream CUstream) error {
+	if !cudaGemvIQ2OptReady {
+		return CUDAMatvecIQ2(output, activation, weightPtr, inDim, outDim, rowBytes)
+	}
+	EnsureContext()
+	nBlocks := uint32(inDim / 256)
+	outDimU := uint32(outDim)
+	rowBytesU := uint32(rowBytes)
+	actPtr := activation.Ptr
+	outPtr := output.Ptr
+	gridPtr := cudaGridBuf.Ptr
+	args := []unsafe.Pointer{
+		unsafe.Pointer(&actPtr), unsafe.Pointer(&weightPtr), unsafe.Pointer(&outPtr),
+		unsafe.Pointer(&gridPtr), unsafe.Pointer(&nBlocks), unsafe.Pointer(&outDimU), unsafe.Pointer(&rowBytesU),
+	}
+	return LaunchKernelStream(cudaGemvIQ2Opt, uint32(outDim), 1, 1, 256, 1, 1, 256*4, stream, args...)
+}

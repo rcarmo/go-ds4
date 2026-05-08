@@ -26,7 +26,6 @@ const DS4GemvQ2KOptPTX = `.version 7.0
     .reg .f32 %f<16>;
     .reg .f16 %h0, %h1;
     .reg .pred %p<4>;
-
     .shared .f32 sdata[256];
 
     mov.u32 %r0, %ctaid.x;
@@ -69,6 +68,7 @@ group_loop:
     setp.ge.u32 %p2, %r8, 16;
     @%p2 bra group_done;
 
+    // Load scale byte
     cvt.u64.u32 %rd10, %r8;
     add.u64 %rd11, %rd6, %rd10;
     ld.global.u8 %r9, [%rd11];
@@ -76,47 +76,28 @@ group_loop:
     shr.u32 %r11, %r9, 4;
     cvt.rn.f32.u32 %f5, %r11;
 
-    // Sum activation for bsums: load 4 floats at once
+    // Activation base for this group: act[j*16]
     shl.b32 %r12, %r8, 4;
     mul.wide.u32 %rd12, %r12, 4;
     add.u64 %rd13, %rd9, %rd12;
 
-    // Load 4x f32 activation values (vectorized)
-    ld.global.f32 %f6, [%rd13];
-    ld.global.f32 %f7, [%rd13+4];
-    ld.global.f32 %f8, [%rd13+8];
-    ld.global.f32 %f9, [%rd13+12];
+    // Bsums: sum 16 activation values (scalar, simple, correct)
     mov.f32 %f10, 0f00000000;
-    add.f32 %f10, %f6, %f7;
-    add.f32 %f10, %f10, %f8;
-    add.f32 %f10, %f10, %f9;
-    ld.global.f32 %f6, [%rd13+16];
-    ld.global.f32 %f7, [%rd13+20];
-    ld.global.f32 %f8, [%rd13+24];
-    ld.global.f32 %f9, [%rd13+28];
+    mov.u32 %r13, 0;
+bsum_loop:
+    setp.ge.u32 %p3, %r13, 16;
+    @%p3 bra bsum_done;
+    shl.b32 %r14, %r13, 2;
+    cvt.u64.u32 %rd14, %r14;
+    add.u64 %rd15, %rd13, %rd14;
+    ld.global.f32 %f6, [%rd15];
     add.f32 %f10, %f10, %f6;
-    add.f32 %f10, %f10, %f7;
-    add.f32 %f10, %f10, %f8;
-    add.f32 %f10, %f10, %f9;
-    ld.global.f32 %f6, [%rd13+32];
-    ld.global.f32 %f7, [%rd13+36];
-    ld.global.f32 %f8, [%rd13+40];
-    ld.global.f32 %f9, [%rd13+44];
-    add.f32 %f10, %f10, %f6;
-    add.f32 %f10, %f10, %f7;
-    add.f32 %f10, %f10, %f8;
-    add.f32 %f10, %f10, %f9;
-    ld.global.f32 %f6, [%rd13+48];
-    ld.global.f32 %f7, [%rd13+52];
-    ld.global.f32 %f8, [%rd13+56];
-    ld.global.f32 %f9, [%rd13+60];
-    add.f32 %f10, %f10, %f6;
-    add.f32 %f10, %f10, %f7;
-    add.f32 %f10, %f10, %f8;
-    add.f32 %f10, %f10, %f9;
+    add.u32 %r13, %r13, 1;
+    bra bsum_loop;
+bsum_done:
     fma.rn.f32 %f4, %f5, %f10, %f4;
 
-    // Q2 dot: load 4 packed bytes, extract 16 Q2 values, dot with activation
+    // Q2 dot: load 4 packed bytes as u32, extract 16 Q2 values
     shl.b32 %r15, %r8, 2;
     add.u32 %r15, %r15, 16;
     cvt.u64.u32 %rd16, %r15;
@@ -125,85 +106,28 @@ group_loop:
 
     mov.f32 %f11, 0f00000000;
 
-    // Byte 0: 4 Q2 values
-    and.b32 %r19, %r17, 3;
-    cvt.rn.f32.u32 %f12, %r19;
-    fma.rn.f32 %f11, %f12, %f6, %f11;
-    shr.u32 %r19, %r17, 2;
-    and.b32 %r19, %r19, 3;
-    cvt.rn.f32.u32 %f12, %r19;
-    fma.rn.f32 %f11, %f12, %f7, %f11;
-    shr.u32 %r19, %r17, 4;
-    and.b32 %r19, %r19, 3;
-    cvt.rn.f32.u32 %f12, %r19;
-    fma.rn.f32 %f11, %f12, %f8, %f11;
-    shr.u32 %r19, %r17, 6;
-    and.b32 %r19, %r19, 3;
-    cvt.rn.f32.u32 %f12, %r19;
-    fma.rn.f32 %f11, %f12, %f9, %f11;
+    // 16 Q2 values x activation: byte-by-byte extraction, reload act each time
+    mov.u32 %r18, 0;
+q2_loop:
+    setp.ge.u32 %p3, %r18, 16;
+    @%p3 bra q2_done;
 
-    // Reload act for bytes 1-3
-    ld.global.f32 %f6, [%rd13+16];
-    ld.global.f32 %f7, [%rd13+20];
-    ld.global.f32 %f8, [%rd13+24];
-    ld.global.f32 %f9, [%rd13+28];
-    shr.u32 %r19, %r17, 8;
-    and.b32 %r19, %r19, 3;
-    cvt.rn.f32.u32 %f12, %r19;
-    fma.rn.f32 %f11, %f12, %f6, %f11;
-    shr.u32 %r19, %r17, 10;
-    and.b32 %r19, %r19, 3;
-    cvt.rn.f32.u32 %f12, %r19;
-    fma.rn.f32 %f11, %f12, %f7, %f11;
-    shr.u32 %r19, %r17, 12;
-    and.b32 %r19, %r19, 3;
-    cvt.rn.f32.u32 %f12, %r19;
-    fma.rn.f32 %f11, %f12, %f8, %f11;
-    shr.u32 %r19, %r17, 14;
-    and.b32 %r19, %r19, 3;
-    cvt.rn.f32.u32 %f12, %r19;
-    fma.rn.f32 %f11, %f12, %f9, %f11;
+    // Extract Q2 value: (packed >> (k*2)) & 3
+    shl.b32 %r19, %r18, 1;
+    shr.u32 %r20, %r17, %r19;
+    and.b32 %r20, %r20, 3;
+    cvt.rn.f32.u32 %f12, %r20;
 
-    ld.global.f32 %f6, [%rd13+32];
-    ld.global.f32 %f7, [%rd13+36];
-    ld.global.f32 %f8, [%rd13+40];
-    ld.global.f32 %f9, [%rd13+44];
-    shr.u32 %r19, %r17, 16;
-    and.b32 %r19, %r19, 3;
-    cvt.rn.f32.u32 %f12, %r19;
-    fma.rn.f32 %f11, %f12, %f6, %f11;
-    shr.u32 %r19, %r17, 18;
-    and.b32 %r19, %r19, 3;
-    cvt.rn.f32.u32 %f12, %r19;
-    fma.rn.f32 %f11, %f12, %f7, %f11;
-    shr.u32 %r19, %r17, 20;
-    and.b32 %r19, %r19, 3;
-    cvt.rn.f32.u32 %f12, %r19;
-    fma.rn.f32 %f11, %f12, %f8, %f11;
-    shr.u32 %r19, %r17, 22;
-    and.b32 %r19, %r19, 3;
-    cvt.rn.f32.u32 %f12, %r19;
-    fma.rn.f32 %f11, %f12, %f9, %f11;
+    // Load activation[j*16 + k]
+    shl.b32 %r21, %r18, 2;
+    cvt.u64.u32 %rd18, %r21;
+    add.u64 %rd19, %rd13, %rd18;
+    ld.global.f32 %f13, [%rd19];
 
-    ld.global.f32 %f6, [%rd13+48];
-    ld.global.f32 %f7, [%rd13+52];
-    ld.global.f32 %f8, [%rd13+56];
-    ld.global.f32 %f9, [%rd13+60];
-    shr.u32 %r19, %r17, 24;
-    and.b32 %r19, %r19, 3;
-    cvt.rn.f32.u32 %f12, %r19;
-    fma.rn.f32 %f11, %f12, %f6, %f11;
-    shr.u32 %r19, %r17, 26;
-    and.b32 %r19, %r19, 3;
-    cvt.rn.f32.u32 %f12, %r19;
-    fma.rn.f32 %f11, %f12, %f7, %f11;
-    shr.u32 %r19, %r17, 28;
-    and.b32 %r19, %r19, 3;
-    cvt.rn.f32.u32 %f12, %r19;
-    fma.rn.f32 %f11, %f12, %f8, %f11;
-    shr.u32 %r19, %r17, 30;
-    cvt.rn.f32.u32 %f12, %r19;
-    fma.rn.f32 %f11, %f12, %f9, %f11;
+    fma.rn.f32 %f11, %f12, %f13, %f11;
+    add.u32 %r18, %r18, 1;
+    bra q2_loop;
+q2_done:
 
     cvt.rn.f32.u32 %f12, %r10;
     fma.rn.f32 %f3, %f12, %f11, %f3;
@@ -247,20 +171,21 @@ warp_reduce:
     @%p2 bra done;
     mov.f32 %f0, 0f00000000;
     mov.u32 %r28, 0;
-ws:  setp.ge.u32 %p3, %r28, 8;
-@%p3 bra st;
+warp_sum:
+    setp.ge.u32 %p3, %r28, 8;
+    @%p3 bra store;
     mul.lo.u32 %r29, %r28, 4;
     cvt.u64.u32 %rd21, %r29;
     add.u64 %rd22, %rd20, %rd21;
     ld.shared.f32 %f8, [%rd22];
     add.f32 %f0, %f0, %f8;
     add.u32 %r28, %r28, 1;
-    bra ws;
-st:
-    ld.param.u64 %rd25, [param_out];
-    mul.wide.u32 %rd26, %r0, 4;
-    add.u64 %rd27, %rd25, %rd26;
-    st.global.f32 [%rd27], %f0;
+    bra warp_sum;
+store:
+    ld.param.u64 %rd23, [param_out];
+    mul.wide.u32 %rd21, %r0, 4;
+    add.u64 %rd22, %rd23, %rd21;
+    st.global.f32 [%rd22], %f0;
 done:
     ret;
 }
@@ -303,4 +228,21 @@ func CUDAMatvecQ2KOpt(output, activation *Buffer, weightPtr CUdeviceptr, inDim, 
 		unsafe.Pointer(&nBlocks), unsafe.Pointer(&outDimU), unsafe.Pointer(&rowBytesU),
 	}
 	return LaunchKernel(cudaGemvQ2KOpt, uint32(outDim), 1, 1, 256, 1, 1, 256*4, args...)
+}
+
+func CUDAMatvecQ2KOptStream(output, activation *Buffer, weightPtr CUdeviceptr, inDim, outDim, rowBytes int, stream CUstream) error {
+	if !cudaGemvQ2KOptReady {
+		return CUDAMatvecQ2K(output, activation, weightPtr, inDim, outDim, rowBytes)
+	}
+	EnsureContext()
+	nBlocks := uint32(inDim / 256)
+	outDimU := uint32(outDim)
+	rowBytesU := uint32(rowBytes)
+	actPtr := activation.Ptr
+	outPtr := output.Ptr
+	args := []unsafe.Pointer{
+		unsafe.Pointer(&actPtr), unsafe.Pointer(&weightPtr), unsafe.Pointer(&outPtr),
+		unsafe.Pointer(&nBlocks), unsafe.Pointer(&outDimU), unsafe.Pointer(&rowBytesU),
+	}
+	return LaunchKernelStream(cudaGemvQ2KOpt, uint32(outDim), 1, 1, 256, 1, 1, 256*4, stream, args...)
 }

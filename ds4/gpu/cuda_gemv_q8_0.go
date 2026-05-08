@@ -273,3 +273,17 @@ func CUDASwiGLU(dst, a, b *Buffer, n int) error {
 }
 
 func CudaSwiGLUReady() bool { return cudaSwiGLUReady }
+
+func CUDASwiGLUStream(dst, a, b *Buffer, n int, stream CUstream) error {
+	if !cudaSwiGLUReady {
+		return fmt.Errorf("SwiGLU not compiled")
+	}
+	nn := uint32(n)
+	aPtr, bPtr, dPtr := a.Ptr, b.Ptr, dst.Ptr
+	args := []unsafe.Pointer{
+		unsafe.Pointer(&aPtr), unsafe.Pointer(&bPtr),
+		unsafe.Pointer(&dPtr), unsafe.Pointer(&nn),
+	}
+	groups := (nn + 255) / 256
+	return LaunchKernelStream(cudaSwiGLU, groups, 1, 1, 256, 1, 1, 0, stream, args...)
+}
