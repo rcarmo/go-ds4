@@ -37,16 +37,38 @@ func F16ToF32(h uint16) float32 {
 
 func F32ToF16(f float32) uint16 {
 	bits := math.Float32bits(f)
-	sign := uint16((bits >> 16) & 0x8000)
-	exp := int((bits>>23)&0xff) - 127 + 15
+	sign := (bits >> 16) & 0x8000
+	exp := int32((bits>>23)&0xff) - 127 + 15
 	mant := bits & 0x7fffff
+
 	if exp <= 0 {
-		return sign
+		if exp < -10 {
+			return uint16(sign)
+		}
+		mant |= 0x800000
+		shift := uint32(14 - exp)
+		halfMant := mant >> shift
+		roundBit := (mant >> (shift - 1)) & 1
+		sticky := mant & ((uint32(1) << (shift - 1)) - 1)
+		if roundBit != 0 && (sticky != 0 || (halfMant&1) != 0) {
+			halfMant++
+		}
+		return uint16(sign | halfMant)
 	}
+
 	if exp >= 31 {
-		return sign | 0x7c00
+		if ((bits>>23)&0xff) == 0xff && mant != 0 {
+			return uint16(sign | 0x7e00)
+		}
+		return uint16(sign | 0x7c00)
 	}
-	return sign | uint16(exp)<<10 | uint16(mant>>13)
+
+	half := sign | (uint32(exp) << 10) | (mant >> 13)
+	round := mant & 0x1fff
+	if round > 0x1000 || (round == 0x1000 && (half&1) != 0) {
+		half++
+	}
+	return uint16(half)
 }
 
 // Q8_0: 32-element blocks. Used for attention projections, shared experts, output.

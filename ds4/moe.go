@@ -495,11 +495,9 @@ func layerForwardDecode(
 		layerFFNDecode(ds, layer, model, budget, streamer, il, tokenID, nExperts)
 		hcPostSumOne(ds.CurHC, ds.RoutedOut, ds.SharedOut, ffnResidual, ds.Post, ds.Comb, ds.HCSumTmp)
 	} else {
-		// Standard residual (V2 Lite)
+		// Standard residual path (V2 Lite): attention residual, then FFN residual.
 		copy(ds.AttnCur[:cfg.NEmbd], ds.CurHC[:cfg.NEmbd])
-		for i := 0; i < cfg.NEmbd; i++ {
-			ds.AttnOut[i] = 0
-		} // DISABLED attn
+		layerAttnDecode(ds, layer, cache, model, pos, il)
 		for i := 0; i < cfg.NEmbd; i++ {
 			ds.CurHC[i] += ds.AttnOut[i]
 		}

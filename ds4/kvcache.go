@@ -100,7 +100,10 @@ func layerCompressRatio(il int) int {
 func (lc *LayerCache) PushRawKV(kv []float32) {
 	idx := lc.RawWrite
 	rd := lc.RowDim
-	copy(lc.RawKV[idx*rd:(idx+1)*rd], kv[:rd])
+	dst := lc.RawKV[idx*rd : (idx+1)*rd]
+	for i := 0; i < rd; i++ {
+		dst[i] = F16ToF32(F32ToF16(kv[i]))
+	}
 	lc.RawWrite++
 	if lc.RawWrite >= lc.CapRaw {
 		lc.RawWrite = 0
@@ -135,7 +138,10 @@ func (lc *LayerCache) PushCompKV(kv []float32) {
 		return
 	}
 	idx := lc.CompWrite
-	copy(lc.CompKV[idx*NHeadDim:(idx+1)*NHeadDim], kv)
+	dst := lc.CompKV[idx*NHeadDim : (idx+1)*NHeadDim]
+	for i := 0; i < NHeadDim; i++ {
+		dst[i] = F16ToF32(F32ToF16(kv[i]))
+	}
 	lc.CompWrite++
 	if lc.CompWrite >= lc.CompCap {
 		lc.CompWrite = 0
@@ -168,7 +174,10 @@ func (lc *LayerCache) PushIndexCompKV(kv []float32) {
 		return
 	}
 	idx := lc.IndexCompWrite
-	copy(lc.IndexCompKV[idx*NIndexerHeadDim:(idx+1)*NIndexerHeadDim], kv)
+	dst := lc.IndexCompKV[idx*NIndexerHeadDim : (idx+1)*NIndexerHeadDim]
+	for i := 0; i < NIndexerHeadDim; i++ {
+		dst[i] = F16ToF32(F32ToF16(kv[i]))
+	}
 	lc.IndexCompWrite++
 	if lc.IndexCompWrite >= lc.CompCap {
 		lc.IndexCompWrite = 0

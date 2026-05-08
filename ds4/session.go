@@ -138,12 +138,9 @@ func (e *Engine) Close() {
 func (e *Engine) newKVCache(ctxSize int) *KVCache {
 	kv := NewKVCacheN(ctxSize, e.Config.NLayer)
 	if e.Config.NHC == 0 {
-		// V2 Lite: KV cache stores compressed kvA (kv_lora_rank + n_rot)
-		kvLoraRank := 512
-		if v, ok := e.Model.MetaU32("deepseek2.attention.kv_lora_rank"); ok {
-			kvLoraRank = int(v)
-		}
-		rowDim := kvLoraRank + e.Config.NRot
+		// Current V2 path expands KV_B and caches one attention row per token.
+		// Keep RowDim aligned with layerAttnDecode's ds.KV width.
+		rowDim := e.Config.NHeadDim
 		for il := 0; il < e.Config.NLayer; il++ {
 			kv.Layer[il].RowDim = rowDim
 			kv.Layer[il].RawKV = make([]float32, kv.Layer[il].CapRaw*rowDim)
