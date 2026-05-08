@@ -1,6 +1,7 @@
 package ds4
 
 import (
+	"fmt"
 	"math"
 	"sort"
 	"unsafe"
@@ -18,6 +19,7 @@ func layerFFNDecode(
 	layer *LayerWeights,
 	model *GGUFModel,
 	budget *MemoryBudget,
+	streamer *DiskStreamer,
 	il, tokenID int,
 ) {
 	// 1. RMSNorm FFN input
@@ -45,7 +47,7 @@ func layerFFNDecode(
 	}
 
 	for _, exp := range experts {
-		expertForward(ds, layer, exp.idx, exp.score)
+		expertForward(ds, layer, exp.idx, exp.score, streamer, model, il)
 	}
 
 	// 5. Run shared expert
@@ -131,15 +133,46 @@ func hashRouteExperts(layer *LayerWeights, tokenID int) []expertScore {
 }
 
 // expertForward runs a single routed expert: gate·up (IQ2_XXS) → SwiGLU → down (Q2_K).
-func expertForward(ds *DecodeState, layer *LayerWeights, expertIdx int, weight float32) {
-	// Gate and up projections are IQ2_XXS: [NFFExp, NExpert*NEmbd]
-	// Each expert's slice: [NFFExp, NEmbd] starting at expertIdx * rowBytes
+// If streamer is non-nil, expert weights are read from disk instead of mmap.
+func expertForward(ds *DecodeState, layer *LayerWeights, expertIdx int, weight float32,
+	streamer *DiskStreamer, model *GGUFModel, il int) {
 	gateRowBytes := (NEmbd / QK_K) * BlockIQ2XXSSize
 	upRowBytes := gateRowBytes
 	downRowBytes := (NFFExp / QK_K) * BlockQ2KSize
 
-	gateBase := layer.FfnGateExps[expertIdx*gateRowBytes*NFFExp:]
-	upBase := layer.FfnUpExps[expertIdx*upRowBytes*NFFExp:]
+	var gateBase, upBase, downBase []byte
+
+	if streamer != nil {
+		// Stream from disk: read only this expert's slice
+		prefix := fmt.Sprintf("blk.%d.", il)
+		gateTensor := model.Tensors[prefix+"ffn_gate_exps.weight"]
+		upTensor := model.Tensors[prefix+"ffn_up_exps.weight"]
+		downTensor := model.Tensors[prefix+"ffn_down_exps.weight"]
+
+		var err error
+		gateBase, err = streamer.ReadExpertTensor(gateTensor, expertIdx)
+		if err != nil {
+			return // silently skip on read error
+		}
+		upBase, err = streamer.ReadExpertTensor(upTensor, expertIdx)
+		if err != nil {
+			return
+		}
+		downBase, err = streamer.ReadExpertTensor(downTensor, expertIdx)
+		if err != nil {
+			return
+		}
+		defer func() {
+			streamer.ReturnBuffer(gateBase)
+			streamer.ReturnBuffer(upBase)
+			streamer.ReturnBuffer(downBase)
+		}()
+	} else {
+		// mmap path: slice into the contiguous expert tensor
+		gateBase = layer.FfnGateExps[expertIdx*gateRowBytes*NFFExp:]
+		upBase = layer.FfnUpExps[expertIdx*upRowBytes*NFFExp:]
+		downBase = layer.FfnDownExps[expertIdx*downRowBytes*NEmbd:]
+	}
 
 	gate := make([]float32, NFFExp)
 	up := make([]float32, NFFExp)
@@ -169,7 +202,6 @@ func expertForward(ds *DecodeState, layer *LayerWeights, expertIdx int, weight f
 	QuantizeRowQ8K(gate, midQ)
 
 	// Down projection: Q2_K [NEmbd, NFFExp] × Q8_K hidden
-	downBase := layer.FfnDownExps[expertIdx*downRowBytes*NEmbd:]
 	for o := 0; o < NEmbd; o++ {
 		downRow := downBase[o*downRowBytes : (o+1)*downRowBytes]
 		ds.RoutedOut[o] += weight * VecDotQ2KQ8K(NFFExp, downRow, midQ)
@@ -199,6 +231,7 @@ func layerForwardDecode(
 	cache *LayerCache,
 	model *GGUFModel,
 	budget *MemoryBudget,
+	streamer *DiskStreamer,
 	pos, il, tokenID int,
 ) {
 	// Prefetch non-expert weights for this layer
@@ -233,7 +266,7 @@ func layerForwardDecode(
 	)
 
 	// Run MoE FFN
-	layerFFNDecode(ds, layer, model, budget, il, tokenID)
+	layerFFNDecode(ds, layer, model, budget, streamer, il, tokenID)
 
 	// HC post (routed + shared → HC state)
 	hcPostSumOne(ds.CurHC, ds.RoutedOut, ds.SharedOut, ffnResidual, ds.Post, ds.Comb)

@@ -22,10 +22,11 @@ type Session struct {
 
 // Engine holds the loaded model and weights.
 type Engine struct {
-	Model   *GGUFModel
-	Weights *Weights
-	Vocab   *Vocab
-	Budget  *MemoryBudget
+	Model    *GGUFModel
+	Weights  *Weights
+	Vocab    *Vocab
+	Budget   *MemoryBudget
+	Streamer *DiskStreamer // non-nil when StreamExperts is enabled
 }
 
 // EngineOptions configures engine loading.
@@ -34,6 +35,7 @@ type EngineOptions struct {
 	MaxRSSMB     int  // 0 = unlimited
 	PinNonExpert bool // mlock non-expert weights (~6.5 GB)
 	EvictExperts bool // MADV_DONTNEED cold experts after each layer
+	StreamExperts bool // read expert weights from disk instead of mmap
 }
 
 // OpenEngine loads a GGUF model and prepares the inference engine.
@@ -70,11 +72,26 @@ func OpenEngineWithOptions(opts EngineOptions) (*Engine, error) {
 		return nil, fmt.Errorf("apply budget: %w", err)
 	}
 
-	return &Engine{Model: m, Weights: w, Vocab: v, Budget: budget}, nil
+	e := &Engine{Model: m, Weights: w, Vocab: v, Budget: budget}
+
+	// Open disk streamer if requested
+	if opts.StreamExperts {
+		streamer, err := NewDiskStreamer(opts.ModelPath, 64)
+		if err != nil {
+			m.Close()
+			return nil, fmt.Errorf("open streamer: %w", err)
+		}
+		e.Streamer = streamer
+	}
+
+	return e, nil
 }
 
-// Close releases the model memory mapping.
+// Close releases the model memory mapping and streamer.
 func (e *Engine) Close() {
+	if e.Streamer != nil {
+		e.Streamer.Close()
+	}
 	if e.Model != nil {
 		e.Model.Close()
 	}
@@ -120,6 +137,7 @@ func (s *Session) Eval(token int) {
 			&s.KV.Layer[il],
 			s.Engine.Model,
 			s.Engine.Budget,
+			s.Engine.Streamer,
 			s.Pos, il, token,
 		)
 	}
