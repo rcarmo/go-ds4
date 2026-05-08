@@ -6,65 +6,18 @@ import (
 	"github.com/rcarmo/go-ds4/ds4/simd"
 )
 
-// VecDotQ2KQ8K_SIMD computes Q2_K · Q8_K using SIMD where possible.
-// The per-group structure (16 groups × 16 elements with different scales)
-// prevents a single bulk DotI8, but we use SIMD for each 16-element sub-dot.
+// VecDotQ2KQ8K_SIMD is unused — replaced by vecDotQ2KQ8K_avx2.
 func VecDotQ2KQ8K_SIMD(n int, xQ2K []byte, yQ8K []byte) float32 {
-	nBlocks := n / QK_K
-	sum := float32(0)
-
-	for b := 0; b < nBlocks; b++ {
-		xOff := b * BlockQ2KSize
-		yOff := b * BlockQ8KSize
-
-		scales := xQ2K[xOff : xOff+16]
-		qs := xQ2K[xOff+16 : xOff+16+64]
-		d := F16ToF32(*(*uint16)(unsafe.Pointer(&xQ2K[xOff+80])))
-		dmin := F16ToF32(*(*uint16)(unsafe.Pointer(&xQ2K[xOff+82])))
-
-		yd := *(*float32)(unsafe.Pointer(&yQ8K[yOff]))
-		yqs := yQ8K[yOff+4 : yOff+4+QK_K]
-		ybsums := yQ8K[yOff+4+QK_K : yOff+4+QK_K+32]
-
-		sumMinS := int32(0)
-		isum := int32(0)
-
-		for j := 0; j < 16; j++ {
-			sc := scales[j]
-			scHi := int32(sc >> 4)
-			scLo := int32(sc & 0x0f)
-
-			bs := *(*int16)(unsafe.Pointer(&ybsums[j*2]))
-			sumMinS += scHi * int32(bs)
-
-			// Expand 16 Q2 values from packed bytes
-			var q2vals [16]int8
-			for i := 0; i < 16; i++ {
-				idx := j*16 + i
-				byteIdx := idx / 4
-				bitShift := uint(idx%4) * 2
-				q2vals[i] = int8((qs[byteIdx] >> bitShift) & 3)
-			}
-
-			// Scalar dot for 16 elements (DotI8 needs 32+ for SIMD benefit)
-			dot := int32(0)
-			for i := 0; i < 16; i++ {
-				dot += int32(q2vals[i]) * int32(int8(yqs[j*16+i]))
-			}
-			isum += scLo * dot
-		}
-
-		sum += yd*d*float32(isum) - yd*dmin*float32(sumMinS)
-	}
-	return sum
+	return vecDotQ2KQ8K_avx2(n, xQ2K, yQ8K)
 }
 
 // VecDotIQ2XXSQ8K_SIMD computes IQ2_XXS · Q8_K using SIMD int8 dot.
-// Each 32-element group has one scale (ls), so we expand all 32 grid values
-// and use DotI8 on the full 32-element chunk.
+// Unrolled grid expansion + DotI8 per 32-element group.
 func VecDotIQ2XXSQ8K_SIMD(n int, xIQ2 []byte, yQ8K []byte) float32 {
 	nBlocks := n / QK_K
 	sumf := float32(0)
+
+	var gridBuf [32]int8
 
 	for i := 0; i < nBlocks; i++ {
 		xOff := i * BlockIQ2XXSSize
@@ -79,34 +32,30 @@ func VecDotIQ2XXSQ8K_SIMD(n int, xIQ2 []byte, yQ8K []byte) float32 {
 
 		bsum := int32(0)
 
-		// 8 groups of 32 elements
 		for ib32 := 0; ib32 < QK_K/32; ib32++ {
 			aux32_1 := *(*uint32)(unsafe.Pointer(&q2[ib32*8+4]))
 			aux8 := (*[8]uint8)(unsafe.Pointer(&q2[ib32*8]))
 
 			ls := int32(2*(aux32_1>>28) + 1)
 
-			// Expand all 32 grid values into contiguous int8 array
-			var gridBuf [32]int8
-			for l := 0; l < 4; l += 2 {
-				gridIdx0 := aux8[l]
-				gridIdx1 := aux8[l+1]
-				signIdx0 := (aux32_1 >> (7 * uint(l))) & 127
-				signIdx1 := (aux32_1 >> (7 * uint(l+1))) & 127
+			// Expand 32 grid values — unrolled
+			g0 := &iq2xxsSignedGrid[int(aux8[0])*128+int(aux32_1&127)]
+			g1 := &iq2xxsSignedGrid[int(aux8[1])*128+int((aux32_1>>7)&127)]
+			g2 := &iq2xxsSignedGrid[int(aux8[2])*128+int((aux32_1>>14)&127)]
+			g3 := &iq2xxsSignedGrid[int(aux8[3])*128+int((aux32_1>>21)&127)]
 
-				grid0 := &iq2xxsSignedGrid[int(gridIdx0)*128+int(signIdx0)]
-				grid1 := &iq2xxsSignedGrid[int(gridIdx1)*128+int(signIdx1)]
+			gridBuf[0] = g0[0]; gridBuf[1] = g0[1]; gridBuf[2] = g0[2]; gridBuf[3] = g0[3]
+			gridBuf[4] = g0[4]; gridBuf[5] = g0[5]; gridBuf[6] = g0[6]; gridBuf[7] = g0[7]
+			gridBuf[8] = g1[0]; gridBuf[9] = g1[1]; gridBuf[10] = g1[2]; gridBuf[11] = g1[3]
+			gridBuf[12] = g1[4]; gridBuf[13] = g1[5]; gridBuf[14] = g1[6]; gridBuf[15] = g1[7]
+			gridBuf[16] = g2[0]; gridBuf[17] = g2[1]; gridBuf[18] = g2[2]; gridBuf[19] = g2[3]
+			gridBuf[20] = g2[4]; gridBuf[21] = g2[5]; gridBuf[22] = g2[6]; gridBuf[23] = g2[7]
+			gridBuf[24] = g3[0]; gridBuf[25] = g3[1]; gridBuf[26] = g3[2]; gridBuf[27] = g3[3]
+			gridBuf[28] = g3[4]; gridBuf[29] = g3[5]; gridBuf[30] = g3[6]; gridBuf[31] = g3[7]
 
-				for k := 0; k < 8; k++ {
-					gridBuf[l*8+k] = grid0[k]
-					gridBuf[l*8+8+k] = grid1[k]
-				}			}
-
-			// SIMD DotI8 on 32 elements — fits exactly one AVX2 register
-			q8Off := ib32 * 32
 			dot := simd.DotI8(
 				unsafe.Pointer(&gridBuf[0]),
-				unsafe.Pointer(&q8[q8Off]),
+				unsafe.Pointer(&q8[ib32*32]),
 				32,
 			)
 			bsum += ls * dot
