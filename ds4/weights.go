@@ -32,12 +32,12 @@ type LayerWeights struct {
 	CompressorNorm []byte
 
 	// Indexer (ratio-4 layers only, nil for others)
-	IndexerQB           []byte
-	IndexerProj         []byte
-	IndexerCompAPE      []byte
-	IndexerCompKV       []byte
-	IndexerCompGate     []byte
-	IndexerCompNorm     []byte
+	IndexerQB       []byte
+	IndexerProj     []byte
+	IndexerCompAPE  []byte
+	IndexerCompKV   []byte
+	IndexerCompGate []byte
+	IndexerCompNorm []byte
 
 	// Hyper-connection (FFN sublayer)
 	HCFfnFn    []byte // F16 [NHC*NEmbd, 2*NHC+NHC²]
@@ -63,7 +63,7 @@ type LayerWeights struct {
 
 // Weights holds all model weights with tensor data pointing into the mmap.
 type Weights struct {
-	TokenEmbd   []byte // F16  [NEmbd, NVocab]
+	TokenEmbd     []byte // F16  [NEmbd, NVocab]
 	OutputHCBase  []byte // F32  [NHC]
 	OutputHCFn    []byte // F16  [NHC*NEmbd, NHC]
 	OutputHCScale []byte // F32  [1]
@@ -109,7 +109,7 @@ func BindWeights(m *GGUFModel) (*Weights, error) {
 	bindOpt(&w.Output, "output.weight")
 
 	// Per-layer tensors
-	for il := 0; il < NLayer; il++ {
+	for il := 0; il < NLayer; il++ { // TODO: use config.NLayer
 		l := &w.Layer[il]
 		p := fmt.Sprintf("blk.%d.", il)
 

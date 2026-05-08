@@ -57,7 +57,7 @@ func DS4FlashConfig() *ModelConfig {
 		NFFExp: NFFExp, NHashLayer: NHashLayer,
 		NSWA: NSWA, NIndexerHead: NIndexerHead, NIndexerHeadDim: NIndexerHeadDim,
 		NIndexerTopK: NIndexerTopK,
-		NHC: NHC, NHCSinkhornIter: NHCSinkhornIter,
+		NHC:          NHC, NHCSinkhornIter: NHCSinkhornIter,
 		RMSEps: RMSEps, HCEps: HCEps, ExpertWeightScale: ExpertWeightScale,
 		SwiGLUClampExp: SwiGLUClampExp, RoPEFreqBase: RoPEFreqBase,
 		RoPEScaleFactor: RoPEScaleFactor, RoPEYarnBetaFast: RoPEYarnBetaFast,
@@ -124,4 +124,15 @@ func (c *ModelConfig) String() string {
 	}
 	return fmt.Sprintf("%d layers, %d dim, %d heads, %d experts (top-%d), HC=%s",
 		c.NLayer, c.NEmbd, c.NHead, c.NExpert, c.NExpertUsed, hc)
+}
+
+// Cfg returns the model config from a DecodeState's engine reference.
+// Falls back to DS4 Flash defaults if engine is nil.
+func (ds *DecodeState) Cfg() *ModelConfig {
+	if ds.Engine != nil {
+		if eng, ok := ds.Engine.(*Engine); ok && eng.Config != nil {
+			return eng.Config
+		}
+	}
+	return DS4FlashConfig()
 }

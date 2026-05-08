@@ -34,8 +34,12 @@ type KVCache struct {
 
 // NewKVCache allocates a KV cache for the given context size.
 func NewKVCache(ctxSize int) *KVCache {
+	return NewKVCacheN(ctxSize, NLayer)
+}
+
+func NewKVCacheN(ctxSize, nLayers int) *KVCache {
 	kv := &KVCache{}
-	for il := 0; il < NLayer; il++ {
+	for il := 0; il < nLayers; il++ {
 		lc := &kv.Layer[il]
 		lc.CapRaw = NSWA
 		lc.RawKV = make([]float32, lc.CapRaw*NHeadDim)

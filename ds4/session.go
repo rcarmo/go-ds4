@@ -133,7 +133,7 @@ func (e *Engine) NewSession(ctxSize int) *Session {
 	ds.Engine = e
 	return &Session{
 		Engine:  e,
-		KV:      NewKVCache(ctxSize),
+		KV:      NewKVCacheN(ctxSize, e.Config.NLayer),
 		Decode:  ds,
 		Tokens:  make([]int, 0, ctxSize),
 		CtxSize: ctxSize,
@@ -164,12 +164,13 @@ func (s *Session) Eval(token int) {
 		s.Decode.CurHC[i] = 0
 	}
 
-	// Run all 43 layers
-	nExperts := NExpertUsed
-	if s.Engine.FastExperts {
-		nExperts = NExpertUsedFast
+	// Run all layers
+	cfg := s.Engine.Config
+	nExperts := cfg.NExpertUsed
+	if s.Engine.FastExperts && nExperts > 2 {
+		nExperts = nExperts - 2
 	}
-	for il := 0; il < NLayer; il++ {
+	for il := 0; il < cfg.NLayer; il++ {
 		layerForwardDecode(
 			s.Decode,
 			&s.Engine.Weights.Layer[il],
