@@ -36,7 +36,9 @@ const DS4GemvIQ2OptPTX = `.version 7.0
     .reg .pred %p<4>;
     .reg .s32 %si;
 
-    .shared .f32 sdata[256];
+    // Shared memory: activation vector (max 4096 floats = 16KB) + reduction (1KB)
+    .shared .f32 s_act[4096];
+    .shared .f32 s_red[256];
 
     mov.u32 %r0, %ctaid.x;
     mov.u32 %r1, %tid.x;
@@ -51,6 +53,26 @@ const DS4GemvIQ2OptPTX = `.version 7.0
     ld.param.u64 %rd1, [param_wt];
     ld.param.u64 %rd2, [param_grid];
 
+    // Phase 1: cooperatively load activation into shared memory
+    // nBlocks * 256 = total activation elements (e.g. 16*256 = 4096)
+    // Each thread loads ceil(total/256) elements
+    shl.b32 %r28, %r3, 8;    // total = nBlocks * 256
+    mov.u32 %r29, %r1;       // i = tid
+    mov.u64 %rd20, s_act;
+load_act:
+    setp.ge.u32 %p1, %r29, %r28;
+    @%p1 bra load_act_done;
+    mul.wide.u32 %rd21, %r29, 4;
+    add.u64 %rd22, %rd0, %rd21;
+    ld.global.f32 %f14, [%rd22];
+    add.u64 %rd23, %rd20, %rd21;
+    st.shared.f32 [%rd23], %f14;
+    add.u32 %r29, %r29, 256;
+    bra load_act;
+load_act_done:
+    bar.sync 0;
+
+    // Phase 2: compute dot products reading from shared memory
     mul.wide.u32 %rd3, %r0, %r4;
     add.u64 %rd4, %rd1, %rd3;
 
@@ -69,8 +91,10 @@ block_loop:
 
     add.u64 %rd7, %rd6, 2;
     shl.b32 %r7, %r5, 8;
+
+    // Shared mem activation base for this block
     mul.wide.u32 %rd8, %r7, 4;
-    add.u64 %rd9, %rd0, %rd8;
+    add.u64 %rd9, %rd20, %rd8;
 
     mov.f32 %f2, 0f00000000;
     mov.u32 %r8, 0;
@@ -94,7 +118,6 @@ sg_loop:
     mul.wide.u32 %rd14, %r16, 4;
     add.u64 %rd15, %rd9, %rd14;
 
-    // Process 4 sub-groups of 8, load grid as 2x u32 for speed
     mov.u32 %r20, 0;
 sub_loop:
     setp.ge.u32 %p3, %r20, 4;
@@ -118,58 +141,67 @@ sub_loop:
     cvt.u64.u32 %rd16, %r23;
     add.u64 %rd17, %rd15, %rd16;
 
-    // Load grid 8 bytes as 2x u32, extract signed bytes, dot with activation
+    // Load grid as 2x u32, extract signed bytes, dot with SHARED MEM activation
     ld.global.v2.u32 {%r24, %r25}, [%rd13];
 
-    // Byte 0-3 from %r24
     and.b32 %r26, %r24, 0xFF;
     setp.gt.u32 %p3, %r26, 127;
     @%p3 add.s32 %r26, %r26, -256;
     cvt.rn.f32.s32 %f4, %r26;
-    ld.global.f32 %f5, [%rd17];
+    ld.shared.f32 %f5, [%rd17];
     fma.rn.f32 %f2, %f4, %f5, %f2;
 
-    shr.u32 %r26, %r24, 8; and.b32 %r26, %r26, 0xFF;
-    setp.gt.u32 %p3, %r26, 127; @%p3 add.s32 %r26, %r26, -256;
+    shr.u32 %r26, %r24, 8;
+    and.b32 %r26, %r26, 0xFF;
+    setp.gt.u32 %p3, %r26, 127;
+    @%p3 add.s32 %r26, %r26, -256;
     cvt.rn.f32.s32 %f4, %r26;
-    ld.global.f32 %f5, [%rd17+4];
+    ld.shared.f32 %f5, [%rd17+4];
     fma.rn.f32 %f2, %f4, %f5, %f2;
 
-    shr.u32 %r26, %r24, 16; and.b32 %r26, %r26, 0xFF;
-    setp.gt.u32 %p3, %r26, 127; @%p3 add.s32 %r26, %r26, -256;
+    shr.u32 %r26, %r24, 16;
+    and.b32 %r26, %r26, 0xFF;
+    setp.gt.u32 %p3, %r26, 127;
+    @%p3 add.s32 %r26, %r26, -256;
     cvt.rn.f32.s32 %f4, %r26;
-    ld.global.f32 %f5, [%rd17+8];
+    ld.shared.f32 %f5, [%rd17+8];
     fma.rn.f32 %f2, %f4, %f5, %f2;
 
     shr.u32 %r26, %r24, 24;
-    setp.gt.u32 %p3, %r26, 127; @%p3 add.s32 %r26, %r26, -256;
+    setp.gt.u32 %p3, %r26, 127;
+    @%p3 add.s32 %r26, %r26, -256;
     cvt.rn.f32.s32 %f4, %r26;
-    ld.global.f32 %f5, [%rd17+12];
+    ld.shared.f32 %f5, [%rd17+12];
     fma.rn.f32 %f2, %f4, %f5, %f2;
 
-    // Byte 4-7 from %r25
     and.b32 %r26, %r25, 0xFF;
-    setp.gt.u32 %p3, %r26, 127; @%p3 add.s32 %r26, %r26, -256;
+    setp.gt.u32 %p3, %r26, 127;
+    @%p3 add.s32 %r26, %r26, -256;
     cvt.rn.f32.s32 %f4, %r26;
-    ld.global.f32 %f5, [%rd17+16];
+    ld.shared.f32 %f5, [%rd17+16];
     fma.rn.f32 %f2, %f4, %f5, %f2;
 
-    shr.u32 %r26, %r25, 8; and.b32 %r26, %r26, 0xFF;
-    setp.gt.u32 %p3, %r26, 127; @%p3 add.s32 %r26, %r26, -256;
+    shr.u32 %r26, %r25, 8;
+    and.b32 %r26, %r26, 0xFF;
+    setp.gt.u32 %p3, %r26, 127;
+    @%p3 add.s32 %r26, %r26, -256;
     cvt.rn.f32.s32 %f4, %r26;
-    ld.global.f32 %f5, [%rd17+20];
+    ld.shared.f32 %f5, [%rd17+20];
     fma.rn.f32 %f2, %f4, %f5, %f2;
 
-    shr.u32 %r26, %r25, 16; and.b32 %r26, %r26, 0xFF;
-    setp.gt.u32 %p3, %r26, 127; @%p3 add.s32 %r26, %r26, -256;
+    shr.u32 %r26, %r25, 16;
+    and.b32 %r26, %r26, 0xFF;
+    setp.gt.u32 %p3, %r26, 127;
+    @%p3 add.s32 %r26, %r26, -256;
     cvt.rn.f32.s32 %f4, %r26;
-    ld.global.f32 %f5, [%rd17+24];
+    ld.shared.f32 %f5, [%rd17+24];
     fma.rn.f32 %f2, %f4, %f5, %f2;
 
     shr.u32 %r26, %r25, 24;
-    setp.gt.u32 %p3, %r26, 127; @%p3 add.s32 %r26, %r26, -256;
+    setp.gt.u32 %p3, %r26, 127;
+    @%p3 add.s32 %r26, %r26, -256;
     cvt.rn.f32.s32 %f4, %r26;
-    ld.global.f32 %f5, [%rd17+28];
+    ld.shared.f32 %f5, [%rd17+28];
     fma.rn.f32 %f2, %f4, %f5, %f2;
 
     add.u32 %r20, %r20, 1;
@@ -188,7 +220,6 @@ sg_done:
     bra block_loop;
 
 warp_reduce:
-    // Warp shuffle reduction (no shared memory needed for intra-warp)
     .reg .f32 %fs;
     shfl.sync.down.b32 %fs, %f0, 16, 31, 0xFFFFFFFF;
     add.f32 %f0, %f0, %fs;
@@ -201,20 +232,16 @@ warp_reduce:
     shfl.sync.down.b32 %fs, %f0, 1, 31, 0xFFFFFFFF;
     add.f32 %f0, %f0, %fs;
 
-    // Lane 0 of each warp writes to shared memory
     and.b32 %r27, %r1, 31;
     setp.ne.u32 %p2, %r27, 0;
     @%p2 bra done;
-
     shr.u32 %r28, %r1, 5;
     mul.lo.u32 %r29, %r28, 4;
-    mov.u64 %rd20, sdata;
-    cvt.u64.u32 %rd21, %r29;
-    add.u64 %rd22, %rd20, %rd21;
-    st.shared.f32 [%rd22], %f0;
+    mov.u64 %rd24, s_red;
+    cvt.u64.u32 %rd25, %r29;
+    add.u64 %rd26, %rd24, %rd25;
+    st.shared.f32 [%rd26], %f0;
     bar.sync 0;
-
-    // Thread 0 sums warp results (8 warps for 256 threads)
     setp.ne.u32 %p2, %r1, 0;
     @%p2 bra done;
     mov.f32 %f0, 0f00000000;
@@ -223,19 +250,17 @@ warp_sum:
     setp.ge.u32 %p3, %r28, 8;
     @%p3 bra store;
     mul.lo.u32 %r29, %r28, 4;
-    cvt.u64.u32 %rd21, %r29;
-    add.u64 %rd22, %rd20, %rd21;
-    ld.shared.f32 %f8, [%rd22];
+    cvt.u64.u32 %rd25, %r29;
+    add.u64 %rd26, %rd24, %rd25;
+    ld.shared.f32 %f8, [%rd26];
     add.f32 %f0, %f0, %f8;
     add.u32 %r28, %r28, 1;
     bra warp_sum;
-
 store:
-    ld.param.u64 %rd25, [param_out];
-    mul.wide.u32 %rd26, %r0, 4;
-    add.u64 %rd27, %rd25, %rd26;
-    st.global.f32 [%rd27], %f0;
-
+    ld.param.u64 %rd27, [param_out];
+    mul.wide.u32 %rd28, %r0, 4;
+    add.u64 %rd29, %rd27, %rd28;
+    st.global.f32 [%rd29], %f0;
 done:
     ret;
 }
