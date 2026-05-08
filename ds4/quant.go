@@ -3,6 +3,8 @@ package ds4
 import (
 	"math"
 	"unsafe"
+
+	"github.com/rcarmo/go-ds4/ds4/simd"
 )
 
 // F16 conversion — matches ds4.c f16_to_f32 / f32_to_f16.
@@ -52,67 +54,16 @@ func F32ToF16(f float32) uint16 {
 
 // DotQ8_0F32 computes dot(Q8_0 weight row, float32 activation) for n elements.
 // Q8_0 block: float32 scale (4 bytes) + int8[32] quantized values = 36 bytes.
+// Uses SIMD (AVX2 on amd64, NEON on arm64) when available.
 func DotQ8_0F32(wq8 []byte, x []float32, n int) float32 {
-	const blockSize = 32
-	nBlocks := n / blockSize
-	sum := float32(0)
-	for b := 0; b < nBlocks; b++ {
-		off := b * BlockQ8_0Size
-		scale := *(*float32)(unsafe.Pointer(&wq8[off]))
-		qs := wq8[off+4 : off+4+blockSize]
-		xOff := b * blockSize
-		var fsum float32
-		for i := 0; i < blockSize; i++ {
-			fsum += float32(int8(qs[i])) * x[xOff+i]
-		}
-		sum += scale * fsum
-	}
-	return sum
+	nBlocks := n / 32
+	return simd.DotQ8_0F32(unsafe.Pointer(&wq8[0]), unsafe.Pointer(&x[0]), nBlocks)
 }
 
 // QuantizeRowQ8K quantizes a float32 row to Q8_K blocks.
-// Each Q8_K block: float32 d + int8[256] qs + int16[16] bsums = 292 bytes.
+// Uses SIMD quantization when available.
 func QuantizeRowQ8K(x []float32, out []byte) {
-	nBlocks := len(x) / QK_K
-	for b := 0; b < nBlocks; b++ {
-		bOff := b * BlockQ8KSize
-		xOff := b * QK_K
-
-		// Find absmax for this block
-		amax := float32(0)
-		for i := 0; i < QK_K; i++ {
-			v := x[xOff+i]
-			if v < 0 {
-				v = -v
-			}
-			if v > amax {
-				amax = v
-			}
-		}
-
-		// Scale
-		d := amax / 127.0
-		*(*float32)(unsafe.Pointer(&out[bOff])) = d
-
-		var id float32
-		if d != 0 {
-			id = 1.0 / d
-		}
-
-		// Quantize and compute bsums
-		qs := out[bOff+4 : bOff+4+QK_K]
-		bsums := out[bOff+4+QK_K : bOff+4+QK_K+32]
-		for j := 0; j < 16; j++ {
-			sum := int16(0)
-			for i := 0; i < 16; i++ {
-				idx := j*16 + i
-				q := int8(math.Round(float64(x[xOff+idx] * id)))
-				qs[idx] = byte(q)
-				sum += int16(q)
-			}
-			*(*int16)(unsafe.Pointer(&bsums[j*2])) = sum
-		}
-	}
+	simd.QuantizeQ8K(unsafe.Pointer(&x[0]), unsafe.Pointer(&out[0]), len(x))
 }
 
 // VecDotQ2KQ8K computes the dot product of Q2_K weights with Q8_K quantized activations.

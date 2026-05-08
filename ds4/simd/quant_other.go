@@ -1,0 +1,98 @@
+//go:build !amd64 && !arm64
+
+package simd
+
+import (
+	"math"
+	"unsafe"
+)
+
+// DotQ8_0F32 scalar fallback.
+func DotQ8_0F32(wq8 unsafe.Pointer, x unsafe.Pointer, nBlocks int) float32 {
+	wp := (*[1 << 30]byte)(wq8)
+	xp := (*[1 << 30]float32)(x)
+	sum := float32(0)
+	for b := 0; b < nBlocks; b++ {
+		off := b * 36
+		scale := *(*float32)(unsafe.Pointer(&wp[off]))
+		xOff := b * 32
+		var fsum float32
+		for i := 0; i < 32; i++ {
+			fsum += float32(int8(wp[off+4+i])) * xp[xOff+i]
+		}
+		sum += scale * fsum
+	}
+	return sum
+}
+
+// DotF16F32 scalar fallback.
+func DotF16F32(wf16 unsafe.Pointer, x unsafe.Pointer, n int) float32 {
+	wp := (*[1 << 30]uint16)(wf16)
+	xp := (*[1 << 30]float32)(x)
+	sum := float32(0)
+	for i := 0; i < n; i++ {
+		sum += f16tof32(wp[i]) * xp[i]
+	}
+	return sum
+}
+
+func f16tof32(h uint16) float32 {
+	sign := uint32(h>>15) << 31
+	exp := uint32(h>>10) & 0x1f
+	mant := uint32(h) & 0x3ff
+	if exp == 0 {
+		return math.Float32frombits(sign)
+	}
+	if exp == 31 {
+		return math.Float32frombits(sign | 0x7f800000)
+	}
+	return math.Float32frombits(sign | ((exp+127-15)<<23) | (mant << 13))
+}
+
+// QuantizeQ8K scalar fallback.
+func QuantizeQ8K(x unsafe.Pointer, out unsafe.Pointer, n int) {
+	quantizeQ8KScalar(x, out, n)
+}
+
+// DotI8 scalar fallback.
+func DotI8(a, b unsafe.Pointer, n int) int32 {
+	ap := (*[1 << 30]int8)(a)
+	bp := (*[1 << 30]int8)(b)
+	sum := int32(0)
+	for i := 0; i < n; i++ {
+		sum += int32(ap[i]) * int32(bp[i])
+	}
+	return sum
+}
+
+func quantizeQ8KScalar(x unsafe.Pointer, out unsafe.Pointer, n int) {
+	xp := (*[1 << 30]float32)(x)
+	op := (*[1 << 30]byte)(out)
+	nBlocks := n / 256
+	for b := 0; b < nBlocks; b++ {
+		bOff := b * 292
+		xOff := b * 256
+		amax := float32(0)
+		for i := 0; i < 256; i++ {
+			v := xp[xOff+i]
+			if v < 0 { v = -v }
+			if v > amax { amax = v }
+		}
+		d := amax / 127.0
+		*(*float32)(unsafe.Pointer(&op[bOff])) = d
+		var id float32
+		if d != 0 { id = 1.0 / d }
+		for i := 0; i < 256; i++ {
+			q := int8(math.Round(float64(xp[xOff+i] * id)))
+			op[bOff+4+i] = byte(q)
+		}
+		// bsums
+		for j := 0; j < 16; j++ {
+			sum := int16(0)
+			for i := 0; i < 16; i++ {
+				sum += int16(int8(op[bOff+4+j*16+i]))
+			}
+			*(*int16)(unsafe.Pointer(&op[bOff+260+j*2])) = sum
+		}
+	}
+}

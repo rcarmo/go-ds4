@@ -2,6 +2,8 @@ package ds4
 
 import (
 	"unsafe"
+
+	"github.com/rcarmo/go-ds4/ds4/simd"
 )
 
 // VecDotIQ2XXSQ8K computes the dot product of IQ2_XXS weights with Q8_K activations.
@@ -89,10 +91,7 @@ func VecDotIQ2XXSPairQ8K(n int, x0IQ2, x1IQ2 []byte, yQ8K []byte) (float32, floa
 }
 
 // DotF16 computes dot product of F16 weight row with float32 activation.
+// Uses SIMD (VCVTPH2PS on amd64, FCVTL on arm64) when available.
 func DotF16(wF16 []uint16, x []float32) float32 {
-	sum := float32(0)
-	for i := range wF16 {
-		sum += F16ToF32(wF16[i]) * x[i]
-	}
-	return sum
+	return simd.DotF16F32(unsafe.Pointer(&wF16[0]), unsafe.Pointer(&x[0]), len(wF16))
 }

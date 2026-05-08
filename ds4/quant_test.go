@@ -4,6 +4,8 @@ import (
 	"math"
 	"testing"
 	"unsafe"
+
+	"github.com/rcarmo/go-ds4/ds4/simd"
 )
 
 func TestF16Roundtrip(t *testing.T) {
@@ -129,4 +131,66 @@ func TestVecDotQ2KQ8K(t *testing.T) {
 
 func unsafePtr(b *byte) unsafe.Pointer {
 	return unsafe.Pointer(b)
+}
+
+func TestDotI8(t *testing.T) {
+	n := 256
+	a := make([]int8, n)
+	b := make([]int8, n)
+	for i := range a {
+		a[i] = int8(i%17 - 8)
+		b[i] = int8(i%13 - 6)
+	}
+	// Reference
+	ref := int32(0)
+	for i := range a {
+		ref += int32(a[i]) * int32(b[i])
+	}
+	// SIMD
+	result := simd.DotI8(unsafe.Pointer(&a[0]), unsafe.Pointer(&b[0]), n)
+	if result != ref {
+		t.Errorf("DotI8: got %d, want %d", result, ref)
+	}
+	t.Logf("DotI8(%d): result=%d ref=%d", n, result, ref)
+}
+
+func BenchmarkDotQ8_0F32_4096(b *testing.B) {
+	n := 4096
+	nBlocks := n / 32
+	wq8 := make([]byte, nBlocks*BlockQ8_0Size)
+	x := make([]float32, n)
+	for i := range x { x[i] = float32(i%17-8) * 0.01 }
+	for i := 0; i < nBlocks; i++ {
+		*(*float32)(unsafe.Pointer(&wq8[i*BlockQ8_0Size])) = 0.01
+		for j := 0; j < 32; j++ {
+			wq8[i*BlockQ8_0Size+4+j] = byte(int8(j - 16))
+		}
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		DotQ8_0F32(wq8, x, n)
+	}
+}
+
+func BenchmarkDotF16F32_4096(b *testing.B) {
+	n := 4096
+	wf16 := make([]uint16, n)
+	x := make([]float32, n)
+	for i := range x { x[i] = float32(i%17-8) * 0.01 }
+	for i := range wf16 { wf16[i] = F32ToF16(x[i]) }
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		DotF16(wf16, x)
+	}
+}
+
+func BenchmarkDotI8_256(b *testing.B) {
+	a := make([]int8, 256)
+	bb := make([]int8, 256)
+	for i := range a { a[i] = int8(i%17-8) }
+	for i := range bb { bb[i] = int8(i%13-6) }
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		simd.DotI8(unsafe.Pointer(&a[0]), unsafe.Pointer(&bb[0]), 256)
+	}
 }
