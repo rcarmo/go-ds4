@@ -61,9 +61,9 @@ func DotQ8_0F32(wq8 []byte, x []float32, n int) float32 {
 }
 
 // QuantizeRowQ8K quantizes a float32 row to Q8_K blocks.
-// Uses SIMD quantization when available.
+// Uses fast rounding without math.Round.
 func QuantizeRowQ8K(x []float32, out []byte) {
-	simd.QuantizeQ8K(unsafe.Pointer(&x[0]), unsafe.Pointer(&out[0]), len(x))
+	simd.QuantizeQ8K_fast(x, out)
 }
 
 // VecDotQ2KQ8K computes Q2_K · Q8_K dot product.
@@ -73,7 +73,8 @@ func VecDotQ2KQ8K(n int, xQ2K []byte, yQ8K []byte) float32 {
 	return vecDotQ2KQ8K_scalar(n, xQ2K, yQ8K)
 }
 
-// vecDotQ2KQ8K_scalar is the reference scalar implementation.
+// vecDotQ2KQ8K_scalar is the optimized scalar implementation.
+// Processes 4 Q2 values per byte directly without per-bit extraction.
 func vecDotQ2KQ8K_scalar(n int, xQ2K []byte, yQ8K []byte) float32 {
 	nBlocks := n / QK_K
 	sum := float32(0)
@@ -82,43 +83,42 @@ func vecDotQ2KQ8K_scalar(n int, xQ2K []byte, yQ8K []byte) float32 {
 		xOff := b * BlockQ2KSize
 		yOff := b * BlockQ8KSize
 
-		// Q2_K block: scales[16] + qs[64] + d(f16) + dmin(f16)
 		scales := xQ2K[xOff : xOff+16]
 		qs := xQ2K[xOff+16 : xOff+16+64]
 		d := F16ToF32(*(*uint16)(unsafe.Pointer(&xQ2K[xOff+80])))
 		dmin := F16ToF32(*(*uint16)(unsafe.Pointer(&xQ2K[xOff+82])))
 
-		// Q8_K block: d(f32) + qs[256] + bsums[16]
 		yd := *(*float32)(unsafe.Pointer(&yQ8K[yOff]))
 		yqs := yQ8K[yOff+4 : yOff+4+QK_K]
 		ybsums := yQ8K[yOff+4+QK_K : yOff+4+QK_K+32]
 
-		// Accumulate using the Q2_K structure:
-		// 256 elements in 16 groups of 16, each with a 4-bit scale
 		sumMinS := int32(0)
 		isum := int32(0)
 
 		for j := 0; j < 16; j++ {
 			sc := scales[j]
-			scHi := int32(sc >> 4)    // upper nibble = min scale
-			scLo := int32(sc & 0x0f)  // lower nibble = weight scale
+			scHi := int32(sc >> 4)
+			scLo := int32(sc & 0x0f)
 
-			// bsums for min correction
-			bs := int16(*(*int16)(unsafe.Pointer(&ybsums[j*2])))
+			bs := *(*int16)(unsafe.Pointer(&ybsums[j*2]))
 			sumMinS += scHi * int32(bs)
 
-			// Dot product of 16 Q2 values with Q8 values
-			var dsum int32
-			for i := 0; i < 16; i++ {
-				idx := j*16 + i
-				// Extract 2-bit value from packed qs
-				byteIdx := idx / 4
-				bitShift := uint(idx%4) * 2
-				q2val := int32((qs[byteIdx] >> bitShift) & 3)
-				q8val := int32(int8(yqs[idx]))
-				dsum += q2val * q8val
+			// Process 16 Q2 values: 4 values per byte, 4 bytes
+			dot := int32(0)
+			qOff := j * 4 // 16 elements = 4 bytes of packed Q2
+			yOff := j * 16
+			for k := 0; k < 4; k++ {
+				qByte := qs[qOff+k]
+				y0 := int32(int8(yqs[yOff+k*4]))
+				y1 := int32(int8(yqs[yOff+k*4+1]))
+				y2 := int32(int8(yqs[yOff+k*4+2]))
+				y3 := int32(int8(yqs[yOff+k*4+3]))
+				dot += int32(qByte&3)*y0 +
+					int32((qByte>>2)&3)*y1 +
+					int32((qByte>>4)&3)*y2 +
+					int32((qByte>>6)&3)*y3
 			}
-			isum += scLo * dsum
+			isum += scLo * dot
 		}
 
 		sum += yd*d*float32(isum) - yd*dmin*float32(sumMinS)
