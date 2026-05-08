@@ -17,7 +17,11 @@ type CUDAEngine struct {
 	expertCache *gpu.ExpertCache
 	batchBufs   *gpu.BatchedExpertBufs
 	stream      gpu.CUstream
-	fusedLayers [NLayer]*gpu.FusedLayerBufs // fused Q8_0 projections per layer
+	fusedLayers [NLayer]*gpu.FusedLayerBufs
+	attnQBuf    *gpu.Buffer // [NHead*NHeadDim] Q vectors
+	attnKVBuf   *gpu.Buffer // [NSWA*NHeadDim] KV cache
+	attnSinkBuf *gpu.Buffer // [NHead] sinks
+	attnOutBuf  *gpu.Buffer // [NHead*NHeadDim] attention output // fused Q8_0 projections per layer
 }
 
 // InitGPU initializes GPU acceleration (CUDA or Vulkan).
@@ -37,6 +41,7 @@ func (e *Engine) InitGPU() error {
 			gpu.InitCUDASwiGLU()
 			gpu.InitCUDAGemvIQ2Opt()
 			gpu.InitCUDAGemvQ2KOpt()
+			gpu.InitCUDAAttn()
 			// Init IQ2 kernel with grid table
 			gridSlice := (*[256 * 128 * 8]int8)(unsafe.Pointer(&iq2xxsSignedGrid[0]))
 			gpu.InitCUDAGemvIQ2(gridSlice[:])
@@ -91,6 +96,7 @@ func (e *Engine) InitGPU() error {
 			}
 			if fusedCount > 0 {
 				fmt.Printf("[gpu] Fused Q8_0 projections: %d layers (attn_q_a+kv \u2192 one dispatch)\n", fusedCount)
+				e.initAttnGPUBufs(ce)
 			}
 
 			return nil
@@ -367,5 +373,65 @@ func (e *Engine) gpuFusedAttnQAKV(qr, kv, x []float32, il int) bool {
 	fused.DispatchAsync(x, ce.stream)
 	results := [][]float32{qr, kv}
 	fused.Collect(results, ce.stream)
+	return true
+}
+
+func (e *Engine) initAttnGPUBufs(ce *CUDAEngine) {
+	var err error
+	ce.attnQBuf, err = gpu.Malloc(NHead * NHeadDim)
+	if err != nil {
+		return
+	}
+	ce.attnKVBuf, err = gpu.Malloc(NSWA * NHeadDim)
+	if err != nil {
+		return
+	}
+	ce.attnSinkBuf, err = gpu.Malloc(NHead)
+	if err != nil {
+		return
+	}
+	ce.attnOutBuf, err = gpu.Malloc(NHead * NHeadDim)
+	if err != nil {
+		return
+	}
+	fmt.Println("[gpu] Attention GPU buffers allocated")
+}
+
+// gpuAttnScoring runs all 64 heads' attention scoring on GPU.
+func (e *Engine) gpuAttnScoring(ds *DecodeState, cache *LayerCache, layer *LayerWeights, il int) bool {
+	ce, ok := e.GPU.(*CUDAEngine)
+	if !ok || !ce.ready || ce.attnQBuf == nil || !gpu.CudaAttnReady() {
+		return false
+	}
+	nRaw := cache.NRaw
+	if nRaw > cache.CapRaw {
+		nRaw = cache.CapRaw
+	}
+	if nRaw == 0 {
+		return false
+	}
+
+	// Upload Q, KV cache (chronological order), and sinks
+	ce.attnQBuf.UploadAsync(ds.Q, ce.stream)
+
+	// Build chronological KV view for GPU
+	kvView := make([]float32, nRaw*NHeadDim)
+	for t := 0; t < nRaw; t++ {
+		row := cache.RawRow(t)
+		copy(kvView[t*NHeadDim:(t+1)*NHeadDim], row)
+	}
+	ce.attnKVBuf.UploadAsync(kvView, ce.stream)
+
+	sinks := tensorF32Unsafe(layer.AttnSinks)
+	ce.attnSinkBuf.UploadAsync(sinks[:NHead], ce.stream)
+
+	scale := float32(1.0 / 22.627417) // 1/sqrt(512)
+
+	if err := gpu.CUDABatchedAttn(ce.attnQBuf, ce.attnKVBuf, ce.attnSinkBuf, ce.attnOutBuf,
+		nRaw, NHeadDim, scale, ce.stream); err != nil {
+		return false
+	}
+	gpu.StreamSync(ce.stream)
+	ce.attnOutBuf.Download(ds.Heads)
 	return true
 }

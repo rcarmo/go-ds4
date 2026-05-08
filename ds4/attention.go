@@ -221,83 +221,94 @@ func layerAttnDecode(
 		nComp = cache.CompCap
 	}
 	nTotal := nRaw + nComp
-	rawStart := cache.rawStart()
-	compStart := cache.compStart()
 
-	sinks := tensorF32Unsafe(layer.AttnSinks)
-	scale := float32(1.0 / math.Sqrt(float64(NHeadDim)))
-
-	for h := 0; h < NHead; h++ {
-		qHead := ds.Q[h*NHeadDim : (h+1)*NHeadDim]
-		maxScore := sinks[h]
-
-		for t := 0; t < nRaw; t++ {
-			idx := rawStart + t
-			if idx >= cache.CapRaw {
-				idx -= cache.CapRaw
-			}
-			kvRow := cache.RawKV[idx*NHeadDim : (idx+1)*NHeadDim]
-			s := simd.Sdot(qHead, kvRow) * scale
-			ds.AttnScore[t] = s
-			if s > maxScore {
-				maxScore = s
-			}
+	// Try GPU batched attention (raw-only for now, no compressed)
+	gpuAttnOK := false
+	if nComp == 0 && ds.Engine != nil {
+		if eng, ok := ds.Engine.(*Engine); ok {
+			gpuAttnOK = eng.gpuAttnScoring(ds, cache, layer, il)
 		}
-		for t := 0; t < nComp; t++ {
-			if compAllowed != nil && !compAllowed[t] {
-				ds.AttnScore[nRaw+t] = -1e30
-				continue
-			}
-			idx := compStart + t
-			if idx >= cache.CompCap {
-				idx -= cache.CompCap
-			}
-			kvRow := cache.CompKV[idx*NHeadDim : (idx+1)*NHeadDim]
-			s := simd.Sdot(qHead, kvRow) * scale
-			ds.AttnScore[nRaw+t] = s
-			if s > maxScore {
-				maxScore = s
-			}
-		}
-
-		headOut := ds.Heads[h*NHeadDim : (h+1)*NHeadDim]
-		for d := range headOut {
-			headOut[d] = 0
-		}
-		denom := float32(math.Exp(float64(sinks[h] - maxScore)))
-
-		for t := 0; t < nRaw; t++ {
-			w := float32(math.Exp(float64(ds.AttnScore[t] - maxScore)))
-			denom += w
-			idx := rawStart + t
-			if idx >= cache.CapRaw {
-				idx -= cache.CapRaw
-			}
-			kvRow := cache.RawKV[idx*NHeadDim : (idx+1)*NHeadDim]
-			simd.Saxpy(w, kvRow, headOut)
-		}
-		for t := 0; t < nComp; t++ {
-			if ds.AttnScore[nRaw+t] <= -1e29 {
-				continue
-			}
-			w := float32(math.Exp(float64(ds.AttnScore[nRaw+t] - maxScore)))
-			denom += w
-			idx := compStart + t
-			if idx >= cache.CompCap {
-				idx -= cache.CompCap
-			}
-			kvRow := cache.CompKV[idx*NHeadDim : (idx+1)*NHeadDim]
-			simd.Saxpy(w, kvRow, headOut)
-		}
-
-		if denom > 0 {
-			inv := 1 / denom
-			for d := range headOut {
-				headOut[d] *= inv
-			}
-		}
-		_ = nTotal
 	}
+
+	if !gpuAttnOK {
+		// CPU fallback
+		rawStart := cache.rawStart()
+		compStart := cache.compStart()
+		sinks := tensorF32Unsafe(layer.AttnSinks)
+		scale := float32(1.0 / math.Sqrt(float64(NHeadDim)))
+
+		for h := 0; h < NHead; h++ {
+			qHead := ds.Q[h*NHeadDim : (h+1)*NHeadDim]
+			maxScore := sinks[h]
+
+			for t := 0; t < nRaw; t++ {
+				idx := rawStart + t
+				if idx >= cache.CapRaw {
+					idx -= cache.CapRaw
+				}
+				kvRow := cache.RawKV[idx*NHeadDim : (idx+1)*NHeadDim]
+				s := simd.Sdot(qHead, kvRow) * scale
+				ds.AttnScore[t] = s
+				if s > maxScore {
+					maxScore = s
+				}
+			}
+			for t := 0; t < nComp; t++ {
+				if compAllowed != nil && !compAllowed[t] {
+					ds.AttnScore[nRaw+t] = -1e30
+					continue
+				}
+				idx := compStart + t
+				if idx >= cache.CompCap {
+					idx -= cache.CompCap
+				}
+				kvRow := cache.CompKV[idx*NHeadDim : (idx+1)*NHeadDim]
+				s := simd.Sdot(qHead, kvRow) * scale
+				ds.AttnScore[nRaw+t] = s
+				if s > maxScore {
+					maxScore = s
+				}
+			}
+
+			headOut := ds.Heads[h*NHeadDim : (h+1)*NHeadDim]
+			for d := range headOut {
+				headOut[d] = 0
+			}
+			denom := float32(math.Exp(float64(sinks[h] - maxScore)))
+
+			for t := 0; t < nRaw; t++ {
+				w := float32(math.Exp(float64(ds.AttnScore[t] - maxScore)))
+				denom += w
+				idx := rawStart + t
+				if idx >= cache.CapRaw {
+					idx -= cache.CapRaw
+				}
+				kvRow := cache.RawKV[idx*NHeadDim : (idx+1)*NHeadDim]
+				simd.Saxpy(w, kvRow, headOut)
+			}
+			for t := 0; t < nComp; t++ {
+				if ds.AttnScore[nRaw+t] <= -1e29 {
+					continue
+				}
+				w := float32(math.Exp(float64(ds.AttnScore[nRaw+t] - maxScore)))
+				denom += w
+				idx := compStart + t
+				if idx >= cache.CompCap {
+					idx -= cache.CompCap
+				}
+				kvRow := cache.CompKV[idx*NHeadDim : (idx+1)*NHeadDim]
+				simd.Saxpy(w, kvRow, headOut)
+			}
+
+			if denom > 0 {
+				inv := 1 / denom
+				for d := range headOut {
+					headOut[d] *= inv
+				}
+			}
+			_ = nTotal
+		}
+	} // end if !gpuAttnOK
 
 	// 5. Output projection (de-RoPE → grouped LoRA)
 	// Inverse RoPE on head tails
