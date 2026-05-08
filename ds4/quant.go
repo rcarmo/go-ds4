@@ -51,7 +51,7 @@ func F32ToF16(f float32) uint16 {
 // Layout: float32 scale (4 bytes) + int8[32] quantized values = 36 bytes.
 
 // DotQ8_0F32 computes dot(Q8_0 weight row, float32 activation) for n elements.
-// wq8 is packed Q8_0 blocks, x is float32.
+// Q8_0 block: float32 scale (4 bytes) + int8[32] quantized values = 36 bytes.
 func DotQ8_0F32(wq8 []byte, x []float32, n int) float32 {
 	const blockSize = 32
 	nBlocks := n / blockSize
@@ -61,13 +61,6 @@ func DotQ8_0F32(wq8 []byte, x []float32, n int) float32 {
 		scale := *(*float32)(unsafe.Pointer(&wq8[off]))
 		qs := wq8[off+4 : off+4+blockSize]
 		xOff := b * blockSize
-		bsum := int32(0)
-		for i := 0; i < blockSize; i++ {
-			bsum += int32(int8(qs[i])) * int32(math.Float32bits(x[xOff+i])>>0) // wrong — need proper approach
-		}
-		// Actually: Q8_0 dot is: sum += scale * Σ(qs[i] * x[i])
-		// But x is float32, not int8. So we need: scale * Σ(int8(qs[i]) * x[i])
-		bsum = 0
 		var fsum float32
 		for i := 0; i < blockSize; i++ {
 			fsum += float32(int8(qs[i])) * x[xOff+i]
