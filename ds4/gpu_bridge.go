@@ -13,6 +13,7 @@ type CUDAEngine struct {
 	weightPtrs map[string]gpu.CUdeviceptr // raw byte buffers on GPU
 	actBuf     *gpu.Buffer                // [maxDim] float32 activation
 	outBuf     *gpu.Buffer                // [maxOutDim] float32 output
+	expertPool *gpu.ExpertPool            // reusable expert weight buffers
 }
 
 // InitGPU initializes GPU acceleration (CUDA or Vulkan).
@@ -26,6 +27,21 @@ func (e *Engine) InitGPU() error {
 			ce.ready = true
 			e.GPU = ce
 			fmt.Printf("[gpu] CUDA Q8_0 GEMV ready on %s\n", gpu.DeviceName())
+
+			// Init IQ2/Q2K kernels too
+			gpu.InitCUDAGemvQ2K()
+
+			// Allocate expert pool (4 slots for FastExperts, 6 otherwise)
+			nSlots := NExpertUsed
+			if e.FastExperts {
+				nSlots = NExpertUsedFast
+			}
+			pool, err := gpu.NewExpertPool(nSlots, NEmbd, NFFExp)
+			if err == nil {
+				ce.expertPool = pool
+			} else {
+				fmt.Printf("[gpu] expert pool alloc failed: %v\n", err)
+			}
 
 			// Upload Q8_0 weight tensors
 			uploaded, totalBytes := e.uploadCUDAWeights(ce)
@@ -177,5 +193,51 @@ func (ce *CUDAEngine) Close() {
 	if ce.outBuf != nil {
 		ce.outBuf.Free()
 	}
+	if ce.expertPool != nil {
+		ce.expertPool.Free()
+	}
 	ce.ready = false
+}
+
+// gpuExpertForward runs a batch of experts on GPU.
+// Returns true if successfully dispatched, false for CPU fallback.
+func (e *Engine) gpuExpertForward(
+	ds *DecodeState, layer *LayerWeights,
+	experts []expertScore, il int,
+) bool {
+	ce, ok := e.GPU.(*CUDAEngine)
+	if !ok || !ce.ready || ce.expertPool == nil || !gpu.CudaGemvQ2KReady() {
+		return false
+	}
+
+	gateRowBytes := (NEmbd / 256) * BlockIQ2XXSSize
+	upRowBytes := gateRowBytes
+	downRowBytes := (NFFExp / 256) * BlockQ2KSize
+
+	// Upload activation (FfnNormed as f32)
+	ce.expertPool.UploadActivation(ds.FfnNormed)
+
+	// Upload active expert weights and dispatch
+	for slot, exp := range experts {
+		if slot >= ce.expertPool.NExperts() {
+			break
+		}
+		// Get expert weight slices from mmap
+		gateBase := layer.FfnGateExps[exp.idx*gateRowBytes*NFFExp:]
+		upBase := layer.FfnUpExps[exp.idx*upRowBytes*NFFExp:]
+		downBase := layer.FfnDownExps[exp.idx*downRowBytes*NEmbd:]
+
+		ce.expertPool.UploadExpert(slot,
+			gateBase[:gateRowBytes*NFFExp],
+			upBase[:upRowBytes*NFFExp],
+			downBase[:downRowBytes*NEmbd],
+		)
+	}
+
+	// For now: dispatch sequentially per expert (can be pipelined later)
+	// Each expert: IQ2 gate → IQ2 up → SwiGLU (CPU) → Q2K down
+	// This is complex to fully GPU-ify, so just GPU the biggest part (IQ2 gate+up)
+	// and leave SwiGLU + Q2K down on CPU as before.
+	// TODO: full GPU expert pipeline
+	return false // not yet fully wired
 }

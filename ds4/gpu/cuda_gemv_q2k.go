@@ -171,3 +171,6 @@ func CUDAMatvecQ2K(output, activation *Buffer, weightPtr CUdeviceptr, inDim, out
 	}
 	return LaunchKernel(cudaGemvQ2K, uint32(outDim), 1, 1, 256, 1, 1, 256*4, args...)
 }
+
+// CudaGemvQ2KReady returns true if the Q2K kernel is compiled.
+func CudaGemvQ2KReady() bool { return cudaGemvQ2KReady }
