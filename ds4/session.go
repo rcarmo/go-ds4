@@ -29,6 +29,7 @@ type Engine struct {
 	Vocab       *Vocab
 	Budget      *MemoryBudget
 	Streamer    *DiskStreamer // non-nil when StreamExperts is enabled
+	Config      *ModelConfig  // model shape parameters
 	FastExperts bool          // use top-4 instead of top-6
 	GPU         interface{}   // *gpu.GPUEngine when GPU available (avoid import cycle)
 }
@@ -84,7 +85,8 @@ func OpenEngineWithOptions(opts EngineOptions) (*Engine, error) {
 		return nil, fmt.Errorf("apply budget: %w", err)
 	}
 
-	e := &Engine{Model: m, Weights: w, Vocab: v, Budget: budget, FastExperts: opts.FastExperts}
+	e := &Engine{Model: m, Weights: w, Vocab: v, Budget: budget, Config: DetectModelConfig(m), FastExperts: opts.FastExperts}
+	fmt.Printf("[model] Detected: %s\n", e.Config)
 
 	// Open disk streamer if requested
 	if opts.StreamExperts {
