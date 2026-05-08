@@ -189,8 +189,8 @@ func layerAttnDecode(
 		copy(ds.QRNorm, ds.QR)
 		rmsNorm(ds.QRNorm, qrNormW)
 		matvecQ8_0GPULayer(ds.Q, layer.AttnQB, ds.QRNorm, NLoraQ, NHead*NHeadDim, ds, "attn_q_b.weight")
-		for h := 0; h < NHead; h++ {
-			rmsNormNoScale(ds.Q[h*NHeadDim : (h+1)*NHeadDim])
+		for h := 0; h < cfg.NHead; h++ {
+			rmsNormNoScale(ds.Q[h*cfg.NHeadDim : (h+1)*cfg.NHeadDim])
 		}
 
 		// KV norm
@@ -204,11 +204,11 @@ func layerAttnDecode(
 	ropeYaRNTailInplace(ds.Q, pos, cfg.NHead, cfg.NHeadDim, cfg.NRot, freqBase, freqScale, false)
 
 	// Apply RoPE to KV tail
-	ropeYaRNTailInplace(ds.KV, pos, 1, NHeadDim, NRot, freqBase, freqScale, false)
+	ropeYaRNTailInplace(ds.KV, pos, 1, cfg.NHeadDim, NRot, freqBase, freqScale, false)
 
 	// FP8 quantize the non-RoPE portion for storage (reuse scratch to avoid alloc)
 	copy(ds.KVCacheRow, ds.KV)
-	fp8KVQuantizeInplace(ds.KVCacheRow, NHeadDim, NRot)
+	fp8KVQuantizeInplace(ds.KVCacheRow, cfg.NHeadDim, NRot)
 
 	// Push to cache
 	cache.PushRawKV(ds.KVCacheRow)
@@ -267,8 +267,8 @@ func layerAttnDecode(
 		}
 		scale := float32(1.0 / math.Sqrt(float64(cfg.NHeadDim)))
 
-		for h := 0; h < NHead; h++ {
-			qHead := ds.Q[h*NHeadDim : (h+1)*NHeadDim]
+		for h := 0; h < cfg.NHead; h++ {
+			qHead := ds.Q[h*cfg.NHeadDim : (h+1)*cfg.NHeadDim]
 			maxScore := sinks[h]
 
 			for t := 0; t < nRaw; t++ {
@@ -276,7 +276,7 @@ func layerAttnDecode(
 				if idx >= cache.CapRaw {
 					idx -= cache.CapRaw
 				}
-				kvRow := cache.RawKV[idx*NHeadDim : (idx+1)*NHeadDim]
+				kvRow := cache.RawKV[idx*cfg.NHeadDim : (idx+1)*cfg.NHeadDim]
 				s := simd.Sdot(qHead, kvRow) * scale
 				ds.AttnScore[t] = s
 				if s > maxScore {
@@ -292,7 +292,7 @@ func layerAttnDecode(
 				if idx >= cache.CompCap {
 					idx -= cache.CompCap
 				}
-				kvRow := cache.CompKV[idx*NHeadDim : (idx+1)*NHeadDim]
+				kvRow := cache.CompKV[idx*cfg.NHeadDim : (idx+1)*cfg.NHeadDim]
 				s := simd.Sdot(qHead, kvRow) * scale
 				ds.AttnScore[nRaw+t] = s
 				if s > maxScore {
@@ -300,8 +300,8 @@ func layerAttnDecode(
 				}
 			}
 
-			headOut := ds.Heads[h*NHeadDim : (h+1)*NHeadDim]
-			for d := range headOut {
+			headOut := ds.Heads[h*cfg.NHeadDim : (h+1)*cfg.NHeadDim]
+			for d := 0; d < cfg.NHeadDim; d++ {
 				headOut[d] = 0
 			}
 			denom := float32(math.Exp(float64(sinks[h] - maxScore)))
@@ -313,7 +313,7 @@ func layerAttnDecode(
 				if idx >= cache.CapRaw {
 					idx -= cache.CapRaw
 				}
-				kvRow := cache.RawKV[idx*NHeadDim : (idx+1)*NHeadDim]
+				kvRow := cache.RawKV[idx*cfg.NHeadDim : (idx+1)*cfg.NHeadDim]
 				simd.Saxpy(w, kvRow, headOut)
 			}
 			for t := 0; t < nComp; t++ {
@@ -326,13 +326,13 @@ func layerAttnDecode(
 				if idx >= cache.CompCap {
 					idx -= cache.CompCap
 				}
-				kvRow := cache.CompKV[idx*NHeadDim : (idx+1)*NHeadDim]
+				kvRow := cache.CompKV[idx*cfg.NHeadDim : (idx+1)*cfg.NHeadDim]
 				simd.Saxpy(w, kvRow, headOut)
 			}
 
 			if denom > 0 {
 				inv := 1 / denom
-				for d := range headOut {
+				for d := 0; d < cfg.NHeadDim; d++ {
 					headOut[d] *= inv
 				}
 			}
