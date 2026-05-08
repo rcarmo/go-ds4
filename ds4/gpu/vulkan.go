@@ -219,7 +219,7 @@ func VulkanInit() bool {
 		apiVersion         uint32
 	}{
 		sType:      0,                     // VK_STRUCTURE_TYPE_APPLICATION_INFO
-		apiVersion: (1 << 22) | (3 << 12), // Vulkan 1.3
+		apiVersion: (1 << 22), // Vulkan 1.3
 	}
 
 	createInfo := struct {
