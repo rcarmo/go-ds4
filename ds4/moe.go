@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"sync"
 	"unsafe"
 )
 
@@ -41,13 +42,39 @@ func layerFFNDecode(
 	}
 	model.PrefetchExperts(il, activeIDs)
 
-	// 4. Run routed experts
+	// 4. Run routed experts IN PARALLEL
 	for i := range ds.RoutedOut {
 		ds.RoutedOut[i] = 0
 	}
 
-	for _, exp := range experts {
-		expertForward(ds, layer, exp.idx, exp.score, streamer, model, il)
+	if len(experts) > 1 {
+		// Parallel: each expert writes to its own buffer, then merge
+		type expertResult struct {
+			out    [NEmbd]float32
+		}
+		results := make([]expertResult, len(experts))
+		var wg sync.WaitGroup
+		for i, exp := range experts {
+			wg.Add(1)
+			go func(idx int, e expertScore) {
+				defer wg.Done()
+				// Each goroutine gets its own Q8_K scratch
+				localXQ := make([]byte, len(ds.RoutedXQ))
+				copy(localXQ, ds.RoutedXQ)
+				localMidQ := make([]byte, (NFFExp/QK_K)*BlockQ8KSize)
+				expertForwardInto(results[idx].out[:], localXQ, localMidQ,
+					layer, e.idx, e.score, streamer, model, il)
+			}(i, exp)
+		}
+		wg.Wait()
+		// Merge results
+		for i := range results {
+			for j := 0; j < NEmbd; j++ {
+				ds.RoutedOut[j] += results[i].out[j]
+			}
+		}
+	} else if len(experts) == 1 {
+		expertForward(ds, layer, experts[0].idx, experts[0].score, streamer, model, il)
 	}
 
 	// 5. Run shared expert
@@ -130,6 +157,66 @@ func hashRouteExperts(layer *LayerWeights, tokenID int) []expertScore {
 		}
 	}
 	return experts
+}
+
+// expertForwardInto runs a single routed expert into a provided output buffer.
+// Thread-safe: uses provided scratch buffers instead of shared DecodeState.
+func expertForwardInto(out []float32, xQ8K, midQ []byte,
+	layer *LayerWeights, expertIdx int, weight float32,
+	streamer *DiskStreamer, model *GGUFModel, il int) {
+
+	gateRowBytes := (NEmbd / QK_K) * BlockIQ2XXSSize
+	upRowBytes := gateRowBytes
+	downRowBytes := (NFFExp / QK_K) * BlockQ2KSize
+
+	var gateBase, upBase, downBase []byte
+
+	if streamer != nil {
+		prefix := fmt.Sprintf("blk.%d.", il)
+		gateTensor := model.Tensors[prefix+"ffn_gate_exps.weight"]
+		upTensor := model.Tensors[prefix+"ffn_up_exps.weight"]
+		downTensor := model.Tensors[prefix+"ffn_down_exps.weight"]
+		var err error
+		gateBase, err = streamer.ReadExpertTensor(gateTensor, expertIdx)
+		if err != nil { return }
+		upBase, err = streamer.ReadExpertTensor(upTensor, expertIdx)
+		if err != nil { return }
+		downBase, err = streamer.ReadExpertTensor(downTensor, expertIdx)
+		if err != nil { return }
+		defer func() {
+			streamer.ReturnBuffer(gateBase)
+			streamer.ReturnBuffer(upBase)
+			streamer.ReturnBuffer(downBase)
+		}()
+	} else {
+		gateBase = layer.FfnGateExps[expertIdx*gateRowBytes*NFFExp:]
+		upBase = layer.FfnUpExps[expertIdx*upRowBytes*NFFExp:]
+		downBase = layer.FfnDownExps[expertIdx*downRowBytes*NEmbd:]
+	}
+
+	gate := make([]float32, NFFExp)
+	up := make([]float32, NFFExp)
+
+	for o := 0; o < NFFExp; o++ {
+		gateRow := gateBase[o*gateRowBytes : (o+1)*gateRowBytes]
+		upRow := upBase[o*upRowBytes : (o+1)*upRowBytes]
+		gate[o] = VecDotIQ2XXSQ8K(NEmbd, gateRow, xQ8K)
+		up[o] = VecDotIQ2XXSQ8K(NEmbd, upRow, xQ8K)
+	}
+
+	swiGLU(gate, gate, up)
+
+	for i := range gate {
+		if gate[i] > SwiGLUClampExp { gate[i] = SwiGLUClampExp }
+		if gate[i] < -SwiGLUClampExp { gate[i] = -SwiGLUClampExp }
+	}
+
+	QuantizeRowQ8K(gate, midQ)
+
+	for o := 0; o < NEmbd; o++ {
+		downRow := downBase[o*downRowBytes : (o+1)*downRowBytes]
+		out[o] += weight * VecDotQ2KQ8K(NFFExp, downRow, midQ)
+	}
 }
 
 // expertForward runs a single routed expert: gate·up (IQ2_XXS) → SwiGLU → down (Q2_K).
