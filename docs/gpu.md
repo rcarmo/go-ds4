@@ -62,7 +62,7 @@ Or via the server:
 
 | Metric | Value |
 |---|---|
-| GPU kernel time (IQ2 4096→2048) | 4 µs |
+| GPU kernel time (IQ2 4096→2048) | 2.4 µs |
 | GPU kernel time (Q2K 2048→4096) | 3 µs |
 | GPU kernel time (Q8_0 4096→4096) | 3 µs |
 | DtoD expert weight copy (4 experts) | ~70 µs |
@@ -85,10 +85,11 @@ Or via the server:
 ## PTX Kernels
 
 All kernels target `sm_80` (Ampere) and use:
+- **Shared memory activation tiling**: cooperative load of activation vector into 16KB shared memory (IQ2 kernel), 256× fewer global reads
+- `ld.global.v2.u32` for vectorized grid/weight loads
 - `ld.global.b16` + `cvt.f32.f16` for F16 scale decode
-- `ld.global.s8` for int8 weight access  
-- Shared memory (`__shared__`) for 256-thread tree reduction
+- Warp shuffle reduction (`shfl.sync.down`) instead of shared memory tree
 - `ex2.approx` + `rcp.approx` for fast SiLU sigmoid
-- `atom.global.add.f32` not used (direct `st.global` after reduction)
+- CUDA stream dispatch for all kernels + async memcpy
 
 Source: all PTX is embedded as Go string constants in `ds4/gpu/cuda_gemv_*.go`. No external `.ptx` files or nvcc dependency.

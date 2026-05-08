@@ -72,9 +72,18 @@ All GPU backends load via `purego.Dlopen` at runtime — no CGo, no build-time G
 | Kernel | PTX File | Description |
 |---|---|---|
 | `gemv_q8_0_f16scale` | `cuda_gemv_q8_0.go` | Q8_0 GEMV: F16 scale decode + int8×f32 dot, 256-thread shared-memory reduction |
-| `iq2xxs_gemv` | `cuda_gemv_iq2.go` | IQ2_XXS GEMV: grid table lookup in VRAM, 4 sub-groups × 8-element scalar dot |
+| `iq2xxs_gemv_opt` | `cuda_gemv_iq2_opt.go` | IQ2_XXS GEMV: **shared memory activation tiling** (cooperative 16KB load), vectorized grid loads (`ld.global.v2.u32`), warp shuffle reduction. 2.4µs/call |
 | `q2k_gemv` | `cuda_gemv_q2k.go` | Q2_K GEMV: 2-bit extraction from packed bytes, per-group scale application |
 | `swiglu` | `cuda_gemv_q8_0.go` | Fused SiLU×mul: `ex2.approx` + `rcp.approx` for fast sigmoid |
+
+### Shared Memory Activation Tiling
+
+The IQ2 kernel uses cooperative shared memory loading:
+
+1. **Phase 1**: 256 threads cooperatively load `activation[4096]` into `s_act[4096]` (16KB shared memory). Each thread loads 16 elements (stride 256). One `bar.sync` barrier.
+2. **Phase 2**: All dot product computations read activation from `ld.shared.f32` (1 cycle latency) instead of `ld.global.f32` (~300 cycles). Each activation element is read by potentially all 256 threads — shared memory eliminates 256× redundant global reads.
+
+Result: 3.0µs → 2.4µs per kernel call (20% faster).
 
 ### Batched Expert Pipeline
 
@@ -88,6 +97,16 @@ Per layer, the 4 active experts are dispatched as one batch:
 6. **Sync + Download** (1 per layer): Single `cuCtxSynchronize`
 
 Total: 4 kernel launches + 1 sync per layer × 43 layers = 172 launches + 43 syncs per token.
+
+### CUDA Streams
+
+All expert GPU operations run on a dedicated CUDA stream:
+- `cuMemcpyHtoDAsync` for activation upload
+- `cuLaunchKernel` with stream parameter for all 4 kernels
+- `cuStreamSynchronize` instead of `cuCtxSynchronize` (only waits for our work)
+- `cuMemcpyDtoHAsync` for result download
+
+This avoids blocking other GPU work and reduces sync overhead.
 
 ### Expert VRAM Cache
 

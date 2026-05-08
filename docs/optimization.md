@@ -41,12 +41,16 @@
 - Selective upload: only outDim ≥ 4096 tensors → 3.2 GB VRAM
 - **~1.57 tok/s** with Q8_0-only GPU
 
-### Phase 8: Full GPU expert pipeline
+### Phase 8: Full GPU expert pipeline + shared memory tiling
 - CUDA PTX IQ2_XXS + Q2_K + SwiGLU kernels
 - Demand-filled expert VRAM cache (zero PCIe after warmup)
 - Batched 4-expert dispatch (DtoD concat + single kernel launch)
+- CUDA stream pipeline (all ops on dedicated stream)
+- Shared memory activation tiling: cooperative load into 16KB shmem,
+  256× fewer global memory reads per activation element
+- IQ2 kernel: 3.0µs → 2.4µs (20% faster from shmem tiling)
 - 43 syncs/token (down from 344)
-- **~2.13 tok/s** (1.6× over CPU)
+- **~2.09 tok/s** (~20% over CPU)
 
 ## Key Decisions
 

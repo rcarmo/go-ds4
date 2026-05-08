@@ -4,12 +4,12 @@
 
 A pure Go inference engine for [DeepSeek V4 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V3), ported from [@antirez's excellent single-file C implementation](https://github.com/antirez/ds4).
 
-**Single static binary. AVX2 + CUDA PTX. 2.13 tok/s GPU-accelerated, pure Go.**
+**Single static binary. AVX2 + CUDA PTX. 2.09 tok/s GPU-accelerated, pure Go.**
 
 | Mode | tok/s (decode) | Hardware | VRAM | Notes |
 |---|---|---|---|---|
-| **GPU CUDA** (batched experts) | **2.13** | RTX 3060 12GB | ~8 GB | Batched 4-expert dispatch, demand-filled cache |
-| **CPU AVX2** (top-4 fast) | **1.24** | i7-12700, 6 cores | 0 | Pure Go + hand-written assembly |
+| **GPU CUDA** (batched + shmem) | **2.09** | RTX 3060 12GB | ~8 GB | Shared-mem tiled IQ2, batched experts, CUDA streams |
+| **CPU AVX2** (top-4 fast) | **1.66** | i7-12700, 6 cores | 0 | Pure Go + hand-written assembly |
 | CPU AVX2 (top-6) | 1.09 | i7-12700, 6 cores | 0 | Default expert count |
 
 The default build produces a **fully self-contained static binary** with no C dependencies. All hot paths use hand-written SIMD assembly (AVX2+FMA on amd64, NEON stubs on arm64). GPU acceleration via CUDA PTX is opt-in and loaded at runtime via `purego` (no CGo, no CUDA toolkit dependency).
@@ -113,16 +113,15 @@ Each layer:
 
 | Configuration | tok/s | VRAM | Strategy |
 |---|---|---|---|
-| CPU only (top-4) | 1.24 | 0 | AVX2 SIMD, parallel experts |
+| CPU only (top-4) | 1.66 | 0 | AVX2 SIMD, parallel experts |
 | GPU Q8_0 only | 2.12 | 3.8 GB | Output head + large projections |
-| **GPU batched experts** | **2.13** | **~8 GB** | 4 experts batched per layer, demand-filled cache |
+| **GPU full pipeline** | **2.09** | **~8 GB** | Batched experts, shared-mem tiling, CUDA streams |
 
-The GPU pipeline batches all 4 active experts into single kernel launches:
-1. DtoD copy: concatenate expert weights contiguously (~70µs)
-2. One IQ2 gate launch (8192 rows) → One IQ2 up launch → One SwiGLU launch → One Q2K down launch
-3. Single sync + download per layer (43 syncs/token total)
-
-Expert weights are demand-cached in VRAM on first route — no PCIe transfer after warmup.
+The GPU pipeline:
+1. **Cooperative activation load**: 256 threads load activation[4096] into 16KB shared memory (one barrier, 256× fewer global reads)
+2. **Batched expert dispatch**: DtoD concatenate 4 experts’ weights, single kernel launch per operation
+3. **CUDA stream pipeline**: all kernels + async memcpy on dedicated stream, `StreamSync` per layer
+4. **Demand-filled cache**: experts uploaded to VRAM on first route, zero PCIe after warmup
 
 ### End-to-End Decode Profile
 
