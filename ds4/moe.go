@@ -56,18 +56,27 @@ func layerFFNDecode(
 		sharedExpertForward(ds, layer)
 	}()
 
-	// GPU expert dispatch: use cached experts if all are in VRAM
-	gpuDone := false
+	// GPU expert dispatch: cached experts on GPU, rest on CPU
+	var gpuHandled []bool
 	if ds.Engine != nil {
 		if eng, ok := ds.Engine.(*Engine); ok {
-			gpuDone = eng.gpuExpertForward(ds, layer, experts, il)
-			if !gpuDone && il == 2 {
+			gpuHandled = eng.gpuExpertForward(ds, layer, experts, il)
+		}
+	}
+
+	// CPU fallback for experts not handled by GPU
+	needCPU := gpuHandled == nil
+	if !needCPU {
+		for _, h := range gpuHandled {
+			if !h {
+				needCPU = true
+				break
 			}
 		}
 	}
 
-	if !gpuDone {
-		// CPU fallback: parallel experts
+	if needCPU {
+		// CPU: only run experts not already handled by GPU
 		if len(experts) > 1 {
 			// Parallel with preallocated per-expert scratch (no per-token allocs)
 			midQStride := (NFFExp / QK_K) * BlockQ8KSize

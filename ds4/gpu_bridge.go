@@ -248,13 +248,13 @@ func (ce *CUDAEngine) Close() {
 func (e *Engine) gpuExpertForward(
 	ds *DecodeState, layer *LayerWeights,
 	experts []expertScore, il int,
-) bool {
+) []bool {
 	ce, ok := e.GPU.(*CUDAEngine)
-	if !ok || !ce.ready || ce.expertCache == nil || ce.batchBufs == nil {
-		return false
+	if !ok || !ce.ready || ce.expertCache == nil {
+		return nil
 	}
 	if !gpu.CudaGemvIQ2Ready() || !gpu.CudaGemvQ2KReady() || !gpu.CudaSwiGLUReady() {
-		return false
+		return nil
 	}
 
 	nExp := len(experts)
@@ -263,57 +263,50 @@ func (e *Engine) gpuExpertForward(
 		expertIdxs[i] = exp.idx
 	}
 	e.cacheExpertsOnDemand(ce, il, expertIdxs)
+
+	// Check how many are cached
+	nCached := 0
 	for _, exp := range experts {
+		if ce.expertCache.IsCached(il, exp.idx) {
+			nCached++
+		}
+	}
+	if nCached == 0 {
+		return nil
+	}
+
+	gateRowBytes := (NEmbd / 256) * BlockIQ2XXSSize * NFFExp
+	upRowBytes := gateRowBytes
+	downRowBytes := (NFFExp / 256) * BlockQ2KSize * NEmbd
+
+	actBuf := ce.expertCache.ActBuf(il)
+	outBuf := ce.expertCache.OutBuf(il)
+	midBuf := ce.expertCache.MidBuf(il)
+
+	actBuf.UploadAsync(ds.FfnNormed, ce.stream)
+
+	gpuHandled := make([]bool, nExp)
+	for slot, exp := range experts {
 		if !ce.expertCache.IsCached(il, exp.idx) {
-			return false
+			continue
 		}
-	}
-
-	gateSize := (NEmbd / 256) * BlockIQ2XXSSize * NFFExp
-	upSize := gateSize
-	downSize := (NFFExp / 256) * BlockQ2KSize * NEmbd
-	gateRowBytes := gateSize // total bytes per expert
-	upRowBytes := upSize
-	downRowBytes := downSize
-	bb := ce.batchBufs
-
-	// DtoD copy: concatenate expert weights contiguously (~70Âµs for 4 experts)
-	for slot, exp := range experts {
 		gatePtr, upPtr, downPtr, _ := ce.expertCache.Get(il, exp.idx)
-		bb.CopyExpertWeights(slot, gatePtr, upPtr, downPtr, gateSize, upSize, downSize)
-	}
 
-	// Upload activation once
-	bb.ActBuf.UploadAsync(ds.FfnNormed, ce.stream)
+		gpu.CUDAMatvecIQ2OptStream(outBuf, actBuf, gatePtr, NEmbd, NFFExp, gateRowBytes, ce.stream)
+		gpu.CUDAMatvecIQ2OptStream(midBuf, actBuf, upPtr, NEmbd, NFFExp, upRowBytes, ce.stream)
+		gpu.CUDASwiGLUStream(outBuf, outBuf, midBuf, NFFExp, ce.stream)
+		gpu.CUDAMatvecQ2KOptStream(actBuf, outBuf, downPtr, NFFExp, NEmbd, downRowBytes, ce.stream)
 
-	// Batched gate: nExp*NFFExp output rows, each reading from its expert slice
-	// The kernel processes rows sequentially; row r reads weight at offset r*rowBytes
-	// where rowBytes = per-row IQ2 size. The batched buffer has expert weights
-	// concatenated, so rows 0..NFFExp-1 are expert 0, NFFExp..2*NFFExp-1 are expert 1, etc.
-	gpu.CUDAMatvecIQ2OptStream(bb.GateOut, bb.ActBuf, bb.GateBuf, NEmbd, nExp*NFFExp, gateRowBytes, ce.stream)
-
-	// Batched up
-	gpu.CUDAMatvecIQ2OptStream(bb.UpOut, bb.ActBuf, bb.UpBuf, NEmbd, nExp*NFFExp, upRowBytes, ce.stream)
-
-	// Batched SwiGLU on all nExp*NFFExp elements
-	gpu.CUDASwiGLUStream(bb.GateOut, bb.GateOut, bb.UpOut, nExp*NFFExp, ce.stream)
-
-	// Batched Q2K down: nExp*NEmbd output rows
-	gpu.CUDAMatvecQ2KOptStream(bb.DownOut, bb.GateOut, bb.DownBuf, NFFExp, nExp*NEmbd, downRowBytes, ce.stream)
-
-	// Single sync + download
-	gpu.StreamSync(ce.stream)
-	result := make([]float32, nExp*NEmbd)
-	bb.DownOut.DownloadAsync(result, ce.stream)
-
-	// Accumulate per-expert results with weights
-	for slot, exp := range experts {
-		off := slot * NEmbd
+		gpu.StreamSync(ce.stream)
+		result := ds.ExpertOut[:NEmbd]
+		actBuf.Download(result)
 		for i := 0; i < NEmbd; i++ {
-			ds.RoutedOut[i] += exp.score * result[off+i]
+			ds.RoutedOut[i] += exp.score * result[i]
 		}
+		actBuf.UploadAsync(ds.FfnNormed, ce.stream)
+		gpuHandled[slot] = true
 	}
-	return true
+	return gpuHandled
 }
 
 // loadExpertCache pre-loads expert weights into VRAM on demand.
