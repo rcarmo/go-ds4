@@ -169,13 +169,29 @@ func (g *GPUEngine) Close() {
 	if g == nil {
 		return
 	}
-	for _, buf := range g.weightBufs {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	for name, buf := range g.weightBufs {
 		buf.Free()
+		delete(g.weightBufs, name)
 	}
 	if g.actBuf != nil {
 		g.actBuf.Free()
+		g.actBuf = nil
 	}
 	if g.outBuf != nil {
 		g.outBuf.Free()
+		g.outBuf = nil
 	}
+	// Kernels hold Vulkan pipelines/pools/fences — destroy them
+	if g.gemvF32 != nil {
+		g.gemvF32.Destroy()
+		g.gemvF32 = nil
+	}
+	if g.gemvQ8_0 != nil {
+		g.gemvQ8_0.Destroy()
+		g.gemvQ8_0 = nil
+	}
+	g.ready = false
 }

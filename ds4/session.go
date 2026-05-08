@@ -7,6 +7,8 @@ import (
 	"math"
 	"math/rand/v2"
 	"unsafe"
+
+	"github.com/rcarmo/go-ds4/ds4/gpu"
 )
 
 // Session holds the mutable inference state for one generation timeline.
@@ -104,8 +106,14 @@ func OpenEngineWithOptions(opts EngineOptions) (*Engine, error) {
 	return e, nil
 }
 
-// Close releases the model memory mapping and streamer.
+// Close releases the model memory mapping, streamer, and GPU resources.
 func (e *Engine) Close() {
+	if e.GPU != nil {
+		if g, ok := e.GPU.(*gpu.GPUEngine); ok {
+			g.Close()
+		}
+		e.GPU = nil
+	}
 	if e.Streamer != nil {
 		e.Streamer.Close()
 	}
