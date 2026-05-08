@@ -238,6 +238,7 @@ func expertForwardFast(out []float32, xQ8K, midQ []byte, cfg *ModelConfig,
 	upRowBytes := ed.upRowBytes
 	downRowBytes := ed.downRowBytes
 	ffnDim := ed.outDim
+	fmt.Printf("  downExps=%d\n", len(layer.FfnDownExps))
 	if ffnDim == 0 {
 		ffnDim = NFFExp
 	}
@@ -292,7 +293,13 @@ func expertForwardFast(out []float32, xQ8K, midQ []byte, cfg *ModelConfig,
 
 	// Q2_K down projection
 	for o := 0; o < cfg.NEmbd; o++ {
-		out[o] += weight * VecDotQ2KQ8K(ffnDim, downBase[o*downRowBytes:(o+1)*downRowBytes], midQ)
+		if ed.downIsIQ4NL {
+			out[o] += weight * VecDotIQ4NLQ8K(ffnDim, downBase[o*downRowBytes:(o+1)*downRowBytes], midQ)
+		} else if ed.downIsQ5K {
+			out[o] += weight * VecDotQ5KQ8K(ffnDim, downBase[o*downRowBytes:(o+1)*downRowBytes], midQ)
+		} else {
+			out[o] += weight * VecDotQ2KQ8K(ffnDim, downBase[o*downRowBytes:(o+1)*downRowBytes], midQ)
+		}
 	}
 }
 
@@ -308,6 +315,7 @@ func expertForward(ds *DecodeState, layer *LayerWeights, expertIdx int, weight f
 	upRowBytes := ed.upRowBytes
 	downRowBytes := ed.downRowBytes
 	ffnDim := ed.outDim
+	fmt.Printf("  downExps=%d\n", len(layer.FfnDownExps))
 	if ffnDim == 0 {
 		ffnDim = NFFExp
 	}
