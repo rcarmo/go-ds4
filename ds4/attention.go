@@ -142,9 +142,18 @@ func layerAttnDecode(
 	copy(ds.AttnNormed, ds.AttnCur)
 	rmsNorm(ds.AttnNormed, normW)
 
-	// 2. Q projection: low-rank LoRA
-	// attn_q_a: Q8_0 [NEmbd, NLoraQ] → qr[NLoraQ]
-	matvecQ8_0GPULayer(ds.QR, layer.AttnQA, ds.AttnNormed, NEmbd, NLoraQ, ds, "attn_q_a.weight")
+	// 2. Q + KV projection: try fused GPU dispatch (one kernel for both)
+	fusedOK := false
+	if ds.Engine != nil {
+		if eng, ok := ds.Engine.(*Engine); ok {
+			fusedOK = eng.gpuFusedAttnQAKV(ds.QR, ds.KV, ds.AttnNormed, il)
+		}
+	}
+	if !fusedOK {
+		// CPU fallback: two separate matmuls
+		matvecQ8_0GPULayer(ds.QR, layer.AttnQA, ds.AttnNormed, NEmbd, NLoraQ, ds, "attn_q_a.weight")
+		matvecQ8_0GPULayer(ds.KV, layer.AttnKV, ds.AttnNormed, NEmbd, NHeadDim, ds, "attn_kv.weight")
+	}
 
 	// RMSNorm on qr
 	qrNormW := tensorF32Unsafe(layer.AttnQANorm)
@@ -165,10 +174,7 @@ func layerAttnDecode(
 	freqScale := layerRoPEFreqScale(il)
 	ropeYaRNTailInplace(ds.Q, pos, NHead, NHeadDim, NRot, freqBase, freqScale, false)
 
-	// 3. KV projection
-	// attn_kv: Q8_0 [NEmbd, NHeadDim] → kv[NHeadDim]
-	matvecQ8_0GPULayer(ds.KV, layer.AttnKV, ds.AttnNormed, NEmbd, NHeadDim, ds, "attn_kv.weight")
-
+	// 3. KV post-processing (already computed in fused step above)
 	// RMSNorm on KV
 	kvNormW := tensorF32Unsafe(layer.AttnKVANorm)
 	rmsNorm(ds.KV, kvNormW)

@@ -17,6 +17,7 @@ type CUDAEngine struct {
 	expertCache *gpu.ExpertCache
 	batchBufs   *gpu.BatchedExpertBufs
 	stream      gpu.CUstream
+	fusedLayers [NLayer]*gpu.FusedLayerBufs // fused Q8_0 projections per layer
 }
 
 // InitGPU initializes GPU acceleration (CUDA or Vulkan).
@@ -75,6 +76,23 @@ func (e *Engine) InitGPU() error {
 			// Upload Q8_0 weight tensors
 			uploaded, totalBytes := e.uploadCUDAWeights(ce)
 			fmt.Printf("[gpu] Uploaded %d tensors (%.1f MB) to GPU VRAM\n", uploaded, float64(totalBytes)/(1024*1024))
+
+			// Create fused Q8_0 projection buffers per layer
+			fusedCount := 0
+			for il := 0; il < NLayer; il++ {
+				l := &e.Weights.Layer[il]
+				if len(l.AttnQA) > 0 && len(l.AttnKV) > 0 {
+					f, err := gpu.NewFusedLayerBufs(l.AttnQA, l.AttnKV, NEmbd, NLoraQ, NHeadDim)
+					if err == nil {
+						ce.fusedLayers[il] = f
+						fusedCount++
+					}
+				}
+			}
+			if fusedCount > 0 {
+				fmt.Printf("[gpu] Fused Q8_0 projections: %d layers (attn_q_a+kv \u2192 one dispatch)\n", fusedCount)
+			}
+
 			return nil
 		}
 	}
@@ -234,6 +252,11 @@ func (ce *CUDAEngine) Close() {
 		ce.expertCache.Free()
 		if ce.batchBufs != nil {
 			ce.batchBufs.Free()
+			for il := range ce.fusedLayers {
+				if ce.fusedLayers[il] != nil {
+					ce.fusedLayers[il].Free()
+				}
+			}
 			if ce.stream != 0 {
 				gpu.StreamDestroy(ce.stream)
 			}
@@ -332,4 +355,19 @@ func (e *Engine) cacheExpertsOnDemand(ce *CUDAEngine, il int, expertIdxs []int) 
 		downBase := l.FfnDownExps[eidx*downRowBytes*NEmbd : (eidx+1)*downRowBytes*NEmbd]
 		ce.expertCache.LoadExpert(il, eidx, gateBase, upBase, downBase)
 	}
+}
+
+// gpuFusedAttnQAKV dispatches fused attn_q_a + attn_kv on GPU.
+// Returns true if dispatched, false for CPU fallback.
+func (e *Engine) gpuFusedAttnQAKV(qr, kv, x []float32, il int) bool {
+	ce, ok := e.GPU.(*CUDAEngine)
+	if !ok || !ce.ready || ce.fusedLayers[il] == nil {
+		return false
+	}
+	fused := ce.fusedLayers[il]
+	results := [][]float32{qr, kv}
+	if err := fused.AttnQAKV.Dispatch(x, results, ce.stream); err != nil {
+		return false
+	}
+	return true
 }
