@@ -93,8 +93,7 @@ func VecDotQ2KQ8K(n int, xQ2K []byte, yQ8K []byte) float32 {
 	return vecDotQ2KQ8K_scalar(n, xQ2K, yQ8K)
 }
 
-// vecDotQ2KQ8K_scalar is the optimized implementation using AVX2 DotQ2x32
-// for the inner 128-element dot product chunks.
+// vecDotQ2KQ8K_scalar matches ds4.c ds4_vec_dot_q2_K_q8_K exactly.
 func vecDotQ2KQ8K_scalar(n int, xQ2K []byte, yQ8K []byte) float32 {
 	nBlocks := n / QK_K
 	sum := float32(0)
@@ -103,35 +102,52 @@ func vecDotQ2KQ8K_scalar(n int, xQ2K []byte, yQ8K []byte) float32 {
 		xOff := b * BlockQ2KSize
 		yOff := b * BlockQ8KSize
 
-		scales := xQ2K[xOff : xOff+16]
-		qs := xQ2K[xOff+16 : xOff+16+64]
+		sc := xQ2K[xOff : xOff+16]
+		q2 := xQ2K[xOff+16 : xOff+16+64]
 		d := F16ToF32(*(*uint16)(unsafe.Pointer(&xQ2K[xOff+80])))
 		dmin := F16ToF32(*(*uint16)(unsafe.Pointer(&xQ2K[xOff+82])))
 
 		yd := *(*float32)(unsafe.Pointer(&yQ8K[yOff]))
-		yqs := yQ8K[yOff+4 : yOff+4+QK_K]
-		ybsums := yQ8K[yOff+4+QK_K : yOff+4+QK_K+32]
+		q8 := yQ8K[yOff+4 : yOff+4+QK_K]
+		bsums := yQ8K[yOff+4+QK_K : yOff+4+QK_K+32]
 
-		sumMinS := int32(0)
-		isum := int32(0)
-
+		summs := int32(0)
 		for j := 0; j < 16; j++ {
-			sc := scales[j]
-			scHi := int32(sc >> 4)
-			scLo := int32(sc & 0x0f)
-
-			bs := *(*int16)(unsafe.Pointer(&ybsums[j*2]))
-			sumMinS += scHi * int32(bs)
-
-			// AVX2: unpack 16 Q2 values + dot with 16 Q8 values
-			dot := simd.DotQ2Group16(
-				unsafe.Pointer(&qs[j*4]),
-				unsafe.Pointer(&yqs[j*16]),
-			)
-			isum += scLo * dot
+			bs := *(*int16)(unsafe.Pointer(&bsums[j*2]))
+			summs += int32(bs) * int32(sc[j]>>4)
 		}
 
-		sum += yd*d*float32(isum) - yd*dmin*float32(sumMinS)
+		isum := int32(0)
+		is := 0
+		q2off := 0
+		q8off := 0
+		for k := 0; k < QK_K/128; k++ {
+			shift := uint(0)
+			for j := 0; j < 4; j++ {
+				dscale := int32(sc[is] & 0x0f)
+				is++
+				isum += dscale * dotQ2K16(q2[q2off:q2off+16], q8[q8off:q8off+16], shift)
+
+				dscale = int32(sc[is] & 0x0f)
+				is++
+				isum += dscale * dotQ2K16(q2[q2off+16:q2off+32], q8[q8off+16:q8off+32], shift)
+
+				shift += 2
+				q8off += 32
+			}
+			q2off += 32
+		}
+
+		sum += yd*d*float32(isum) - yd*dmin*float32(summs)
+	}
+	return sum
+}
+
+func dotQ2K16(q2 []byte, q8 []byte, shift uint) int32 {
+	var sum int32
+	for i := 0; i < 16; i++ {
+		q := int32((q2[i] >> shift) & 0x03)
+		sum += q * int32(int8(q8[i]))
 	}
 	return sum
 }
