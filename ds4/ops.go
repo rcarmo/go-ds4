@@ -190,8 +190,49 @@ func matvecF16(out []float32, wF16 []byte, x []float32, inDim, outDim int) {
 	})
 }
 
+// quantizeQ8_0Activation quantizes activation to per-block int8 with f32 scales and f32 sums.
+func quantizeQ8_0Activation(x []float32, xq []int8, xscale []float32, xsum []float32) {
+	nBlocks := len(x) / 32
+	for b := 0; b < nBlocks; b++ {
+		off := b * 32
+		amax := float32(0)
+		for i := 0; i < 32; i++ {
+			v := x[off+i]
+			if v < 0 {
+				v = -v
+			}
+			if v > amax {
+				amax = v
+			}
+		}
+		if amax == 0 {
+			xscale[b] = 0
+			xsum[b] = 0
+			for i := 0; i < 32; i++ {
+				xq[off+i] = 0
+			}
+			continue
+		}
+		xscale[b] = amax / 127.0
+		inv := 127.0 / amax
+		sum := int32(0)
+		for i := 0; i < 32; i++ {
+			v := x[off+i] * inv
+			var q int8
+			if v >= 0 {
+				q = int8(v + 0.5)
+			} else {
+				q = int8(v - 0.5)
+			}
+			xq[off+i] = q
+			sum += int32(q)
+		}
+		xsum[b] = float32(sum)
+	}
+}
+
 // matvecQ8_0 computes out[outDim] = Q8_0_weight[outDim, inDim] · x[inDim].
-// Uses SIMD DotQ8_0F32 (VPMOVSXBD+VCVTDQ2PS+FMA) directly on each row.
+// Uses SIMD DotQ8_0F32 (VCVTPH2PS+VPMOVSXBD+VCVTDQ2PS+FMA) directly per row.
 func matvecQ8_0(out []float32, wQ8 []byte, x []float32, inDim, outDim int) {
 	rowBytes := (inDim / 32) * BlockQ8_0Size
 	parallelFor(outDim, func(start, end int) {

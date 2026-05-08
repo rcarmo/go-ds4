@@ -66,10 +66,11 @@ func DotI8(a, b unsafe.Pointer, n int) int32 {
 }
 
 // DotQ8_0PrequantI8 scalar fallback.
-func DotQ8_0PrequantI8(row unsafe.Pointer, xq unsafe.Pointer, xscale unsafe.Pointer, nBlocks int) float32 {
+func DotQ8_0PrequantI8(row unsafe.Pointer, xq unsafe.Pointer, xscale unsafe.Pointer, xsum unsafe.Pointer, nBlocks int) float32 {
 	rp := (*[1 << 30]byte)(row)
 	xqp := (*[1 << 30]int8)(xq)
 	xsp := (*[1 << 30]float32)(xscale)
+	_ = xsum // not needed for scalar path
 	sum := float32(0)
 	for b := 0; b < nBlocks; b++ {
 		off := b * 34
