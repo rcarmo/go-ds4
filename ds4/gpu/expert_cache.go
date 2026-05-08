@@ -20,10 +20,10 @@ type ExpertCache struct {
 }
 
 type layerExpertCache struct {
-	cached   map[int]*cachedExpert // expertIdx → GPU pointers
-	actBuf   *Buffer              // shared activation buffer for this layer
-	outBuf   *Buffer              // shared output buffer
-	midBuf   *Buffer              // intermediate buffer (gate/up result)
+	cached map[int]*cachedExpert // expertIdx → GPU pointers
+	actBuf *Buffer               // shared activation buffer for this layer
+	outBuf *Buffer               // shared output buffer
+	midBuf *Buffer               // intermediate buffer (gate/up result)
 }
 
 type cachedExpert struct {
@@ -43,9 +43,9 @@ func NewExpertCache(nPerLayer int) (*ExpertCache, error) {
 	NFFExp := 2048
 	NLayer := 43
 
-	gateSize := (NEmbd / 256) * 66 * NFFExp  // IQ2_XXS [NFFExp, NEmbd]
-	upSize := gateSize                         // same format
-	downSize := (NFFExp / 256) * 84 * NEmbd   // Q2_K [NEmbd, NFFExp]
+	gateSize := (NEmbd / 256) * 66 * NFFExp // IQ2_XXS [NFFExp, NEmbd]
+	upSize := gateSize                      // same format
+	downSize := (NFFExp / 256) * 84 * NEmbd // Q2_K [NEmbd, NFFExp]
 
 	ec := &ExpertCache{
 		nCached:  nPerLayer,
@@ -156,5 +156,83 @@ func (ec *ExpertCache) Free() {
 		if ec.layers[il].midBuf != nil {
 			ec.layers[il].midBuf.Free()
 		}
+	}
+}
+
+// BatchedExpertBufs holds contiguous GPU memory for batched expert dispatch.
+type BatchedExpertBufs struct {
+	GateBuf  CUdeviceptr // contiguous gate weights for N experts
+	UpBuf    CUdeviceptr // contiguous up weights
+	DownBuf  CUdeviceptr // contiguous down weights
+	GateOut  *Buffer     // [N*NFFExp] gate output
+	UpOut    *Buffer     // [N*NFFExp] up output
+	DownOut  *Buffer     // [N*NEmbd] down output
+	ActBuf   *Buffer     // [NEmbd] shared activation
+	nExperts int
+}
+
+func NewBatchedExpertBufs(nExperts, inDim, ffnDim int) (*BatchedExpertBufs, error) {
+	EnsureContext()
+	gateSize := (inDim / 256) * 66 * ffnDim
+	upSize := gateSize
+	downSize := (ffnDim / 256) * 84 * inDim
+
+	b := &BatchedExpertBufs{nExperts: nExperts}
+	var err error
+	if err = CuMemAllocRaw(&b.GateBuf, uint64(nExperts*gateSize)); err != nil {
+		return nil, err
+	}
+	if err = CuMemAllocRaw(&b.UpBuf, uint64(nExperts*upSize)); err != nil {
+		return nil, err
+	}
+	if err = CuMemAllocRaw(&b.DownBuf, uint64(nExperts*downSize)); err != nil {
+		return nil, err
+	}
+	b.GateOut, err = Malloc(nExperts * ffnDim)
+	if err != nil {
+		return nil, err
+	}
+	b.UpOut, err = Malloc(nExperts * ffnDim)
+	if err != nil {
+		return nil, err
+	}
+	b.DownOut, err = Malloc(nExperts * inDim)
+	if err != nil {
+		return nil, err
+	}
+	b.ActBuf, err = Malloc(inDim)
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// CopyExpertWeights copies cached expert weights contiguously for batched dispatch.
+func (b *BatchedExpertBufs) CopyExpertWeights(slot int, gatePtr, upPtr, downPtr CUdeviceptr, gateSize, upSize, downSize int) {
+	EnsureContext()
+	cuMemcpyDtoD(CUdeviceptr(uint64(b.GateBuf)+uint64(slot*gateSize)), gatePtr, uint64(gateSize))
+	cuMemcpyDtoD(CUdeviceptr(uint64(b.UpBuf)+uint64(slot*upSize)), upPtr, uint64(upSize))
+	cuMemcpyDtoD(CUdeviceptr(uint64(b.DownBuf)+uint64(slot*downSize)), downPtr, uint64(downSize))
+}
+
+func (b *BatchedExpertBufs) Free() {
+	if b == nil {
+		return
+	}
+	EnsureContext()
+	CuMemFreeRaw(b.GateBuf)
+	CuMemFreeRaw(b.UpBuf)
+	CuMemFreeRaw(b.DownBuf)
+	if b.GateOut != nil {
+		b.GateOut.Free()
+	}
+	if b.UpOut != nil {
+		b.UpOut.Free()
+	}
+	if b.DownOut != nil {
+		b.DownOut.Free()
+	}
+	if b.ActBuf != nil {
+		b.ActBuf.Free()
 	}
 }

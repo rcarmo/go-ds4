@@ -15,6 +15,7 @@ type CUDAEngine struct {
 	outBuf      *gpu.Buffer
 	expertPool  *gpu.ExpertPool
 	expertCache *gpu.ExpertCache
+	batchBufs   *gpu.BatchedExpertBufs
 }
 
 // InitGPU initializes GPU acceleration (CUDA or Vulkan).
@@ -54,6 +55,12 @@ func (e *Engine) InitGPU() error {
 			if err == nil {
 				ce.expertCache = cache
 				fmt.Printf("[gpu] Expert cache ready: %d slots/layer (demand-filled)\n", cachedPerLayer)
+				// Allocate batched expert buffers
+				bb, berr := gpu.NewBatchedExpertBufs(NExpertUsedFast, NEmbd, NFFExp)
+				if berr == nil {
+					ce.batchBufs = bb
+					fmt.Println("[gpu] Batched expert buffers ready")
+				}
 			} else {
 				fmt.Printf("[gpu] expert cache alloc failed: %v\n", err)
 			}
@@ -213,25 +220,30 @@ func (ce *CUDAEngine) Close() {
 	}
 	if ce.expertCache != nil {
 		ce.expertCache.Free()
+		if ce.batchBufs != nil {
+			ce.batchBufs.Free()
+		}
 	}
 	ce.ready = false
 }
 
-// gpuExpertForward runs all expert compute on GPU without CPU round-trips.
-// Gate → Up → SwiGLU → Down all execute on GPU. Single sync at the end.
+// gpuExpertForward batches all experts into single kernel launches.
+// DtoD copies expert weights contiguously, then one IQ2 launch for all gate rows,
+// one IQ2 for all up rows, one SwiGLU, one Q2K for all down rows, single sync.
 func (e *Engine) gpuExpertForward(
 	ds *DecodeState, layer *LayerWeights,
 	experts []expertScore, il int,
 ) bool {
 	ce, ok := e.GPU.(*CUDAEngine)
-	if !ok || !ce.ready || ce.expertCache == nil {
+	if !ok || !ce.ready || ce.expertCache == nil || ce.batchBufs == nil {
 		return false
 	}
 	if !gpu.CudaGemvIQ2Ready() || !gpu.CudaGemvQ2KReady() || !gpu.CudaSwiGLUReady() {
 		return false
 	}
 
-	expertIdxs := make([]int, len(experts))
+	nExp := len(experts)
+	expertIdxs := make([]int, nExp)
 	for i, exp := range experts {
 		expertIdxs[i] = exp.idx
 	}
@@ -242,45 +254,49 @@ func (e *Engine) gpuExpertForward(
 		}
 	}
 
-	actBuf := ce.expertCache.ActBuf(il)
-	outBuf := ce.expertCache.OutBuf(il)
-	midBuf := ce.expertCache.MidBuf(il)
-	gateRowBytes := (NEmbd / 256) * BlockIQ2XXSSize
-	upRowBytes := gateRowBytes
-	downRowBytes := (NFFExp / 256) * BlockQ2KSize
+	gateSize := (NEmbd / 256) * BlockIQ2XXSSize * NFFExp
+	upSize := gateSize
+	downSize := (NFFExp / 256) * BlockQ2KSize * NEmbd
+	gateRowBytes := gateSize // total bytes per expert
+	upRowBytes := upSize
+	downRowBytes := downSize
+	bb := ce.batchBufs
 
-	// Single activation upload
-	actBuf.Upload(ds.FfnNormed)
-
-	for _, exp := range experts {
+	// DtoD copy: concatenate expert weights contiguously (~70Âµs for 4 experts)
+	for slot, exp := range experts {
 		gatePtr, upPtr, downPtr, _ := ce.expertCache.Get(il, exp.idx)
+		bb.CopyExpertWeights(slot, gatePtr, upPtr, downPtr, gateSize, upSize, downSize)
+	}
 
-		// All on GPU, no sync between:
-		// 1. IQ2 gate: actBuf → outBuf [NFFExp]
-		gpu.CUDAMatvecIQ2(outBuf, actBuf, gatePtr, NEmbd, NFFExp, gateRowBytes*NFFExp)
-		// 2. IQ2 up: actBuf → midBuf [NFFExp]
-		gpu.CUDAMatvecIQ2(midBuf, actBuf, upPtr, NEmbd, NFFExp, upRowBytes*NFFExp)
-		// 3. SwiGLU on GPU: outBuf = silu(outBuf) * midBuf
-		gpu.CUDASwiGLU(outBuf, outBuf, midBuf, NFFExp)
-		// 4. Q2K down: outBuf[NFFExp] → midBuf reused as act → ...
-		// Need outBuf as activation for Q2K. But outBuf has NFFExp=2048 floats, actBuf has NEmbd=4096.
-		// Use midBuf as the SwiGLU output, feed to Q2K:
-		// Actually: after SwiGLU, outBuf has the hidden state [NFFExp].
-		// Q2K down: weight[NEmbd, NFFExp] × hidden[NFFExp] → result[NEmbd]
-		// We need a separate buffer for Q2K input (outBuf) and output.
-		// Reuse actBuf (which we no longer need for this expert):
-		gpu.CUDAMatvecQ2K(actBuf, outBuf, downPtr, NFFExp, NEmbd, downRowBytes*NEmbd)
+	// Upload activation once
+	bb.ActBuf.Upload(ds.FfnNormed)
 
-		// Only sync + download at the end of this expert
-		gpu.Sync()
-		result := ds.ExpertOut[:NEmbd]
-		actBuf.Download(result)
+	// Batched gate: nExp*NFFExp output rows, each reading from its expert slice
+	// The kernel processes rows sequentially; row r reads weight at offset r*rowBytes
+	// where rowBytes = per-row IQ2 size. The batched buffer has expert weights
+	// concatenated, so rows 0..NFFExp-1 are expert 0, NFFExp..2*NFFExp-1 are expert 1, etc.
+	gpu.CUDAMatvecIQ2(bb.GateOut, bb.ActBuf, bb.GateBuf, NEmbd, nExp*NFFExp, gateRowBytes)
+
+	// Batched up
+	gpu.CUDAMatvecIQ2(bb.UpOut, bb.ActBuf, bb.UpBuf, NEmbd, nExp*NFFExp, upRowBytes)
+
+	// Batched SwiGLU on all nExp*NFFExp elements
+	gpu.CUDASwiGLU(bb.GateOut, bb.GateOut, bb.UpOut, nExp*NFFExp)
+
+	// Batched Q2K down: nExp*NEmbd output rows
+	gpu.CUDAMatvecQ2K(bb.DownOut, bb.GateOut, bb.DownBuf, NFFExp, nExp*NEmbd, downRowBytes)
+
+	// Single sync + download
+	gpu.Sync()
+	result := make([]float32, nExp*NEmbd)
+	bb.DownOut.Download(result)
+
+	// Accumulate per-expert results with weights
+	for slot, exp := range experts {
+		off := slot * NEmbd
 		for i := 0; i < NEmbd; i++ {
-			ds.RoutedOut[i] += exp.score * result[i]
+			ds.RoutedOut[i] += exp.score * result[off+i]
 		}
-
-		// Restore activation for next expert
-		actBuf.Upload(ds.FfnNormed)
 	}
 	return true
 }
