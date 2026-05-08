@@ -33,10 +33,11 @@ func layerFFNDecode(
 	QuantizeRowQ8K(ds.FfnNormed, ds.RoutedXQ)
 
 	// 3. Expert routing — select top-K experts
-	experts := routeExperts(ds.FfnNormed, layer, il, tokenID)
+	experts := routeExperts(ds, ds.FfnNormed, layer, il, tokenID)
 
 	// Prefetch selected expert pages
-	activeIDs := make([]int, len(experts))
+	var activeIDsBuf [NExpertUsed]int
+	activeIDs := activeIDsBuf[:len(experts)]
 	for i, e := range experts {
 		activeIDs[i] = e.idx
 	}
@@ -88,14 +89,20 @@ func layerFFNDecode(
 }
 
 // routeExperts selects the top-K experts for a token.
-func routeExperts(normed []float32, layer *LayerWeights, il, tokenID int) []expertScore {
+func routeExperts(ds *DecodeState, normed []float32, layer *LayerWeights, il, tokenID int) []expertScore {
 	// Check for hash routing (3 hash layers)
 	if layer.FfnGateTid2Eid != nil {
-		return hashRouteExperts(layer, tokenID)
+		table := unsafe.Slice((*int32)(unsafe.Pointer(&layer.FfnGateTid2Eid[0])), NExpertUsed*NVocab)
+		top := ds.RouteScores[:NExpertUsed]
+		w := float32(1.0 / float32(NExpertUsed))
+		for k := 0; k < NExpertUsed; k++ {
+			top[k] = expertScore{idx: int(table[k*NVocab+tokenID]), score: w}
+		}
+		return top
 	}
 
 	// Standard routing: F16 matmul normed → 256 expert logits
-	logits := make([]float32, NExpert)
+	logits := ds.RouteLogits
 	gateU16 := unsafe.Slice((*uint16)(unsafe.Pointer(&layer.FfnGateInp[0])), NExpert*NEmbd)
 	for e := 0; e < NExpert; e++ {
 		row := gateU16[e*NEmbd : (e+1)*NEmbd]
@@ -119,7 +126,7 @@ func routeExperts(normed []float32, layer *LayerWeights, il, tokenID int) []expe
 	}
 
 	// Top-K selection
-	scores := make([]expertScore, NExpert)
+	scores := ds.RouteScores
 	for i := range scores {
 		scores[i] = expertScore{idx: i, score: logits[i]}
 	}
@@ -176,11 +183,17 @@ func expertForwardFast(out []float32, xQ8K, midQ []byte,
 		prefix := fmt.Sprintf("blk.%d.", il)
 		var err error
 		gateBase, err = streamer.ReadExpertTensor(model.Tensors[prefix+"ffn_gate_exps.weight"], expertIdx)
-		if err != nil { return }
+		if err != nil {
+			return
+		}
 		upBase, err = streamer.ReadExpertTensor(model.Tensors[prefix+"ffn_up_exps.weight"], expertIdx)
-		if err != nil { return }
+		if err != nil {
+			return
+		}
 		downBase, err = streamer.ReadExpertTensor(model.Tensors[prefix+"ffn_down_exps.weight"], expertIdx)
-		if err != nil { return }
+		if err != nil {
+			return
+		}
 		defer func() {
 			streamer.ReturnBuffer(gateBase)
 			streamer.ReturnBuffer(upBase)
@@ -229,11 +242,17 @@ func expertForwardInto(out []float32, xQ8K, midQ []byte,
 		downTensor := model.Tensors[prefix+"ffn_down_exps.weight"]
 		var err error
 		gateBase, err = streamer.ReadExpertTensor(gateTensor, expertIdx)
-		if err != nil { return }
+		if err != nil {
+			return
+		}
 		upBase, err = streamer.ReadExpertTensor(upTensor, expertIdx)
-		if err != nil { return }
+		if err != nil {
+			return
+		}
 		downBase, err = streamer.ReadExpertTensor(downTensor, expertIdx)
-		if err != nil { return }
+		if err != nil {
+			return
+		}
 		defer func() {
 			streamer.ReturnBuffer(gateBase)
 			streamer.ReturnBuffer(upBase)
@@ -258,8 +277,12 @@ func expertForwardInto(out []float32, xQ8K, midQ []byte,
 	swiGLU(gate, gate, up)
 
 	for i := range gate {
-		if gate[i] > SwiGLUClampExp { gate[i] = SwiGLUClampExp }
-		if gate[i] < -SwiGLUClampExp { gate[i] = -SwiGLUClampExp }
+		if gate[i] > SwiGLUClampExp {
+			gate[i] = SwiGLUClampExp
+		}
+		if gate[i] < -SwiGLUClampExp {
+			gate[i] = -SwiGLUClampExp
+		}
 	}
 
 	QuantizeRowQ8K(gate, midQ)
@@ -348,17 +371,11 @@ func expertForward(ds *DecodeState, layer *LayerWeights, expertIdx int, weight f
 
 // sharedExpertForward runs the always-active shared expert (Q8_0).
 func sharedExpertForward(ds *DecodeState, layer *LayerWeights) {
-	// Gate: Q8_0 [NFFExp, NEmbd]
-	gate := make([]float32, NFFExp)
-	up := make([]float32, NFFExp)
-
+	gate := ds.SharedGate
+	up := ds.SharedUp
 	matvecQ8_0(gate, layer.FfnGateShexp, ds.FfnNormed, NEmbd, NFFExp)
 	matvecQ8_0(up, layer.FfnUpShexp, ds.FfnNormed, NEmbd, NFFExp)
-
-	// SwiGLU
 	swiGLU(gate, gate, up)
-
-	// Down: Q8_0 [NEmbd, NFFExp]
 	matvecQ8_0(ds.SharedOut, layer.FfnDownShexp, gate, NFFExp, NEmbd)
 }
 
@@ -376,7 +393,7 @@ func layerForwardDecode(
 	model.PrefetchLayer(il)
 
 	// Save residual HC for attention sublayer
-	attnResidual := make([]float32, hcDim)
+	attnResidual := ds.AttnResidual
 	copy(attnResidual, ds.CurHC[:hcDim])
 
 	// HC pre → attention input
@@ -384,6 +401,7 @@ func layerForwardDecode(
 		ds.AttnNormed, ds.Post, ds.Comb,
 		attnResidual,
 		layer.HCAttnFn, layer.HCAttnScale, layer.HCAttnBase,
+		ds.HCFlat, ds.HCMix,
 	)
 
 	// Run MLA attention
@@ -393,7 +411,7 @@ func layerForwardDecode(
 	hcPostOne(ds.NextHC, ds.AttnOut, attnResidual, ds.Post, ds.Comb)
 
 	// Save FFN residual
-	ffnResidual := make([]float32, hcDim)
+	ffnResidual := ds.FfnResidual
 	copy(ffnResidual, ds.NextHC[:hcDim])
 
 	// HC pre → FFN input
@@ -401,35 +419,36 @@ func layerForwardDecode(
 		ds.FfnNormed, ds.Post, ds.Comb,
 		ffnResidual,
 		layer.HCFfnFn, layer.HCFfnScale, layer.HCFfnBase,
+		ds.HCFlat, ds.HCMix,
 	)
 
 	// Run MoE FFN
 	layerFFNDecode(ds, layer, model, budget, streamer, il, tokenID)
 
 	// HC post (routed + shared → HC state)
-	hcPostSumOne(ds.CurHC, ds.RoutedOut, ds.SharedOut, ffnResidual, ds.Post, ds.Comb)
+	hcPostSumOne(ds.CurHC, ds.RoutedOut, ds.SharedOut, ffnResidual, ds.Post, ds.Comb, ds.HCSumTmp)
 }
 
 // outputLogits computes the LM head: HC collapse → RMSNorm → Q8_0 matmul → logits.
-func outputLogits(logits []float32, hcState []float32, w *Weights) {
-	// 1. HC head collapse: sigmoid-weighted sum of 4 streams
+func outputLogits(ds *DecodeState, logits []float32, hcState []float32, w *Weights) {
 	hcBase := tensorF32Unsafe(w.OutputHCBase)
 	hcScale := tensorF32Unsafe(w.OutputHCScale)
 	hcFnU16 := unsafe.Slice((*uint16)(unsafe.Pointer(&w.OutputHCFn[0])), hcDim*NHC)
 
-	// Project HC flat → NHC weights
-	flat := make([]float32, hcDim)
+	flat := ds.OutFlat
 	copy(flat, hcState[:hcDim])
 	rmsNormNoScale(flat)
 
-	hcWeights := make([]float32, NHC)
+	hcWeights := ds.OutHCWeights
 	for j := 0; j < NHC; j++ {
 		row := hcFnU16[j*hcDim : (j+1)*hcDim]
 		hcWeights[j] = sigmoid(hcScale[0]*DotF16(row, flat) + hcBase[j])
 	}
 
-	// Weighted sum: collapsed[NEmbd] = Σ hcWeights[s] * hcState[s*NEmbd:]
-	collapsed := make([]float32, NEmbd)
+	collapsed := ds.OutCollapsed
+	for i := range collapsed {
+		collapsed[i] = 0
+	}
 	for s := 0; s < NHC; s++ {
 		wt := hcWeights[s]
 		for i := 0; i < NEmbd; i++ {
@@ -437,11 +456,8 @@ func outputLogits(logits []float32, hcState []float32, w *Weights) {
 		}
 	}
 
-	// 2. Output RMSNorm
 	outputNormW := tensorF32Unsafe(w.OutputNorm)
 	rmsNorm(collapsed, outputNormW)
-
-	// 3. Output projection: Q8_0 [NEmbd, NVocab]
 	matvecQ8_0(logits, w.Output, collapsed, NEmbd, NVocab)
 }
 

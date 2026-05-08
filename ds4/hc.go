@@ -11,10 +11,10 @@ const hcDim = NHC * NEmbd
 const hcMixDim = 2*NHC + NHC*NHC
 
 // hcPreFromState computes the HC pre-step:
-//   1. Flatten HC state [NHC, NEmbd] → RMSNorm
-//   2. Project through fn (F16) → mix params [hcMixDim]
-//   3. Sigmoid + scale → pre[NHC], post[NHC], comb[NHC²]
-//   4. out = Σ_s (pre[s] * state[s])
+//  1. Flatten HC state [NHC, NEmbd] → RMSNorm
+//  2. Project through fn (F16) → mix params [hcMixDim]
+//  3. Sigmoid + scale → pre[NHC], post[NHC], comb[NHC²]
+//  4. out = Σ_s (pre[s] * state[s])
 //
 // fn: F16 [hcDim, hcMixDim], scale: F32 [3], base: F32 [hcMixDim]
 func hcPreFromState(
@@ -25,14 +25,16 @@ func hcPreFromState(
 	fn []byte, // F16 weights
 	scaleTensor []byte, // F32 [3]
 	baseTensor []byte, // F32 [hcMixDim]
+	flatScratch []float32, // [hcDim]
+	mixScratch []float32, // [hcMixDim]
 ) {
 	// 1. Flatten + RMSNorm
-	flat := make([]float32, hcDim)
+	flat := flatScratch[:hcDim]
 	copy(flat, residualHC[:hcDim])
 	rmsNormNoScale(flat)
 
 	// 2. Project: mix[hcMixDim] = flat · fn^T
-	mix := make([]float32, hcMixDim)
+	mix := mixScratch[:hcMixDim]
 	fnU16 := unsafe.Slice((*uint16)(unsafe.Pointer(&fn[0])), hcDim*hcMixDim)
 	for j := 0; j < hcMixDim; j++ {
 		row := fnU16[j*hcDim : (j+1)*hcDim]
@@ -85,7 +87,8 @@ func hcPreFromState(
 }
 
 // hcPostOne injects a sublayer output into the HC state and mixes streams.
-//   outHC[s] = post[s] * blockOut + Σ_t (comb[s*NHC+t] * residualHC[t])
+//
+//	outHC[s] = post[s] * blockOut + Σ_t (comb[s*NHC+t] * residualHC[t])
 func hcPostOne(
 	outHC []float32, // [NHC, NEmbd] — updated HC state
 	blockOut []float32, // [NEmbd] — sublayer output
@@ -112,10 +115,11 @@ func hcPostSumOne(
 	routedOut, sharedOut []float32,
 	residualHC []float32,
 	post, comb []float32,
+	tmp []float32,
 ) {
-	tmp := make([]float32, NEmbd)
+	t := tmp[:NEmbd]
 	for i := 0; i < NEmbd; i++ {
-		tmp[i] = routedOut[i] + sharedOut[i]
+		t[i] = routedOut[i] + sharedOut[i]
 	}
-	hcPostOne(outHC, tmp, residualHC, post, comb)
+	hcPostOne(outHC, t, residualHC, post, comb)
 }

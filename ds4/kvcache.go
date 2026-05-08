@@ -18,10 +18,10 @@ type LayerCache struct {
 	CompStateScore []float32
 
 	// Indexer compressed KV (ratio-4 layers only)
-	IndexCompKV        []float32 // [compCap, NIndexerHeadDim]
-	NIndexComp         int
-	IndexStateKV       []float32
-	IndexStateScore    []float32
+	IndexCompKV     []float32 // [compCap, NIndexerHeadDim]
+	NIndexComp      int
+	IndexStateKV    []float32
+	IndexStateScore []float32
 }
 
 // KVCache holds the full KV cache across all layers.

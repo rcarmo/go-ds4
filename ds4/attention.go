@@ -40,38 +40,49 @@ type DecodeState struct {
 	IndexAllowed    []bool    // [ctx/4+2]
 
 	// FFN / MoE
-	FfnNormed  []float32 // [NEmbd]
-	RoutedXQ   []byte    // Q8_K quantized activation for experts
-	RoutedMidQ []byte    // Q8_K quantized expert hidden
-	RoutedOut  []float32 // [NEmbd] routed expert output
-	SharedOut  []float32 // [NEmbd] shared expert output
-	GateUp     []float32 // [NFFExp] gate/up intermediate
+	FfnNormed   []float32     // [NEmbd]
+	RoutedXQ    []byte        // Q8_K quantized activation for experts
+	RoutedMidQ  []byte        // Q8_K quantized expert hidden
+	RoutedOut   []float32     // [NEmbd] routed expert output
+	SharedOut   []float32     // [NEmbd] shared expert output
+	SharedGate  []float32     // [NFFExp] shared expert gate scratch
+	SharedUp    []float32     // [NFFExp] shared expert up scratch
+	RouteLogits []float32     // [NExpert] routing logits scratch
+	RouteScores []expertScore // [NExpert] routing score scratch
 
-	// HC scratch
-	Post []float32 // [NHC]
-	Comb []float32 // [NHC * NHC]
+	// HC/output scratch
+	AttnResidual []float32 // [NHC*NEmbd]
+	FfnResidual  []float32 // [NHC*NEmbd]
+	OutFlat      []float32 // [NHC*NEmbd]
+	OutHCWeights []float32 // [NHC]
+	OutCollapsed []float32 // [NEmbd]
+	HCFlat       []float32 // [NHC*NEmbd] HC pre scratch
+	HCMix        []float32 // [2*NHC+NHC^2] HC pre scratch
+	HCSumTmp     []float32 // [NEmbd] HC post sum scratch
+	Post         []float32 // [NHC]
+	Comb         []float32 // [NHC * NHC]
 }
 
 // NewDecodeState allocates decode buffers for a given context size.
 func NewDecodeState(ctxSize int) *DecodeState {
 	maxScores := NSWA + ctxSize/2 + 2 // raw + max compressed
 	return &DecodeState{
-		CurHC:      make([]float32, hcDim),
-		NextHC:     make([]float32, hcDim),
-		AttnNormed: make([]float32, NEmbd),
-		QR:         make([]float32, NLoraQ),
-		QRNorm:     make([]float32, NLoraQ),
-		Q:          make([]float32, NHead*NHeadDim),
-		KV:         make([]float32, NHeadDim),
-		Heads:      make([]float32, NHead*NHeadDim),
-		AttnOut:    make([]float32, NEmbd),
-		AttnScore:  make([]float32, maxScores),
-		KVCacheRow: make([]float32, NHeadDim),
-		TmpLoRA:    make([]float32, NLoraO),
-		CompKVCur:  make([]float32, 2*NHeadDim),
-		CompScoreCur: make([]float32, 2*NHeadDim),
-		CompPooled: make([]float32, NHeadDim),
-		CompOut:    make([]float32, NHeadDim),
+		CurHC:           make([]float32, hcDim),
+		NextHC:          make([]float32, hcDim),
+		AttnNormed:      make([]float32, NEmbd),
+		QR:              make([]float32, NLoraQ),
+		QRNorm:          make([]float32, NLoraQ),
+		Q:               make([]float32, NHead*NHeadDim),
+		KV:              make([]float32, NHeadDim),
+		Heads:           make([]float32, NHead*NHeadDim),
+		AttnOut:         make([]float32, NEmbd),
+		AttnScore:       make([]float32, maxScores),
+		KVCacheRow:      make([]float32, NHeadDim),
+		TmpLoRA:         make([]float32, NLoraO),
+		CompKVCur:       make([]float32, 2*NHeadDim),
+		CompScoreCur:    make([]float32, 2*NHeadDim),
+		CompPooled:      make([]float32, NHeadDim),
+		CompOut:         make([]float32, NHeadDim),
 		IndexCompKVCur:  make([]float32, 2*NIndexerHeadDim),
 		IndexCompScore:  make([]float32, 2*NIndexerHeadDim),
 		IndexCompPooled: make([]float32, NIndexerHeadDim),
@@ -80,14 +91,25 @@ func NewDecodeState(ctxSize int) *DecodeState {
 		IndexWeights:    make([]float32, NIndexerHead),
 		IndexScores:     make([]float32, ctxSize/4+2),
 		IndexAllowed:    make([]bool, ctxSize/4+2),
-		FfnNormed:  make([]float32, NEmbd),
-		RoutedXQ:   make([]byte, (NEmbd/QK_K)*BlockQ8KSize),
-		RoutedMidQ: make([]byte, NExpertUsed*(NFFExp/QK_K)*BlockQ8KSize),
-		RoutedOut:  make([]float32, NEmbd),
-		SharedOut:  make([]float32, NEmbd),
-		GateUp:     make([]float32, NFFExp),
-		Post:       make([]float32, NHC),
-		Comb:       make([]float32, NHC*NHC),
+		FfnNormed:       make([]float32, NEmbd),
+		RoutedXQ:        make([]byte, (NEmbd/QK_K)*BlockQ8KSize),
+		RoutedMidQ:      make([]byte, NExpertUsed*(NFFExp/QK_K)*BlockQ8KSize),
+		RoutedOut:       make([]float32, NEmbd),
+		SharedOut:       make([]float32, NEmbd),
+		SharedGate:      make([]float32, NFFExp),
+		SharedUp:        make([]float32, NFFExp),
+		RouteLogits:     make([]float32, NExpert),
+		RouteScores:     make([]expertScore, NExpert),
+		AttnResidual:    make([]float32, hcDim),
+		FfnResidual:     make([]float32, hcDim),
+		OutFlat:         make([]float32, hcDim),
+		OutHCWeights:    make([]float32, NHC),
+		OutCollapsed:    make([]float32, NEmbd),
+		HCFlat:          make([]float32, hcDim),
+		HCMix:           make([]float32, hcMixDim),
+		HCSumTmp:        make([]float32, NEmbd),
+		Post:            make([]float32, NHC),
+		Comb:            make([]float32, NHC*NHC),
 	}
 }
 

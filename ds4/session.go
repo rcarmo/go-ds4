@@ -1,23 +1,23 @@
 package ds4
 
 import (
-	"unsafe"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
 	"math/rand/v2"
+	"unsafe"
 )
 
 // Session holds the mutable inference state for one generation timeline.
 type Session struct {
-	Engine   *Engine
-	KV       *KVCache
-	Decode   *DecodeState
-	Tokens   []int // full token history
-	Pos      int   // current position in sequence
-	CtxSize  int
-	Logits   []float32 // [NVocab] last logits
+	Engine  *Engine
+	KV      *KVCache
+	Decode  *DecodeState
+	Tokens  []int // full token history
+	Pos     int   // current position in sequence
+	CtxSize int
+	Logits  []float32 // [NVocab] last logits
 }
 
 // Engine holds the loaded model and weights.
@@ -31,10 +31,10 @@ type Engine struct {
 
 // EngineOptions configures engine loading.
 type EngineOptions struct {
-	ModelPath    string
-	MaxRSSMB     int  // 0 = unlimited
-	PinNonExpert bool // mlock non-expert weights (~6.5 GB)
-	EvictExperts bool // MADV_DONTNEED cold experts after each layer
+	ModelPath     string
+	MaxRSSMB      int  // 0 = unlimited
+	PinNonExpert  bool // mlock non-expert weights (~6.5 GB)
+	EvictExperts  bool // MADV_DONTNEED cold experts after each layer
 	StreamExperts bool // read expert weights from disk instead of mmap
 }
 
@@ -152,7 +152,7 @@ func (s *Session) Eval(token int) {
 	}
 
 	// Output logits
-	outputLogits(s.Logits, s.Decode.CurHC, s.Engine.Weights)
+	outputLogits(s.Decode, s.Logits, s.Decode.CurHC, s.Engine.Weights)
 
 	s.Pos++
 }
@@ -285,7 +285,6 @@ func partialTopK(all []scored, k int) {
 	}
 }
 
-
 // Rewind resets the session to a given position (for prefix reuse).
 func (s *Session) Rewind(pos int) {
 	if pos < s.Pos {
@@ -304,28 +303,66 @@ func (s *Session) Invalidate() {
 // SavePayload writes the session KV state to a writer.
 func (s *Session) SavePayload(w io.Writer) error {
 	// Header
-	binary.Write(w, binary.LittleEndian, uint32(0x34565344)) // "DSV4"
-	binary.Write(w, binary.LittleEndian, uint32(1))           // version
-	binary.Write(w, binary.LittleEndian, uint32(s.Pos))
-	binary.Write(w, binary.LittleEndian, uint32(s.CtxSize))
+	if err := binary.Write(w, binary.LittleEndian, uint32(0x34565344)); err != nil { // "DSV4"
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint32(2)); err != nil { // version
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint32(s.Pos)); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint32(s.CtxSize)); err != nil {
+		return err
+	}
 
 	// Per-layer KV data
 	for il := 0; il < NLayer; il++ {
 		lc := &s.KV.Layer[il]
-		binary.Write(w, binary.LittleEndian, uint32(lc.NRaw))
-		binary.Write(w, binary.LittleEndian, lc.RawKV)
+		if err := binary.Write(w, binary.LittleEndian, uint32(lc.NRaw)); err != nil {
+			return err
+		}
+		if err := binary.Write(w, binary.LittleEndian, lc.RawKV); err != nil {
+			return err
+		}
 		if lc.CompressRatio > 0 {
-			binary.Write(w, binary.LittleEndian, uint32(lc.NComp))
-			binary.Write(w, binary.LittleEndian, lc.CompKV)
-			binary.Write(w, binary.LittleEndian, lc.CompStateKV)
-			binary.Write(w, binary.LittleEndian, lc.CompStateScore)
+			if err := binary.Write(w, binary.LittleEndian, uint32(lc.NComp)); err != nil {
+				return err
+			}
+			if err := binary.Write(w, binary.LittleEndian, lc.CompKV); err != nil {
+				return err
+			}
+			if err := binary.Write(w, binary.LittleEndian, lc.CompStateKV); err != nil {
+				return err
+			}
+			if err := binary.Write(w, binary.LittleEndian, lc.CompStateScore); err != nil {
+				return err
+			}
+			if lc.CompressRatio == 4 {
+				if err := binary.Write(w, binary.LittleEndian, uint32(lc.NIndexComp)); err != nil {
+					return err
+				}
+				if err := binary.Write(w, binary.LittleEndian, lc.IndexCompKV); err != nil {
+					return err
+				}
+				if err := binary.Write(w, binary.LittleEndian, lc.IndexStateKV); err != nil {
+					return err
+				}
+				if err := binary.Write(w, binary.LittleEndian, lc.IndexStateScore); err != nil {
+					return err
+				}
+			}
 		}
 	}
 
 	// Token history
-	binary.Write(w, binary.LittleEndian, uint32(len(s.Tokens)))
+	if err := binary.Write(w, binary.LittleEndian, uint32(len(s.Tokens))); err != nil {
+		return err
+	}
 	for _, t := range s.Tokens {
-		binary.Write(w, binary.LittleEndian, int32(t))
+		if err := binary.Write(w, binary.LittleEndian, int32(t)); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -334,39 +371,90 @@ func (s *Session) SavePayload(w io.Writer) error {
 // LoadPayload restores session KV state from a reader.
 func (s *Session) LoadPayload(r io.Reader) error {
 	var magic, version, pos, ctxSize uint32
-	binary.Read(r, binary.LittleEndian, &magic)
+	if err := binary.Read(r, binary.LittleEndian, &magic); err != nil {
+		return err
+	}
 	if magic != 0x34565344 {
 		return fmt.Errorf("bad session magic 0x%08x", magic)
 	}
-	binary.Read(r, binary.LittleEndian, &version)
-	binary.Read(r, binary.LittleEndian, &pos)
-	binary.Read(r, binary.LittleEndian, &ctxSize)
+	if err := binary.Read(r, binary.LittleEndian, &version); err != nil {
+		return err
+	}
+	if version != 1 && version != 2 {
+		return fmt.Errorf("unsupported session version %d", version)
+	}
+	if err := binary.Read(r, binary.LittleEndian, &pos); err != nil {
+		return err
+	}
+	if err := binary.Read(r, binary.LittleEndian, &ctxSize); err != nil {
+		return err
+	}
 
+	if s.CtxSize != int(ctxSize) || s.KV == nil {
+		s.CtxSize = int(ctxSize)
+		s.KV = NewKVCache(s.CtxSize)
+	}
 	s.Pos = int(pos)
-	s.CtxSize = int(ctxSize)
 
 	for il := 0; il < NLayer; il++ {
 		lc := &s.KV.Layer[il]
 		var nRaw uint32
-		binary.Read(r, binary.LittleEndian, &nRaw)
+		if err := binary.Read(r, binary.LittleEndian, &nRaw); err != nil {
+			return err
+		}
 		lc.NRaw = int(nRaw)
-		binary.Read(r, binary.LittleEndian, lc.RawKV)
+		if err := binary.Read(r, binary.LittleEndian, lc.RawKV); err != nil {
+			return err
+		}
 		if lc.CompressRatio > 0 {
 			var nComp uint32
-			binary.Read(r, binary.LittleEndian, &nComp)
+			if err := binary.Read(r, binary.LittleEndian, &nComp); err != nil {
+				return err
+			}
 			lc.NComp = int(nComp)
-			binary.Read(r, binary.LittleEndian, lc.CompKV)
-			binary.Read(r, binary.LittleEndian, lc.CompStateKV)
-			binary.Read(r, binary.LittleEndian, lc.CompStateScore)
+			if err := binary.Read(r, binary.LittleEndian, lc.CompKV); err != nil {
+				return err
+			}
+			if err := binary.Read(r, binary.LittleEndian, lc.CompStateKV); err != nil {
+				return err
+			}
+			if err := binary.Read(r, binary.LittleEndian, lc.CompStateScore); err != nil {
+				return err
+			}
+			if lc.CompressRatio == 4 {
+				if version >= 2 {
+					var nIndexComp uint32
+					if err := binary.Read(r, binary.LittleEndian, &nIndexComp); err != nil {
+						return err
+					}
+					lc.NIndexComp = int(nIndexComp)
+					if err := binary.Read(r, binary.LittleEndian, lc.IndexCompKV); err != nil {
+						return err
+					}
+					if err := binary.Read(r, binary.LittleEndian, lc.IndexStateKV); err != nil {
+						return err
+					}
+					if err := binary.Read(r, binary.LittleEndian, lc.IndexStateScore); err != nil {
+						return err
+					}
+				} else {
+					// v1 payloads had no indexer state
+					lc.NIndexComp = 0
+				}
+			}
 		}
 	}
 
 	var nTokens uint32
-	binary.Read(r, binary.LittleEndian, &nTokens)
+	if err := binary.Read(r, binary.LittleEndian, &nTokens); err != nil {
+		return err
+	}
 	s.Tokens = make([]int, nTokens)
 	for i := range s.Tokens {
 		var t int32
-		binary.Read(r, binary.LittleEndian, &t)
+		if err := binary.Read(r, binary.LittleEndian, &t); err != nil {
+			return err
+		}
 		s.Tokens[i] = int(t)
 	}
 
