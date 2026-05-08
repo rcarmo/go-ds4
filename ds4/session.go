@@ -306,7 +306,7 @@ func (s *Session) SavePayload(w io.Writer) error {
 	if err := binary.Write(w, binary.LittleEndian, uint32(0x34565344)); err != nil { // "DSV4"
 		return err
 	}
-	if err := binary.Write(w, binary.LittleEndian, uint32(2)); err != nil { // version
+	if err := binary.Write(w, binary.LittleEndian, uint32(3)); err != nil { // version
 		return err
 	}
 	if err := binary.Write(w, binary.LittleEndian, uint32(s.Pos)); err != nil {
@@ -320,6 +320,9 @@ func (s *Session) SavePayload(w io.Writer) error {
 	for il := 0; il < NLayer; il++ {
 		lc := &s.KV.Layer[il]
 		if err := binary.Write(w, binary.LittleEndian, uint32(lc.NRaw)); err != nil {
+			return err
+		}
+		if err := binary.Write(w, binary.LittleEndian, uint32(lc.RawWrite)); err != nil {
 			return err
 		}
 		if err := binary.Write(w, binary.LittleEndian, lc.RawKV); err != nil {
@@ -380,7 +383,7 @@ func (s *Session) LoadPayload(r io.Reader) error {
 	if err := binary.Read(r, binary.LittleEndian, &version); err != nil {
 		return err
 	}
-	if version != 1 && version != 2 {
+	if version != 1 && version != 2 && version != 3 {
 		return fmt.Errorf("unsupported session version %d", version)
 	}
 	if err := binary.Read(r, binary.LittleEndian, &pos); err != nil {
@@ -403,6 +406,15 @@ func (s *Session) LoadPayload(r io.Reader) error {
 			return err
 		}
 		lc.NRaw = int(nRaw)
+		if version >= 3 {
+			var rawWrite uint32
+			if err := binary.Read(r, binary.LittleEndian, &rawWrite); err != nil {
+				return err
+			}
+			lc.RawWrite = int(rawWrite) % lc.CapRaw
+		} else {
+			lc.RawWrite = lc.NRaw % lc.CapRaw
+		}
 		if err := binary.Read(r, binary.LittleEndian, lc.RawKV); err != nil {
 			return err
 		}

@@ -2,10 +2,11 @@ package ds4
 
 // LayerCache holds the per-layer KV cache state.
 type LayerCache struct {
-	// Raw SWA (sliding window attention) KV rows
-	RawKV  []float32 // [capRaw, NHeadDim]
-	NRaw   int       // live rows in raw window
-	CapRaw int       // = NSWA (128) or ctx-dependent
+	// Raw SWA (sliding window attention) KV rows, logical ring buffer.
+	RawKV    []float32 // [capRaw, NHeadDim]
+	NRaw     int       // live rows in raw window (<= CapRaw)
+	CapRaw   int       // = NSWA (128) or ctx-dependent
+	RawWrite int       // next physical write slot in RawKV
 
 	// Compressed KV (for layers with compress_ratio > 0)
 	CompressRatio int       // 0=none, 2=2:1, 4=4:1
@@ -86,16 +87,36 @@ func layerCompressRatio(il int) int {
 	return 128
 }
 
-// PushRawKV appends a new KV row to the sliding window in chronological order.
-// Mirrors ds4.c behavior: append until full, then shift left by one row.
+// PushRawKV appends a new KV row to the raw SWA window using a logical ring.
+// Oldest rows are overwritten when full, with no memmove.
 func (lc *LayerCache) PushRawKV(kv []float32) {
-	if lc.NRaw < lc.CapRaw {
-		copy(lc.RawKV[lc.NRaw*NHeadDim:(lc.NRaw+1)*NHeadDim], kv)
-		lc.NRaw++
-		return
+	idx := lc.RawWrite
+	copy(lc.RawKV[idx*NHeadDim:(idx+1)*NHeadDim], kv)
+	lc.RawWrite++
+	if lc.RawWrite >= lc.CapRaw {
+		lc.RawWrite = 0
 	}
-	copy(lc.RawKV[0:(lc.CapRaw-1)*NHeadDim], lc.RawKV[NHeadDim:lc.CapRaw*NHeadDim])
-	copy(lc.RawKV[(lc.CapRaw-1)*NHeadDim:lc.CapRaw*NHeadDim], kv)
+	if lc.NRaw < lc.CapRaw {
+		lc.NRaw++
+	}
+}
+
+// rawStart returns the physical slot of the oldest row in RawKV.
+func (lc *LayerCache) rawStart() int {
+	start := lc.RawWrite - lc.NRaw
+	if start < 0 {
+		start += lc.CapRaw
+	}
+	return start
+}
+
+// RawRow returns row i in chronological order (0=oldest, NRaw-1=newest).
+func (lc *LayerCache) RawRow(i int) []float32 {
+	idx := lc.rawStart() + i
+	if idx >= lc.CapRaw {
+		idx -= lc.CapRaw
+	}
+	return lc.RawKV[idx*NHeadDim : (idx+1)*NHeadDim]
 }
 
 // PushCompKV appends one compressed attention KV row.

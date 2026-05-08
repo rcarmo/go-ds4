@@ -214,12 +214,17 @@ func layerAttnDecode(
 	sinks := tensorF32Unsafe(layer.AttnSinks)
 	scale := float32(1.0 / math.Sqrt(float64(NHeadDim)))
 
+	rawStart := cache.rawStart()
 	for h := 0; h < NHead; h++ {
 		qHead := ds.Q[h*NHeadDim : (h+1)*NHeadDim]
 		maxScore := sinks[h]
 
 		for t := 0; t < nRaw; t++ {
-			kvRow := cache.RawKV[t*NHeadDim : (t+1)*NHeadDim]
+			idx := rawStart + t
+			if idx >= cache.CapRaw {
+				idx -= cache.CapRaw
+			}
+			kvRow := cache.RawKV[idx*NHeadDim : (idx+1)*NHeadDim]
 			s := simd.Sdot(qHead, kvRow) * scale
 			ds.AttnScore[t] = s
 			if s > maxScore {
@@ -248,7 +253,11 @@ func layerAttnDecode(
 		for t := 0; t < nRaw; t++ {
 			w := float32(math.Exp(float64(ds.AttnScore[t] - maxScore)))
 			denom += w
-			kvRow := cache.RawKV[t*NHeadDim : (t+1)*NHeadDim]
+			idx := rawStart + t
+			if idx >= cache.CapRaw {
+				idx -= cache.CapRaw
+			}
+			kvRow := cache.RawKV[idx*NHeadDim : (idx+1)*NHeadDim]
 			simd.Saxpy(w, kvRow, headOut)
 		}
 		for t := 0; t < nComp; t++ {
