@@ -349,7 +349,32 @@ func matvecAuto(out []float32, w []byte, x []float32, inDim, outDim int) {
 			}
 		})
 	default:
-		// Unknown format — zero output
+		// Try Q6_K
+		q6kRowBytes := ((inDim + QK_K - 1) / QK_K) * 210
+		if bytesPerRow == q6kRowBytes {
+			xQ8K := make([]byte, ((inDim+QK_K-1)/QK_K)*BlockQ8KSize)
+			padded := make([]float32, ((inDim+QK_K-1)/QK_K)*QK_K)
+			copy(padded, x)
+			QuantizeRowQ8K(padded, xQ8K)
+			parallelFor(outDim, func(start, end int) {
+				for o := start; o < end; o++ {
+					row := w[o*bytesPerRow : (o+1)*bytesPerRow]
+					out[o] = VecDotQ6KQ8K(inDim, row, xQ8K)
+				}
+			})
+			return
+		}
+		// Try IQ4_NL
+		iq4RowBytes := ((inDim + QK4_NL - 1) / QK4_NL) * BlockIQ4NLSize
+		if bytesPerRow == iq4RowBytes {
+			parallelFor(outDim, func(start, end int) {
+				for o := start; o < end; o++ {
+					row := w[o*bytesPerRow : (o+1)*bytesPerRow]
+					out[o] = VecDotIQ4NLF32(row, x, inDim)
+				}
+			})
+			return
+		}
 		for i := range out[:outDim] {
 			out[i] = 0
 		}

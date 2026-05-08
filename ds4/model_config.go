@@ -69,7 +69,7 @@ func DS4FlashConfig() *ModelConfig {
 // DS2LiteConfig returns the config for DeepSeek-V2-Lite (16B MoE).
 func DS2LiteConfig() *ModelConfig {
 	return &ModelConfig{
-		NLayer: 27, NEmbd: 2048, NVocab: 100015,
+		NLayer: 27, NEmbd: 2048, NVocab: 102400,
 		NHead: 16, NHeadKV: 1, NHeadDim: 192, NValueDim: 128,
 		NRot: 64, NOutGroup: 4, NLoraQ: 512, NLoraO: 512,
 		NExpert: 64, NExpertUsed: 6, NExpertShared: 2,
@@ -113,6 +113,9 @@ func DetectModelConfig(m *GGUFModel) *ModelConfig {
 		}
 		if v, ok := m.MetaU32("deepseek2.num_experts_per_tok"); ok {
 			cfg.NExpertUsed = int(v)
+		}
+		if v, ok := m.MetaU32("deepseek2.vocab_size"); ok {
+			cfg.NVocab = int(v)
 		}
 		return cfg
 	default:

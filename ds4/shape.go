@@ -85,6 +85,8 @@ func TensorTypeSize(typ uint32) (bytesPerBlock int, elementsPerBlock int) {
 		return BlockIQ2XXSSize, QK_K
 	case TensorIQ4NL:
 		return BlockIQ4NLSize, QK4_NL
+	case TensorQ6_K:
+		return 210, QK_K
 	case TensorI32:
 		return 4, 1
 	default:
@@ -96,4 +98,8 @@ const (
 	TensorIQ4NL    = 20
 	BlockIQ4NLSize = 18 // 2 d(F16) + 16 packed 4-bit (per 32 elements)
 	QK4_NL         = 32
+)
+const (
+	TensorQ6_K   = 14
+	BlockQ6KSize = 210 // QK_K/2 + QK_K/4 + QK_K/16 + 2 = 128+64+16+2 = 210
 )

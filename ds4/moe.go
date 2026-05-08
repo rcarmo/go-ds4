@@ -32,6 +32,8 @@ func layerFFNDecode(
 	// Dense layer (no experts): just run shared expert as standard FFN
 	if len(layer.FfnGateInp) == 0 && len(layer.FfnGateExps) == 0 {
 		sharedExpertForward(ds, layer)
+		if hasNaNF32(ds.SharedOut[:NEmbd]) {
+		}
 		copy(ds.RoutedOut, ds.SharedOut)
 		for i := range ds.SharedOut {
 			ds.SharedOut[i] = 0
@@ -419,10 +421,10 @@ func sharedExpertForward(ds *DecodeState, layer *LayerWeights) {
 	}
 	gate := make([]float32, sharedFFN)
 	up := make([]float32, sharedFFN)
-	matvecQ8_0(gate, layer.FfnGateShexp, ds.FfnNormed, cfg.NEmbd, sharedFFN)
-	matvecQ8_0(up, layer.FfnUpShexp, ds.FfnNormed, cfg.NEmbd, sharedFFN)
+	matvecAuto(gate, layer.FfnGateShexp, ds.FfnNormed, cfg.NEmbd, sharedFFN)
+	matvecAuto(up, layer.FfnUpShexp, ds.FfnNormed, cfg.NEmbd, sharedFFN)
 	swiGLU(gate, gate, up)
-	matvecQ8_0(ds.SharedOut, layer.FfnDownShexp, gate, sharedFFN, cfg.NEmbd)
+	matvecAuto(ds.SharedOut, layer.FfnDownShexp, gate, sharedFFN, cfg.NEmbd)
 }
 
 // layerForwardDecode runs one full transformer layer for a single decode token.
@@ -467,9 +469,7 @@ func layerForwardDecode(
 		normW := tensorF32Unsafe(layer.AttnNorm)
 		copy(ds.AttnCur, ds.CurHC[:cfg.NEmbd])
 		rmsNorm(ds.AttnCur[:cfg.NEmbd], normW[:cfg.NEmbd])
-		copy(ds.AttnNormed, ds.AttnCur)
-		rmsNorm(ds.AttnNormed, normW)
-		layerAttnDecode(ds, layer, cache, model, pos, il)
+		layerAttnDecodeV2(ds, layer, cache, pos, il)
 		for i := 0; i < cfg.NEmbd; i++ {
 			ds.CurHC[i] += ds.AttnOut[i]
 		}
@@ -478,6 +478,10 @@ func layerForwardDecode(
 		copy(ds.FfnNormed, ds.CurHC[:cfg.NEmbd])
 		rmsNorm(ds.FfnNormed[:cfg.NEmbd], ffnNormW[:cfg.NEmbd])
 		layerFFNDecode(ds, layer, model, budget, streamer, il, tokenID, nExperts)
+		if hasNaNF32(ds.SharedOut[:NEmbd]) {
+		}
+		if hasNaNF32(ds.RoutedOut[:cfg.NEmbd]) {
+		}
 		for i := 0; i < cfg.NEmbd; i++ {
 			ds.CurHC[i] += ds.RoutedOut[i] + ds.SharedOut[i]
 		}
@@ -490,21 +494,17 @@ func outputLogits(ds *DecodeState, logits []float32, hcState []float32, w *Weigh
 
 	var collapsed []float32
 	if cfg.NHC > 0 && len(w.OutputHCBase) > 0 {
-		// V4: HC collapse (sigmoid-weighted 4-stream sum)
 		hcBase := tensorF32Unsafe(w.OutputHCBase)
 		hcScale := tensorF32Unsafe(w.OutputHCScale)
 		hcFnU16 := unsafe.Slice((*uint16)(unsafe.Pointer(&w.OutputHCFn[0])), hcDim*NHC)
-
 		flat := ds.OutFlat
 		copy(flat, hcState[:hcDim])
 		rmsNormNoScale(flat)
-
 		hcWeights := ds.OutHCWeights
 		for j := 0; j < NHC; j++ {
 			row := hcFnU16[j*hcDim : (j+1)*hcDim]
 			hcWeights[j] = sigmoid(hcScale[0]*DotF16(row, flat) + hcBase[j])
 		}
-
 		collapsed = ds.OutCollapsed
 		for i := range collapsed {
 			collapsed[i] = 0
@@ -516,17 +516,14 @@ func outputLogits(ds *DecodeState, logits []float32, hcState []float32, w *Weigh
 			}
 		}
 	} else {
-		// V2: no HC, just use stream 0
 		collapsed = make([]float32, cfg.NEmbd)
 		copy(collapsed, hcState[:cfg.NEmbd])
 	}
 
 	outputNormW := tensorF32Unsafe(w.OutputNorm)
-	rmsNorm(collapsed, outputNormW)
+	rmsNorm(collapsed, outputNormW[:cfg.NEmbd])
 	matvecAuto(logits, w.Output, collapsed, cfg.NEmbd, cfg.NVocab)
 }
-
-// Argmax returns the index of the maximum value.
 func Argmax(x []float32) int {
 	best := 0
 	bestVal := x[0]
