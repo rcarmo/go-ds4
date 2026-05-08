@@ -46,27 +46,32 @@ func (e *Engine) InitGPU() error {
 
 func (e *Engine) uploadCUDAWeights(ce *CUDAEngine) (int, int64) {
 	type upload struct {
-		name string
-		data []byte
+		name   string
+		data   []byte
+		outDim int
 	}
-	uploads := []upload{
-		{"output.weight", e.Weights.Output},
-	}
+	var uploads []upload
+
+	// Output head (4096→129280) — biggest single matmul
+	uploads = append(uploads, upload{"output.weight", e.Weights.Output, NVocab})
+
 	for il := 0; il < NLayer; il++ {
 		l := &e.Weights.Layer[il]
-		prefix := fmt.Sprintf("blk.%d.", il)
-		if len(l.AttnQB) > 0 {
-			uploads = append(uploads, upload{prefix + "attn_q_b.weight", l.AttnQB})
-		}
-		if len(l.FfnDownShexp) > 0 {
-			uploads = append(uploads, upload{prefix + "ffn_down_shexp.weight", l.FfnDownShexp})
-		}
+		p := fmt.Sprintf("blk.%d.", il)
+		// Only upload tensors where outDim >= 2048 (GPU crossover)
+		uploads = append(uploads,
+			upload{p + "attn_q_b.weight", l.AttnQB, NHead * NHeadDim},   // 1024→32768
+			upload{p + "attn_output_b.weight", l.AttnOutputB, NEmbd},    // 1024→4096
+			upload{p + "ffn_gate_shexp.weight", l.FfnGateShexp, NFFExp}, // 4096→2048
+			upload{p + "ffn_up_shexp.weight", l.FfnUpShexp, NFFExp},     // 4096→2048
+			upload{p + "ffn_down_shexp.weight", l.FfnDownShexp, NEmbd},  // 2048→4096
+		)
 	}
 
 	uploaded := 0
 	var totalBytes int64
 	for _, u := range uploads {
-		if len(u.data) == 0 {
+		if len(u.data) == 0 || u.outDim < 2048 {
 			continue
 		}
 		var ptr gpu.CUdeviceptr
@@ -115,6 +120,10 @@ func (ce *CUDAEngine) matvecQ8_0(out []float32, tensorName string, x []float32, 
 	if !ce.ready {
 		return false
 	}
+	// Only GPU-dispatch when output is large enough to overcome PCIe overhead
+	if outDim < 2048 {
+		return false
+	}
 	wtPtr, ok := ce.weightPtrs[tensorName]
 	if !ok {
 		return false
@@ -151,7 +160,6 @@ func (ce *CUDAEngine) matvecQ8_0(out []float32, tensorName string, x []float32, 
 	if err := gpu.CUDAMatvecQ8_0(ce.outBuf, ce.actBuf, wtPtr, inDim, outDim, rowBytes); err != nil {
 		return false
 	}
-	gpu.Sync()
 	ce.outBuf.Download(out[:outDim])
 	return true
 }

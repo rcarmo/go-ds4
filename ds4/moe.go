@@ -43,10 +43,18 @@ func layerFFNDecode(
 	}
 	model.PrefetchExperts(il, activeIDs)
 
-	// 4. Run routed experts IN PARALLEL
+	// 4. Run routed experts IN PARALLEL + shared expert overlapped
 	for i := range ds.RoutedOut {
 		ds.RoutedOut[i] = 0
 	}
+
+	// Start shared expert concurrently (independent of routed experts)
+	var sharedWg sync.WaitGroup
+	sharedWg.Add(1)
+	go func() {
+		defer sharedWg.Done()
+		sharedExpertForward(ds, layer)
+	}()
 
 	if len(experts) > 1 {
 		// Parallel with preallocated per-expert scratch (no per-token allocs)
@@ -77,8 +85,8 @@ func layerFFNDecode(
 		expertForward(ds, layer, experts[0].idx, experts[0].score, streamer, model, il)
 	}
 
-	// 5. Run shared expert
-	sharedExpertForward(ds, layer)
+	// 5. Wait for shared expert
+	sharedWg.Wait()
 
 	// 6. Evict cold expert pages to stay within budget
 	if budget != nil {
@@ -371,10 +379,10 @@ func expertForward(ds *DecodeState, layer *LayerWeights, expertIdx int, weight f
 func sharedExpertForward(ds *DecodeState, layer *LayerWeights) {
 	gate := ds.SharedGate
 	up := ds.SharedUp
-	matvecQ8_0(gate, layer.FfnGateShexp, ds.FfnNormed, NEmbd, NFFExp)
-	matvecQ8_0(up, layer.FfnUpShexp, ds.FfnNormed, NEmbd, NFFExp)
+	matvecQ8_0GPULayer(gate, layer.FfnGateShexp, ds.FfnNormed, NEmbd, NFFExp, ds, "ffn_gate_shexp.weight")
+	matvecQ8_0GPULayer(up, layer.FfnUpShexp, ds.FfnNormed, NEmbd, NFFExp, ds, "ffn_up_shexp.weight")
 	swiGLU(gate, gate, up)
-	matvecQ8_0(ds.SharedOut, layer.FfnDownShexp, gate, NFFExp, NEmbd)
+	matvecQ8_0GPULayer(ds.SharedOut, layer.FfnDownShexp, gate, NFFExp, NEmbd, ds, "ffn_down_shexp.weight")
 }
 
 // layerForwardDecode runs one full transformer layer for a single decode token.
@@ -387,6 +395,7 @@ func layerForwardDecode(
 	streamer *DiskStreamer,
 	pos, il, tokenID, nExperts int,
 ) {
+	ds.LayerIdx = il
 	// Prefetch non-expert weights for this layer
 	model.PrefetchLayer(il)
 

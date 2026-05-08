@@ -69,7 +69,8 @@ type DecodeState struct {
 	Comb         []float32 // [NHC * NHC]
 
 	// Engine back-reference (for GPU dispatch)
-	Engine interface{}
+	Engine   interface{}
+	LayerIdx int // current layer index (set during forward pass)
 }
 
 // NewDecodeState allocates decode buffers for a given context size.
@@ -143,7 +144,7 @@ func layerAttnDecode(
 
 	// 2. Q projection: low-rank LoRA
 	// attn_q_a: Q8_0 [NEmbd, NLoraQ] → qr[NLoraQ]
-	matvecQ8_0(ds.QR, layer.AttnQA, ds.AttnNormed, NEmbd, NLoraQ)
+	matvecQ8_0GPULayer(ds.QR, layer.AttnQA, ds.AttnNormed, NEmbd, NLoraQ, ds, "attn_q_a.weight")
 
 	// RMSNorm on qr
 	qrNormW := tensorF32Unsafe(layer.AttnQANorm)
@@ -151,7 +152,7 @@ func layerAttnDecode(
 	rmsNorm(ds.QRNorm, qrNormW)
 
 	// attn_q_b: Q8_0 [NLoraQ, NHead*NHeadDim] → q[NHead*NHeadDim] — GPU if available
-	matvecQ8_0GPU(ds.Q, layer.AttnQB, ds.QRNorm, NLoraQ, NHead*NHeadDim, ds.Engine, "")
+	matvecQ8_0GPULayer(ds.Q, layer.AttnQB, ds.QRNorm, NLoraQ, NHead*NHeadDim, ds, "attn_q_b.weight")
 
 	// Per-head RMSNorm
 	for h := 0; h < NHead; h++ {
@@ -166,7 +167,7 @@ func layerAttnDecode(
 
 	// 3. KV projection
 	// attn_kv: Q8_0 [NEmbd, NHeadDim] → kv[NHeadDim]
-	matvecQ8_0(ds.KV, layer.AttnKV, ds.AttnNormed, NEmbd, NHeadDim)
+	matvecQ8_0GPULayer(ds.KV, layer.AttnKV, ds.AttnNormed, NEmbd, NHeadDim, ds, "attn_kv.weight")
 
 	// RMSNorm on KV
 	kvNormW := tensorF32Unsafe(layer.AttnKVANorm)
@@ -188,15 +189,17 @@ func layerAttnDecode(
 	if ratio > 0 && len(layer.CompressorKV) != 0 {
 		if compressorDecodeOne(ds.CompOut, ds.CompKVCur, ds.CompScoreCur, ds.CompPooled,
 			layer.CompressorKV, layer.CompressorGate, layer.CompressorAPE, layer.CompressorNorm,
+			"attn_compressor_kv.weight", "attn_compressor_gate.weight",
 			ds.AttnNormed, cache.CompStateKV, cache.CompStateScore,
-			NHeadDim, ratio, il, pos, true) {
+			NHeadDim, ratio, il, pos, true, ds) {
 			cache.PushCompKV(ds.CompOut)
 		}
 		if ratio == 4 && len(layer.IndexerCompKV) != 0 {
 			if compressorDecodeOne(ds.IndexCompOut, ds.IndexCompKVCur, ds.IndexCompScore, ds.IndexCompPooled,
 				layer.IndexerCompKV, layer.IndexerCompGate, layer.IndexerCompAPE, layer.IndexerCompNorm,
+				"indexer_compressor_kv.weight", "indexer_compressor_gate.weight",
 				ds.AttnNormed, cache.IndexStateKV, cache.IndexStateScore,
-				NIndexerHeadDim, ratio, il, pos, false) {
+				NIndexerHeadDim, ratio, il, pos, false, ds) {
 				cache.PushIndexCompKV(ds.IndexCompOut)
 			}
 			compAllowed = indexerAllowedDecodeOne(ds, layer, ds.AttnCur, ds.QRNorm, cache, il, pos)
@@ -299,7 +302,7 @@ func layerAttnDecode(
 	matvecQ8_0Grouped(ds.TmpLoRA, layer.AttnOutputA, ds.Heads, NHead*NValueDim, NLoraO, NOutGroup)
 
 	// attn_output_b: Q8_0 [NLoraO, NEmbd] → attn_out[NEmbd]
-	matvecQ8_0(ds.AttnOut, layer.AttnOutputB, ds.TmpLoRA, NLoraO, NEmbd)
+	matvecQ8_0GPULayer(ds.AttnOut, layer.AttnOutputB, ds.TmpLoRA, NLoraO, NEmbd, ds, "attn_output_b.weight")
 }
 
 // layerRoPEFreqBase returns the RoPE frequency base for this layer.

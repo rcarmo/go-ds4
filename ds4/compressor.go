@@ -12,10 +12,12 @@ import (
 func compressorDecodeOne(
 	outComp, kvCur, scoreCur, pooled []float32,
 	wKV, wGate, wAPE, wNorm []byte,
+	wKVName, wGateName string,
 	x []float32,
 	stateKV, stateScore []float32,
 	headDim, compressRatio, il, pos int,
 	quantizeKV bool,
+	ds *DecodeState,
 ) bool {
 	if compressRatio == 0 || len(wKV) == 0 || len(wGate) == 0 || len(wAPE) == 0 || len(wNorm) == 0 {
 		return false
@@ -34,8 +36,8 @@ func compressorDecodeOne(
 
 	kv := kvCur[:width]
 	sc := scoreCur[:width]
-	matvecQ8_0(kv, wKV, x, NEmbd, width)
-	matvecQ8_0(sc, wGate, x, NEmbd, width)
+	matvecQ8_0GPULayer(kv, wKV, x, NEmbd, width, ds, wKVName)
+	matvecQ8_0GPULayer(sc, wGate, x, NEmbd, width, ds, wGateName)
 
 	// Add APE[j, pos_mod] where tensor layout is [dim0=width, dim1=ratio]
 	apeU16 := tensorU16Unsafe(wAPE)
@@ -180,10 +182,10 @@ func indexerAllowedDecodeOne(
 		return allowed
 	}
 
-	matvecQ8_0(ds.IndexQ, layer.IndexerQB, qrNorm, NLoraQ, NIndexerHead*NIndexerHeadDim)
+	matvecQ8_0GPULayer(ds.IndexQ, layer.IndexerQB, qrNorm, NLoraQ, NIndexerHead*NIndexerHeadDim, ds, "indexer_attn_q_b.weight")
 	ropeYaRNTailInplace(ds.IndexQ, pos, NIndexerHead, NIndexerHeadDim, NRot, layerRoPEFreqBase(il), layerRoPEFreqScale(il), false)
 
-	matvecQ8_0(ds.IndexWeights, layer.IndexerProj, cur, NEmbd, NIndexerHead)
+	matvecQ8_0GPULayer(ds.IndexWeights, layer.IndexerProj, cur, NEmbd, NIndexerHead, ds, "indexer_proj.weight")
 	scale := float32(1.0 / math.Sqrt(float64(NIndexerHeadDim*NIndexerHead)))
 	for h := 0; h < NIndexerHead; h++ {
 		ds.IndexWeights[h] *= scale

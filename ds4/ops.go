@@ -1,6 +1,7 @@
 package ds4
 
 import (
+	"fmt"
 	"math"
 	"runtime"
 	"sync"
@@ -244,10 +245,20 @@ func matvecQ8_0(out []float32, wQ8 []byte, x []float32, inDim, outDim int) {
 }
 
 // matvecQ8_0GPU tries GPU dispatch first, falls back to CPU.
-// tensorName is the GGUF tensor name used as GPU buffer key.
 func matvecQ8_0GPU(out []float32, wQ8 []byte, x []float32, inDim, outDim int, engine interface{}, tensorName string) {
 	if engine != nil {
 		if e, ok := engine.(*Engine); ok && e.gpuMatvecQ8_0(out, tensorName, x, inDim, outDim) {
+			return
+		}
+	}
+	matvecQ8_0(out, wQ8, x, inDim, outDim)
+}
+
+// matvecQ8_0GPULayer is like matvecQ8_0GPU but constructs the tensor name from layer + suffix.
+func matvecQ8_0GPULayer(out []float32, wQ8 []byte, x []float32, inDim, outDim int, ds *DecodeState, suffix string) {
+	if ds.Engine != nil {
+		name := fmt.Sprintf("blk.%d.%s", ds.LayerIdx, suffix)
+		if e, ok := ds.Engine.(*Engine); ok && e.gpuMatvecQ8_0(out, name, x, inDim, outDim) {
 			return
 		}
 	}
