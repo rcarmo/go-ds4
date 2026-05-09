@@ -317,12 +317,16 @@ func main() {
 	listen := flag.String("listen", ":8080", "address to listen on")
 	ctxSize := flag.Int("ctx", 4096, "context size")
 	fast := flag.Bool("fast", false, "use top-4 experts (faster, slight quality loss)")
+	useGPU := flag.Bool("gpu", false, "enable GPU")
+	strictGPU := flag.Bool("gpu-strict", false, "require GPU kernels; no CPU fallback for GPU-covered paths")
 	flag.Parse()
 
 	log.Printf("Loading model from %s...", *modelPath)
 	engine, err := ds4.OpenEngineWithOptions(ds4.EngineOptions{
 		ModelPath:   *modelPath,
 		FastExperts: *fast,
+		UseGPU:      *useGPU || *strictGPU,
+		StrictGPU:   *strictGPU,
 	})
 	if err != nil {
 		log.Fatalf("Failed to load model: %v", err)

@@ -31,6 +31,7 @@ type Engine struct {
 	Streamer    *DiskStreamer // non-nil when StreamExperts is enabled
 	Config      *ModelConfig  // model shape parameters
 	FastExperts bool          // use top-4 instead of top-6
+	StrictGPU   bool          // panic/error instead of CPU fallback for GPU-covered kernels
 	GPU         interface{}   // *gpu.GPUEngine when GPU available (avoid import cycle)
 }
 
@@ -42,7 +43,8 @@ type EngineOptions struct {
 	EvictExperts  bool // MADV_DONTNEED cold experts after each layer
 	StreamExperts bool // read expert weights from disk instead of mmap
 	FastExperts   bool // use top-4 instead of top-6 experts (faster, slight quality loss)
-	UseGPU        bool // attempt Vulkan GPU acceleration for dense projections
+	UseGPU        bool // attempt GPU acceleration
+	StrictGPU     bool // require GPU kernels for GPU-covered paths; no silent CPU fallback
 }
 
 // OpenEngine loads a GGUF model with sensible defaults for low-memory operation.
@@ -93,7 +95,7 @@ func OpenEngineWithOptions(opts EngineOptions) (*Engine, error) {
 		return nil, fmt.Errorf("apply budget: %w", err)
 	}
 
-	e := &Engine{Model: m, Weights: w, Vocab: v, Budget: budget, Config: cfg, FastExperts: opts.FastExperts}
+	e := &Engine{Model: m, Weights: w, Vocab: v, Budget: budget, Config: cfg, FastExperts: opts.FastExperts, StrictGPU: opts.StrictGPU}
 	fmt.Printf("[model] Detected: %s\n", e.Config)
 
 	// Open disk streamer if requested
@@ -107,8 +109,11 @@ func OpenEngineWithOptions(opts EngineOptions) (*Engine, error) {
 	}
 
 	// Initialize GPU if requested
-	if opts.UseGPU {
+	if opts.UseGPU || opts.StrictGPU {
 		if err := e.InitGPU(); err != nil {
+			if opts.StrictGPU {
+				return nil, fmt.Errorf("strict GPU init: %w", err)
+			}
 			fmt.Printf("[gpu] init failed (CPU fallback): %v\n", err)
 		}
 	}

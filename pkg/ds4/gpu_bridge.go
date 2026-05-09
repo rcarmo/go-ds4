@@ -11,6 +11,7 @@ import (
 // CUDAEngine holds CUDA GPU state for DS4 inference acceleration.
 type CUDAEngine struct {
 	ready        bool
+	strictMode   bool
 	weightPtrs   map[string]gpu.CUdeviceptr
 	actBuf       *gpu.Buffer
 	outBuf       *gpu.Buffer
@@ -32,11 +33,14 @@ type CUDAEngine struct {
 	attnOutBuf   *gpu.Buffer // [NHead*NHeadDim] attention output // fused Q8_0 projections per layer
 }
 
+func (ce *CUDAEngine) strict() bool { return ce != nil && ce.strictMode }
+
 // InitGPU initializes GPU acceleration (CUDA or Vulkan).
 func (e *Engine) InitGPU() error {
 	// Try CUDA first (NVIDIA)
 	if gpu.Init() {
 		ce := &CUDAEngine{
+			strictMode: e.StrictGPU,
 			weightPtrs: make(map[string]gpu.CUdeviceptr),
 		}
 		if gpu.InitCUDAGemvQ8_0Prequant() {
@@ -172,7 +176,7 @@ func (e *Engine) uploadCUDAWeights(ce *CUDAEngine) (int, int64) {
 	uploaded := 0
 	var totalBytes int64
 	for _, u := range uploads {
-		if len(u.data) == 0 || u.outDim < 2048 {
+		if len(u.data) == 0 || (!e.StrictGPU && u.outDim < 2048) {
 			continue
 		}
 		var ptr gpu.CUdeviceptr
@@ -230,15 +234,19 @@ func (ce *CUDAEngine) matvecQ8_0(out []float32, tensorName string, x []float32, 
 	if !ce.ready {
 		return false
 	}
-	// Only GPU-dispatch for large outputs where kernel speedup exceeds PCIe overhead
-	if outDim < 2048 {
+	// Only GPU-dispatch for large outputs where kernel speedup exceeds PCIe overhead,
+	// unless strict mode is explicitly validating GPU coverage/correctness.
+	if outDim < 2048 && !ce.strict() {
 		return false
 	}
 	wtPtr, ok := ce.weightPtrs[tensorName]
 	if !ok {
 		return false
 	}
+	return ce.matvecQ8_0Ptr(out, wtPtr, x, inDim, outDim)
+}
 
+func (ce *CUDAEngine) matvecQ8_0Ptr(out []float32, wtPtr gpu.CUdeviceptr, x []float32, inDim, outDim int) bool {
 	nBlocks := (inDim + 31) / 32
 	rowBytes := nBlocks * BlockQ8_0Size
 
@@ -286,6 +294,31 @@ func (ce *CUDAEngine) matvecQ8_0(out []float32, tensorName string, x []float32, 
 		return false
 	}
 	ce.outBuf.Download(out[:outDim])
+	return true
+}
+
+func (e *Engine) gpuMatvecQ8_0Grouped(out []float32, tensorName string, x []float32, inDim, outDim, groupSize int) bool {
+	ce, ok := e.GPU.(*CUDAEngine)
+	if !ok || !ce.ready {
+		return false
+	}
+	basePtr, ok := ce.weightPtrs[tensorName]
+	if !ok {
+		return false
+	}
+	nGroups := groupSize
+	groupDim := inDim / nGroups
+	rank := outDim
+	nBlocks := (groupDim + 31) / 32
+	rowBytes := nBlocks * BlockQ8_0Size
+	for g := 0; g < nGroups; g++ {
+		ptr := gpu.CUdeviceptr(uint64(basePtr) + uint64(g*rank*rowBytes))
+		gx := x[g*groupDim : (g+1)*groupDim]
+		goff := g * rank
+		if !ce.matvecQ8_0Ptr(out[goff:goff+rank], ptr, gx, groupDim, rank) {
+			return false
+		}
+	}
 	return true
 }
 
@@ -361,9 +394,9 @@ func (e *Engine) gpuExpertForward(
 	}
 	e.cacheExpertsOnDemand(ce, il, expertIdxs)
 
-	gateRowBytes := (NEmbd / 256) * BlockIQ2XXSSize * NFFExp
+	gateRowBytes := (NEmbd / 256) * BlockIQ2XXSSize
 	upRowBytes := gateRowBytes
-	downRowBytes := (NFFExp / 256) * BlockQ2KSize * NEmbd
+	downRowBytes := (NFFExp / 256) * BlockQ2KSize
 
 	actBuf := ce.expertCache.ActBuf(il) // reused as down output [NEmbd] float32
 	outBuf := ce.expertCache.OutBuf(il) // gate [NFFExp] float32
@@ -394,17 +427,31 @@ func (e *Engine) gpuExpertForward(
 	gpuHandled := make([]bool, nExp)
 	for slot, exp := range experts {
 		if !ce.expertCache.IsCached(il, exp.idx) {
+			if e.StrictGPU {
+				panic(fmt.Sprintf("strict GPU: expert %d layer %d was not cached", exp.idx, il))
+			}
 			continue
 		}
 		gatePtr, upPtr, downPtr, _ := ce.expertCache.Get(il, exp.idx)
 
 		if err := gpu.CUDAMatvecIQ2Q8K(outBuf, ce.expertQ8Ptr, gatePtr, NEmbd, NFFExp, gateRowBytes, ce.stream); err != nil {
+			if e.StrictGPU {
+				panic(fmt.Sprintf("strict GPU: IQ2 gate kernel failed layer %d expert %d: %v", il, exp.idx, err))
+			}
 			continue
 		}
 		if err := gpu.CUDAMatvecIQ2Q8K(midBuf, ce.expertQ8Ptr, upPtr, NEmbd, NFFExp, upRowBytes, ce.stream); err != nil {
+			if e.StrictGPU {
+				panic(fmt.Sprintf("strict GPU: IQ2 up kernel failed layer %d expert %d: %v", il, exp.idx, err))
+			}
 			continue
 		}
-		gpu.StreamSync(ce.stream)
+		if err := gpu.StreamSyncErr(ce.stream); err != nil {
+			if e.StrictGPU {
+				panic(fmt.Sprintf("strict GPU: IQ2 gate/up sync failed layer %d expert %d: %v", il, exp.idx, err))
+			}
+			continue
+		}
 
 		gate := ds.ExpertGate[slot*NFFExp : (slot+1)*NFFExp]
 		up := ds.ExpertUp[slot*NFFExp : (slot+1)*NFFExp]
@@ -433,9 +480,17 @@ func (e *Engine) gpuExpertForward(
 		gpu.CuMemcpyHtoDRaw(ce.midQ8Ptr, unsafe.Pointer(&midQ[0]), uint64(midQ8Len))
 
 		if err := gpu.CUDAMatvecQ2KQ8K(actBuf, ce.midQ8Ptr, downPtr, NFFExp, NEmbd, downRowBytes, ce.stream); err != nil {
+			if e.StrictGPU {
+				panic(fmt.Sprintf("strict GPU: Q2K down kernel failed layer %d expert %d: %v", il, exp.idx, err))
+			}
 			continue
 		}
-		gpu.StreamSync(ce.stream)
+		if err := gpu.StreamSyncErr(ce.stream); err != nil {
+			if e.StrictGPU {
+				panic(fmt.Sprintf("strict GPU: Q2K down sync failed layer %d expert %d: %v", il, exp.idx, err))
+			}
+			continue
+		}
 		result := ds.ExpertOut[slot*NEmbd : (slot+1)*NEmbd]
 		actBuf.Download(result)
 		for i := 0; i < NEmbd; i++ {
@@ -467,7 +522,9 @@ func (e *Engine) cacheExpertsOnDemand(ce *CUDAEngine, il int, expertIdxs []int) 
 		gateBase := l.FfnGateExps[eidx*gateRowBytes*NFFExp : (eidx+1)*gateRowBytes*NFFExp]
 		upBase := l.FfnUpExps[eidx*upRowBytes*NFFExp : (eidx+1)*upRowBytes*NFFExp]
 		downBase := l.FfnDownExps[eidx*downRowBytes*NEmbd : (eidx+1)*downRowBytes*NEmbd]
-		ce.expertCache.LoadExpert(il, eidx, gateBase, upBase, downBase)
+		if err := ce.expertCache.LoadExpert(il, eidx, gateBase, upBase, downBase); err != nil && ce.strict() {
+			panic(fmt.Sprintf("strict GPU: failed to cache layer %d expert %d: %v", il, eidx, err))
+		}
 	}
 }
 

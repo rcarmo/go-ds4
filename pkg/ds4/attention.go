@@ -397,7 +397,7 @@ func layerAttnDecode(
 		matvecAuto(ds.AttnOut, layer.AttnOutput, ds.Heads, cfg.NHead*cfg.NHeadDim, cfg.NEmbd)
 	} else {
 		// V4: grouped LoRA output
-		matvecQ8_0Grouped(ds.TmpLoRA, layer.AttnOutputA, ds.Heads, NHead*NValueDim, NLoraO, NOutGroup)
+		matvecQ8_0Grouped(ds.TmpLoRA, layer.AttnOutputA, ds.Heads, NHead*NValueDim, NLoraO, NOutGroup, ds, "attn_output_a.weight")
 		matvecQ8_0GPULayer(ds.AttnOut, layer.AttnOutputB, ds.TmpLoRA, NLoraO*NOutGroup, NEmbd, ds, "attn_output_b.weight")
 	}
 }

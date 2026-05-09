@@ -60,13 +60,24 @@ func layerFFNDecode(
 		ds.RoutedOut[i] = 0
 	}
 
-	// Start shared expert concurrently (independent of routed experts)
+	strictGPU := false
+	if ds.Engine != nil {
+		if e, ok := ds.Engine.(*Engine); ok {
+			strictGPU = e.StrictGPU
+		}
+	}
+
+	// Start shared expert concurrently (independent of routed experts). In strict
+	// GPU mode keep GPU dispatch serialized so kernel failures are attributable
+	// and shared global CUDA buffers are not reused concurrently.
 	var sharedWg sync.WaitGroup
-	sharedWg.Add(1)
-	go func() {
-		defer sharedWg.Done()
-		sharedExpertForward(ds, layer)
-	}()
+	if !strictGPU {
+		sharedWg.Add(1)
+		go func() {
+			defer sharedWg.Done()
+			sharedExpertForward(ds, layer)
+		}()
+	}
 
 	// GPU expert dispatch: cached experts on GPU, rest on CPU
 	var gpuHandled []bool
@@ -88,6 +99,11 @@ func layerFFNDecode(
 	}
 
 	if needCPU {
+		if ds.Engine != nil {
+			if e, ok := ds.Engine.(*Engine); ok && e.StrictGPU {
+				panic(fmt.Sprintf("strict GPU: routed expert CPU fallback refused at layer %d", il))
+			}
+		}
 		// CPU: only run experts not already handled by GPU
 		if len(experts) > 1 {
 			// Parallel with preallocated per-expert scratch (no per-token allocs)
@@ -122,8 +138,12 @@ func layerFFNDecode(
 		}
 	} // end if !gpuDone
 
-	// 5. Wait for shared expert
-	sharedWg.Wait()
+	// 5. Wait for/run shared expert
+	if strictGPU {
+		sharedExpertForward(ds, layer)
+	} else {
+		sharedWg.Wait()
+	}
 
 	// 6. Evict cold expert pages to stay within budget
 	if budget != nil {
@@ -451,6 +471,18 @@ func sharedExpertForward(ds *DecodeState, layer *LayerWeights) {
 	}
 	gate := make([]float32, sharedFFN)
 	up := make([]float32, sharedFFN)
+	if cfg.NHC > 0 {
+		matvecQ8_0GPULayer(gate, layer.FfnGateShexp, ds.FfnNormed, cfg.NEmbd, sharedFFN, ds, "ffn_gate_shexp.weight")
+		matvecQ8_0GPULayer(up, layer.FfnUpShexp, ds.FfnNormed, cfg.NEmbd, sharedFFN, ds, "ffn_up_shexp.weight")
+		swiGLU(gate, gate, up)
+		matvecQ8_0GPULayer(ds.SharedOut, layer.FfnDownShexp, gate, sharedFFN, cfg.NEmbd, ds, "ffn_down_shexp.weight")
+		return
+	}
+	if ds.Engine != nil {
+		if e, ok := ds.Engine.(*Engine); ok && e.StrictGPU {
+			panic("strict GPU: V2 shared expert matvecAuto path has no GPU kernel")
+		}
+	}
 	matvecAuto(gate, layer.FfnGateShexp, ds.FfnNormed, cfg.NEmbd, sharedFFN)
 	matvecAuto(up, layer.FfnUpShexp, ds.FfnNormed, cfg.NEmbd, sharedFFN)
 	swiGLU(gate, gate, up)
@@ -543,6 +575,15 @@ func outputLogits(ds *DecodeState, logits []float32, hcState []float32, w *Weigh
 
 	outputNormW := tensorF32Unsafe(w.OutputNorm)
 	rmsNorm(collapsed, outputNormW[:cfg.NEmbd])
+	if cfg.NHC > 0 {
+		matvecQ8_0GPU(logits, w.Output, collapsed, cfg.NEmbd, cfg.NVocab, ds.Engine, "output.weight")
+		return
+	}
+	if ds.Engine != nil {
+		if e, ok := ds.Engine.(*Engine); ok && e.StrictGPU {
+			panic("strict GPU: V2 output matvecAuto path has no GPU kernel")
+		}
+	}
 	matvecAuto(logits, w.Output, collapsed, cfg.NEmbd, cfg.NVocab)
 }
 

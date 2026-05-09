@@ -366,9 +366,16 @@ func StreamCreate() (CUstream, error) {
 
 // StreamSync waits for all operations on a stream to complete.
 func StreamSync(s CUstream) {
+	_ = StreamSyncErr(s)
+}
+
+func StreamSyncErr(s CUstream) error {
 	if s != 0 && cuStreamSynchronize != nil {
-		cuStreamSynchronize(s)
+		if r := cuStreamSynchronize(s); r != CUDA_SUCCESS {
+			return fmt.Errorf("cuStreamSynchronize: error %d", r)
+		}
 	}
+	return nil
 }
 
 // StreamDestroy destroys a CUDA stream.

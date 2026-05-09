@@ -20,6 +20,7 @@ func main() {
 	topK := flag.Int("topk", 40, "top-k sampling")
 	fast := flag.Bool("fast", false, "fast expert mode")
 	useGPU := flag.Bool("gpu", false, "enable GPU")
+	strictGPU := flag.Bool("gpu-strict", false, "require GPU kernels; panic/error instead of CPU fallback for GPU-covered paths")
 	flag.Parse()
 
 	fmt.Printf("Loading %s...\n", *modelPath)
@@ -27,7 +28,8 @@ func main() {
 	engine, err := ds4.OpenEngineWithOptions(ds4.EngineOptions{
 		ModelPath:   *modelPath,
 		FastExperts: *fast,
-		UseGPU:      *useGPU,
+		UseGPU:      *useGPU || *strictGPU,
+		StrictGPU:   *strictGPU,
 	})
 	if err != nil {
 		log.Fatal(err)

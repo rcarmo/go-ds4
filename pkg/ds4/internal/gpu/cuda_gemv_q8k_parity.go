@@ -276,6 +276,7 @@ const DS4GemvIQ2Q8KPTX = `.version 7.0
     .reg .u64 %rd<40>;
     .reg .f32 %f<12>;
     .reg .f16 %h0;
+    .reg .s32 %si<4>;
     .reg .pred %p<6>;
     .shared .f32 sdata[256];
 
@@ -352,7 +353,7 @@ iq_sub_loop:
     cvt.u64.u32 %rd13, %r21;
     add.u64 %rd14, %rd8, %rd13;
 
-    mov.u32 %r23, 0;                 // dot
+    mov.s32 %si2, 0;                 // dot
     mov.u32 %r24, 0;
 iq_dot8:
     setp.ge.u32 %p4, %r24, 8;
@@ -360,13 +361,13 @@ iq_dot8:
     cvt.u64.u32 %rd15, %r24;
     add.u64 %rd16, %rd12, %rd15;
     add.u64 %rd17, %rd14, %rd15;
-    ld.global.s8 %r25, [%rd16];
-    ld.global.s8 %r26, [%rd17];
-    mad.lo.s32 %r23, %r25, %r26, %r23;
+    ld.global.s8 %si0, [%rd16];
+    ld.global.s8 %si1, [%rd17];
+    mad.lo.s32 %si2, %si0, %si1, %si2;
     add.u32 %r24, %r24, 1;
     bra iq_dot8;
 iq_dot8_done:
-    add.s32 %r14, %r14, %r23;
+    add.s32 %r14, %r14, %si2;
     add.u32 %r15, %r15, 1;
     bra iq_sub_loop;
 iq_sub_done:

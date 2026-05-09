@@ -327,11 +327,21 @@ func matvecQ8_0(out []float32, wQ8 []byte, x []float32, inDim, outDim int) {
 	})
 }
 
-// matvecQ8_0GPU tries GPU dispatch first, falls back to CPU.
+func strictGPUEngine(engine interface{}) (*Engine, bool) {
+	e, ok := engine.(*Engine)
+	return e, ok && e.StrictGPU
+}
+
+// matvecQ8_0GPU tries GPU dispatch first, falls back to CPU unless strict GPU is enabled.
 func matvecQ8_0GPU(out []float32, wQ8 []byte, x []float32, inDim, outDim int, engine interface{}, tensorName string) {
 	if engine != nil {
-		if e, ok := engine.(*Engine); ok && e.gpuMatvecQ8_0(out, tensorName, x, inDim, outDim) {
-			return
+		if e, ok := engine.(*Engine); ok {
+			if e.gpuMatvecQ8_0(out, tensorName, x, inDim, outDim) {
+				return
+			}
+			if e.StrictGPU {
+				panic(fmt.Sprintf("strict GPU: Q8_0 matvec fallback refused for %s [%d->%d]", tensorName, inDim, outDim))
+			}
 		}
 	}
 	matvecQ8_0(out, wQ8, x, inDim, outDim)
@@ -341,15 +351,31 @@ func matvecQ8_0GPU(out []float32, wQ8 []byte, x []float32, inDim, outDim int, en
 func matvecQ8_0GPULayer(out []float32, wQ8 []byte, x []float32, inDim, outDim int, ds *DecodeState, suffix string) {
 	if ds.Engine != nil {
 		name := fmt.Sprintf("blk.%d.%s", ds.LayerIdx, suffix)
-		if e, ok := ds.Engine.(*Engine); ok && e.gpuMatvecQ8_0(out, name, x, inDim, outDim) {
-			return
+		if e, ok := ds.Engine.(*Engine); ok {
+			if e.gpuMatvecQ8_0(out, name, x, inDim, outDim) {
+				return
+			}
+			if e.StrictGPU {
+				panic(fmt.Sprintf("strict GPU: Q8_0 layer matvec fallback refused for %s [%d->%d]", name, inDim, outDim))
+			}
 		}
 	}
 	matvecQ8_0(out, wQ8, x, inDim, outDim)
 }
 
 // matvecQ8_0Grouped computes grouped output projection.
-func matvecQ8_0Grouped(out []float32, wQ8 []byte, x []float32, inDim, outDim, groupSize int) {
+func matvecQ8_0Grouped(out []float32, wQ8 []byte, x []float32, inDim, outDim, groupSize int, ds *DecodeState, suffix string) {
+	if ds != nil && ds.Engine != nil {
+		name := fmt.Sprintf("blk.%d.%s", ds.LayerIdx, suffix)
+		if e, ok := ds.Engine.(*Engine); ok {
+			if e.gpuMatvecQ8_0Grouped(out, name, x, inDim, outDim, groupSize) {
+				return
+			}
+			if e.StrictGPU {
+				panic(fmt.Sprintf("strict GPU: grouped Q8_0 fallback refused for %s [%d->%d groups=%d]", name, inDim, outDim, groupSize))
+			}
+		}
+	}
 	// C parity: attn_output_a is laid out as nGroups contiguous rank-row
 	// matrices, each consuming that group's slice of heads. inDim is the total
 	// head width; outDim is the per-group rank; groupSize is nGroups.
