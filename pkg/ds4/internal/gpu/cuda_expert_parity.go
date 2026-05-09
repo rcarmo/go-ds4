@@ -62,11 +62,21 @@ const DS4ExpertSwiGLUQ8KPTX = `.version 7.0
     setp.lt.f32 %p4, %f1, %f11;
     @%p4 mov.f32 %f1, %f11;
 clamp_done:
-    // silu(gate) * up * route_weight
-    mul.f32 %f2, %f0, 0fBFB8AA3B;
-    ex2.approx.f32 %f2, %f2;
+    // silu(gate) * up * route_weight. Match CPU fastSigmoid/fastExp bit trick.
+    setp.gt.f32 %p5, %f0, 0f41200000; // x > 10
+    @%p5 mov.f32 %f3, 0f3F800000;
+    @%p5 bra sigmoid_done;
+    setp.lt.f32 %p5, %f0, 0fC1200000; // x < -10
+    @%p5 mov.f32 %f3, 0f00000000;
+    @%p5 bra sigmoid_done;
+    neg.f32 %f2, %f0;
+    mul.rn.f32 %f2, %f2, 0f4B38AA3B; // (1/ln2) * 2^23
+    cvt.rzi.s32.f32 %r13, %f2;
+    add.s32 %r13, %r13, 1065353216;
+    mov.b32 %f2, %r13;
     add.f32 %f3, %f2, 0f3F800000;
-    rcp.approx.f32 %f3, %f3;
+    rcp.rn.f32 %f3, %f3;
+sigmoid_done:
     mul.f32 %f4, %f0, %f3;
     mul.f32 %f4, %f4, %f1;
     mul.wide.u32 %rd7, %r5, 4;

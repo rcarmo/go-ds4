@@ -240,6 +240,15 @@ func CuMemcpyHtoDRaw(dst CUdeviceptr, src unsafe.Pointer, size uint64) {
 	cuMemcpyHtoD(dst, src, size)
 }
 
+// CuMemcpyDtoHRaw copies device bytes to host.
+func CuMemcpyDtoHRaw(dst unsafe.Pointer, src CUdeviceptr, size uint64) error {
+	EnsureContext()
+	if r := cuMemcpyDtoH(dst, src, size); r != CUDA_SUCCESS {
+		return fmt.Errorf("cuMemcpyDtoH: error %d", r)
+	}
+	return nil
+}
+
 // CuMemFreeRaw frees device memory.
 func CuMemFreeRaw(ptr CUdeviceptr) {
 	EnsureContext()
