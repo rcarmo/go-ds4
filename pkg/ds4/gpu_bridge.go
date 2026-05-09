@@ -57,6 +57,7 @@ func (e *Engine) InitGPU() error {
 			gpu.InitCUDAGemvIQ2(gridSlice[:])
 			gpu.InitCUDAGemvIQ2Q8K()
 			gpu.InitCUDAExpertSwiGLUQ8K()
+			gpu.InitCUDAExpertSumRows()
 			ce.ready = true
 			e.GPU = ce
 			fmt.Printf("[gpu] CUDA Q8_0 prequant parity path ready on %s\n", gpu.DeviceName())
@@ -641,21 +642,23 @@ func (e *Engine) gpuExpertForwardStrictBatched(ds *DecodeState, layer *LayerWeig
 	if err := gpu.StreamSyncErr(ce.stream); err != nil {
 		panic(fmt.Sprintf("strict GPU: batched SwiGLU+Q8K sync failed layer %d: %v", il, err))
 	}
-	gpuHandled := make([]bool, nExp)
 	for slot := range experts {
 		midPtr := gpu.CUdeviceptr(uint64(ce.midQ8Ptr) + uint64(slot*midQ8Len))
 		downPtr := gpu.CUdeviceptr(uint64(bb.DownBuf) + uint64(slot*NEmbd*downRowBytes))
-		if err := gpu.CUDAMatvecQ2KQ8K(bb.ActBuf, midPtr, downPtr, NFFExp, NEmbd, downRowBytes, ce.stream); err != nil {
+		downOut := &gpu.Buffer{Ptr: gpu.CUdeviceptr(uint64(bb.DownOut.Ptr) + uint64(slot*NEmbd*4)), Size: NEmbd}
+		if err := gpu.CUDAMatvecQ2KQ8K(downOut, midPtr, downPtr, NFFExp, NEmbd, downRowBytes, ce.stream); err != nil {
 			panic(fmt.Sprintf("strict GPU: batched Q2K down failed layer %d slot %d: %v", il, slot, err))
 		}
-		if err := gpu.StreamSyncErr(ce.stream); err != nil {
-			panic(fmt.Sprintf("strict GPU: batched Q2K down sync failed layer %d slot %d: %v", il, slot, err))
-		}
-		result := ds.ExpertOut[slot*NEmbd : (slot+1)*NEmbd]
-		bb.ActBuf.Download(result)
-		for i := 0; i < NEmbd; i++ {
-			ds.RoutedOut[i] += result[i]
-		}
+	}
+	if err := gpu.CUDAExpertSumRows(bb.DownOut, bb.ActBuf, NEmbd, nExp, ce.stream); err != nil {
+		panic(fmt.Sprintf("strict GPU: batched routed sum failed layer %d: %v", il, err))
+	}
+	if err := gpu.StreamSyncErr(ce.stream); err != nil {
+		panic(fmt.Sprintf("strict GPU: batched Q2K down/sum sync failed layer %d: %v", il, err))
+	}
+	bb.ActBuf.Download(ds.RoutedOut[:NEmbd])
+	gpuHandled := make([]bool, nExp)
+	for slot := range experts {
 		gpuHandled[slot] = true
 	}
 	return gpuHandled

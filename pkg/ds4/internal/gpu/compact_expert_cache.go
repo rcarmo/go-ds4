@@ -133,9 +133,9 @@ func (c *CompactExpertCache) evictUntil(needed uint64) {
 	}
 }
 
-// CopyTo copies a cached/uploaded expert slice into dst. On a cache miss, data
-// is uploaded once into resident VRAM first. dst is usually the compact batched
-// gate/up/down buffer for the current token.
+// CopyTo copies an expert slice into dst. Cache hits use D->D from resident
+// VRAM. Cache misses upload directly into the per-token batch buffer so a low
+// hit-rate cache does not pay H->D to cache plus D->D to batch.
 func (c *CompactExpertCache) CopyTo(dst CUdeviceptr, layer, expert int, kind compactExpertKind, data []byte) error {
 	if c == nil {
 		if len(data) == 0 {
@@ -155,14 +155,14 @@ func (c *CompactExpertCache) CopyTo(dst CUdeviceptr, layer, expert int, kind com
 	} else {
 		c.Misses++
 		bytes := uint64(len(data))
+		CuMemcpyHtoDRaw(dst, unsafe.Pointer(&data[0]), bytes)
+		c.UploadBytes += bytes
 		if bytes > c.budgetBytes {
-			CuMemcpyHtoDRaw(dst, unsafe.Pointer(&data[0]), bytes)
-			c.UploadBytes += bytes
 			return nil
 		}
 		c.evictUntil(bytes)
 		if c.liveBytes+bytes > c.budgetBytes {
-			return fmt.Errorf("compact expert cache budget exhausted: need %d live %d budget %d", bytes, c.liveBytes, c.budgetBytes)
+			return nil
 		}
 		var ptr CUdeviceptr
 		var err error
@@ -176,16 +176,20 @@ func (c *CompactExpertCache) CopyTo(dst CUdeviceptr, layer, expert int, kind com
 			}
 		}
 		if err != nil {
-			return err
+			return nil
 		}
-		CuMemcpyHtoDRaw(ptr, unsafe.Pointer(&data[0]), bytes)
-		c.UploadBytes += bytes
+		if err := CuMemcpyDtoDRaw(ptr, dst, bytes); err != nil {
+			CuMemFreeRaw(ptr)
+			return nil
+		}
+		c.DtoDBytes += bytes
 		entry = &compactExpertEntry{ptr: ptr, bytes: bytes, lastUsed: c.nextClock()}
 		c.entries[key] = entry
 		c.liveBytes += bytes
 		if c.liveBytes > c.peakBytes {
 			c.peakBytes = c.liveBytes
 		}
+		return nil
 	}
 	if err := CuMemcpyDtoDRaw(dst, entry.ptr, entry.bytes); err != nil {
 		return err
