@@ -2,6 +2,7 @@ package ds4
 
 import (
 	"fmt"
+	"os"
 	"unsafe"
 
 	"github.com/rcarmo/go-ds4/ds4/gpu"
@@ -26,6 +27,10 @@ type CUDAEngine struct {
 
 // InitGPU initializes GPU acceleration (CUDA or Vulkan).
 func (e *Engine) InitGPU() error {
+	if !gpuNonParityKernelsAllowed() {
+		return fmt.Errorf("GPU kernels are disabled in correctness mode because current CUDA/Vulkan kernels predate C parity fixes; set DS4_UNSAFE_GPU_NONPARITY=1 for legacy benchmarking")
+	}
+
 	// Try CUDA first (NVIDIA)
 	if gpu.Init() {
 		ce := &CUDAEngine{
@@ -34,8 +39,9 @@ func (e *Engine) InitGPU() error {
 		if gpu.InitCUDAGemvQ8_0() {
 			ce.ready = true
 			e.GPU = ce
-			fmt.Printf("[gpu] CUDA Q8_0 GEMV ready on %s\n", gpu.DeviceName())
+			fmt.Printf("[gpu] CUDA available on %s\n", gpu.DeviceName())
 
+			fmt.Println("[gpu] unsafe non-parity CUDA kernels enabled by DS4_UNSAFE_GPU_NONPARITY=1")
 			// Init IQ2/Q2K kernels too
 			gpu.InitCUDAGemvQ2K()
 			gpu.InitCUDASwiGLU()
@@ -173,9 +179,19 @@ func (e *Engine) GPUReady() bool {
 	return false
 }
 
+// gpuNonParityKernelsAllowed returns true only when explicitly requested.
+// The current CUDA/Vulkan Q8_0 and routed-expert kernels consume F32
+// activations, while the C/CPU parity path prequantizes Q8_0 activations and
+// routes IQ2/Q2 experts through Q8_K with C's signed-scale quantization and Q2_K
+// shift traversal. Keep those GPU paths disabled by default so -gpu cannot
+// silently reintroduce the pre-65e492b incoherence.
+func gpuNonParityKernelsAllowed() bool {
+	return os.Getenv("DS4_UNSAFE_GPU_NONPARITY") == "1"
+}
+
 // gpuMatvecQ8_0 attempts GPU dispatch for a Q8_0 matvec.
 func (e *Engine) gpuMatvecQ8_0(out []float32, tensorName string, x []float32, inDim, outDim int) bool {
-	if e.GPU == nil {
+	if e.GPU == nil || !gpuNonParityKernelsAllowed() {
 		return false
 	}
 
@@ -278,6 +294,9 @@ func (e *Engine) gpuExpertForward(
 	ds *DecodeState, layer *LayerWeights,
 	experts []expertScore, il int,
 ) []bool {
+	if !gpuNonParityKernelsAllowed() {
+		return nil
+	}
 	ce, ok := e.GPU.(*CUDAEngine)
 	if !ok || !ce.ready || ce.expertCache == nil {
 		return nil
@@ -365,6 +384,9 @@ func (e *Engine) cacheExpertsOnDemand(ce *CUDAEngine, il int, expertIdxs []int) 
 
 // gpuFusedAttnQAKV dispatches fused attn_q_a + attn_kv on GPU (sync).
 func (e *Engine) gpuFusedAttnQAKV(qr, kv, x []float32, il int) bool {
+	if !gpuNonParityKernelsAllowed() {
+		return false
+	}
 	ce, ok := e.GPU.(*CUDAEngine)
 	if !ok || !ce.ready || ce.fusedLayers[il] == nil {
 		return false

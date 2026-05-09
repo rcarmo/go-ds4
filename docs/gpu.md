@@ -27,21 +27,32 @@ Or via the server:
 
 ## What Gets Accelerated
 
-### Always on GPU (when available)
-- **Q8_0 projections** with outDim ≥ 4096:
-  - `output.weight` (4096 → 129280) — the single largest matmul
-  - `attn_q_b.weight` (1024 → 32768) — per layer
-  - `attn_output_b.weight` (1024 → 4096) — per layer
-  - `ffn_down_shexp.weight` (2048 → 4096) — per layer
+### Default correctness mode
 
-### GPU with expert cache (demand-filled)
-- **IQ2_XXS gate/up** projections for top-4 routed experts
-- **Q2_K down** projections for top-4 routed experts
-- **SwiGLU** activation (fused on GPU, no CPU round-trip)
+After the CPU/C parity fixes, the old CUDA/Vulkan Q8_0 and routed expert kernels are **disabled by default** because they do not implement the same math:
 
-### Stays on CPU
-- Small Q8_0 projections (outDim < 4096): attn_q_a, attn_kv
-- Attention scoring (Sdot + Saxpy — too small for GPU dispatch)
+- Q8_0 dense kernels consume F32 activations, while the parity path uses C-style Q8_0 activation prequantization.
+- Expert kernels consume F32 activations and apply router weights after the Q2_K down path, while the parity path uses Q8_K activation quantization, clamps/weights before Q8_K hidden quantization, and the exact ds4.c Q2_K shift traversal.
+- Fused Q8_0 `attn_q_a + attn_kv` inherits the same Q8_0 mismatch.
+
+With normal `UseGPU: true`, GPU initialization is refused and the engine falls back to CPU so generation remains coherent.
+
+### Unsafe legacy GPU mode
+
+Set `DS4_UNSAFE_GPU_NONPARITY=1` to re-enable the old experimental kernels for benchmarking only. In that mode:
+
+- **Q8_0 projections** with outDim ≥ 4096 may run on GPU:
+  - `output.weight` (4096 → 129280)
+  - `attn_q_b.weight` (1024 → 32768)
+  - `attn_output_b.weight` (8192 → 4096)
+  - `ffn_down_shexp.weight` (2048 → 4096)
+- **IQ2_XXS/Q2_K routed expert cache** may run on GPU.
+- **SwiGLU** may run on GPU.
+
+### Still CPU in correctness mode
+
+- Q8_0 dense projections
+- IQ2_XXS/Q2_K routed experts
 - RMSNorm, RoPE, softmax
 - KV cache operations
 - Compressor / indexer projections
@@ -51,20 +62,21 @@ Or via the server:
 
 | Component | Size | Notes |
 |---|---|---|
-| Q8_0 dense projections | 3.2 GB | 130 tensors, uploaded at init |
-| Expert cache (demand) | 0–4.5 GB | Fills as experts are routed |
-| Batched expert buffers | 27 MB | Gate+up+down for 4 experts |
-| IQ2 grid table | 256 KB | Uploaded once at init |
+| CUDA/Vulkan buffers | 0 MB | Default correctness mode refuses GPU init |
+| Q8_0 dense projections | 3.2 GB | Unsafe legacy mode only |
+| Expert cache (demand) | 0–4.5 GB | Unsafe legacy mode only |
+| Batched expert buffers | 27 MB | Unsafe legacy mode only |
+| IQ2 grid table | 256 KB | Unsafe legacy mode only |
 | Transient buffers | ~10 MB | Activation, output, intermediate |
-| **Total** | **3.5–8 GB** | Fits in 12 GB GPU |
+| **Total** | **0 MB default / 3.5–8 GB unsafe** | Fits in 12 GB GPU |
 
 ## Performance Characteristics
 
 | Metric | Value |
 |---|---|
-| GPU kernel time (IQ2 4096→2048) | 2.4 µs |
-| GPU kernel time (Q2K 2048→4096) | 3 µs |
-| GPU kernel time (Q8_0 4096→4096) | 3 µs |
+| Legacy GPU kernel time (IQ2 4096→2048) | 2.4 µs |
+| Legacy GPU kernel time (Q2K 2048→4096) | 3 µs |
+| Legacy GPU kernel time (Q8_0 4096→4096) | 3 µs |
 | DtoD expert weight copy (4 experts) | ~70 µs |
 | Host→Device activation upload | 8 µs |
 | Device→Host result download | 10 µs |

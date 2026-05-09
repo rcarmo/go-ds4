@@ -21,7 +21,7 @@ Input text
       │   ├─ Compressor update (ratio-4/128 layers)
       │   ├─ Indexer top-K gating (ratio-4 layers)
       │   ├─ Mixed attention: SWA raw + compressed + sink
-      │   └─ Output LoRA: grouped 8-way → 1024 → 4096 (Q8_0)
+      │   └─ Output LoRA: 8 grouped rank-1024 projections → 8192 → 4096 (Q8_0)
       ├─ HC post (residual injection)
       ├─ HC pre (Sinkhorn, FFN sublayer)
       ├─ MoE FFN
@@ -71,9 +71,9 @@ All GPU backends load via `purego.Dlopen` at runtime — no CGo, no build-time G
 
 | Kernel | PTX File | Description |
 |---|---|---|
-| `gemv_q8_0_f16scale` | `cuda_gemv_q8_0.go` | Q8_0 GEMV: F16 scale decode + int8×f32 dot, 256-thread shared-memory reduction |
-| `iq2xxs_gemv_opt` | `cuda_gemv_iq2_opt.go` | IQ2_XXS GEMV: **shared memory activation tiling** (cooperative 16KB load), vectorized grid loads (`ld.global.v2.u32`), warp shuffle reduction. 2.4µs/call |
-| `q2k_gemv` | `cuda_gemv_q2k.go` | Q2_K GEMV: 2-bit extraction from packed bytes, per-group scale application |
+| `gemv_q8_0_f16scale` | `cuda_gemv_q8_0.go` | Legacy unsafe Q8_0 GEMV: F16 scale decode + int8×f32 dot (not C prequant parity) |
+| `iq2xxs_gemv_opt` | `cuda_gemv_iq2_opt.go` | Legacy unsafe IQ2_XXS GEMV: shared F32 activation tiling (not Q8_K parity) |
+| `q2k_gemv` | `cuda_gemv_q2k.go` | Legacy unsafe Q2_K GEMV: F32 activation path (not C Q8_K/Q2 traversal parity) |
 | `swiglu` | `cuda_gemv_q8_0.go` | Fused SiLU×mul: `ex2.approx` + `rcp.approx` for fast sigmoid |
 
 ### Shared Memory Activation Tiling
@@ -87,7 +87,9 @@ Result: 3.0µs → 2.4µs per kernel call (20% faster).
 
 ### Batched Expert Pipeline
 
-Per layer, the 4 active experts are dispatched as one batch:
+The batched expert GPU pipeline is currently gated behind `DS4_UNSAFE_GPU_NONPARITY=1` because it predates the C parity fixes. It uses F32 activations directly and does not match the coherent CPU path's Q8_K activation quantization, router-weight placement before hidden quantization, or exact Q2_K shift traversal.
+
+When explicitly enabled for benchmarking, per layer the active experts are dispatched as one batch:
 
 1. **DtoD copy** (~70µs): Concatenate 4 experts' cached weights contiguously
 2. **IQ2 gate** (1 launch, 8192 rows): All 4 experts' gate projections

@@ -38,9 +38,9 @@ type MemorySummary struct {
 // EstimateMemory returns the model's memory breakdown.
 func EstimateMemory(ctxSize int) MemorySummary {
 	// These are computed from the model constants
-	bq8_0 := 36 // Q8_0 block: 36 bytes per 32 elements
-	biq2 := 66  // IQ2_XXS: 66 bytes per 256 elements
-	bq2k := 84  // Q2_K: 84 bytes per 256 elements
+	bq8_0 := BlockQ8_0Size // DS4 Q8_0 block: 34 bytes per 32 elements
+	biq2 := 66             // IQ2_XXS: 66 bytes per 256 elements
+	bq2k := 84             // Q2_K: 84 bytes per 256 elements
 
 	perLayerNonExpert := float64(0)
 	// Attention projections (Q8_0)
