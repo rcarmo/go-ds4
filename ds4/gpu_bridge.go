@@ -14,6 +14,9 @@ type CUDAEngine struct {
 	weightPtrs  map[string]gpu.CUdeviceptr
 	actBuf      *gpu.Buffer
 	outBuf      *gpu.Buffer
+	actQPtr     gpu.CUdeviceptr
+	actQSize    int
+	actScaleBuf *gpu.Buffer
 	expertPool  *gpu.ExpertPool
 	expertCache *gpu.ExpertCache
 	batchBufs   *gpu.BatchedExpertBufs
@@ -27,21 +30,26 @@ type CUDAEngine struct {
 
 // InitGPU initializes GPU acceleration (CUDA or Vulkan).
 func (e *Engine) InitGPU() error {
-	if !gpuNonParityKernelsAllowed() {
-		return fmt.Errorf("GPU kernels are disabled in correctness mode because current CUDA/Vulkan kernels predate C parity fixes; set DS4_UNSAFE_GPU_NONPARITY=1 for legacy benchmarking")
-	}
-
 	// Try CUDA first (NVIDIA)
 	if gpu.Init() {
 		ce := &CUDAEngine{
 			weightPtrs: make(map[string]gpu.CUdeviceptr),
 		}
-		if gpu.InitCUDAGemvQ8_0() {
+		if gpu.InitCUDAGemvQ8_0Prequant() {
 			ce.ready = true
 			e.GPU = ce
-			fmt.Printf("[gpu] CUDA available on %s\n", gpu.DeviceName())
+			fmt.Printf("[gpu] CUDA Q8_0 prequant parity path ready on %s\n", gpu.DeviceName())
 
-			fmt.Println("[gpu] unsafe non-parity CUDA kernels enabled by DS4_UNSAFE_GPU_NONPARITY=1")
+			// Upload Q8_0 weight tensors for the parity-safe dense path.
+			uploaded, totalBytes := e.uploadCUDAWeights(ce)
+			fmt.Printf("[gpu] Uploaded %d Q8_0 tensors (%.1f MB) to GPU VRAM\n", uploaded, float64(totalBytes)/(1024*1024))
+
+			if !gpuNonParityKernelsAllowed() {
+				fmt.Println("[gpu] routed expert/fused/Vulkan kernels remain disabled until their Q8_K/Q2 parity ports are enabled")
+				return nil
+			}
+
+			fmt.Println("[gpu] unsafe non-parity CUDA expert/fused kernels enabled by DS4_UNSAFE_GPU_NONPARITY=1")
 			// Init IQ2/Q2K kernels too
 			gpu.InitCUDAGemvQ2K()
 			gpu.InitCUDASwiGLU()
@@ -84,10 +92,6 @@ func (e *Engine) InitGPU() error {
 				fmt.Printf("[gpu] expert cache alloc failed: %v\n", err)
 			}
 
-			// Upload Q8_0 weight tensors
-			uploaded, totalBytes := e.uploadCUDAWeights(ce)
-			fmt.Printf("[gpu] Uploaded %d tensors (%.1f MB) to GPU VRAM\n", uploaded, float64(totalBytes)/(1024*1024))
-
 			// Create fused Q8_0 projection buffers per layer
 			fusedCount := 0
 			for il := 0; il < NLayer; il++ {
@@ -109,7 +113,11 @@ func (e *Engine) InitGPU() error {
 		}
 	}
 
-	// Fallback: try Vulkan
+	if !gpuNonParityKernelsAllowed() {
+		return fmt.Errorf("no parity-safe CUDA Q8_0 GPU available")
+	}
+
+	// Fallback: try Vulkan (legacy/non-parity benchmarking only)
 	vk := gpu.GPUInit()
 	if vk != nil {
 		e.GPU = vk
@@ -180,18 +188,17 @@ func (e *Engine) GPUReady() bool {
 }
 
 // gpuNonParityKernelsAllowed returns true only when explicitly requested.
-// The current CUDA/Vulkan Q8_0 and routed-expert kernels consume F32
-// activations, while the C/CPU parity path prequantizes Q8_0 activations and
-// routes IQ2/Q2 experts through Q8_K with C's signed-scale quantization and Q2_K
-// shift traversal. Keep those GPU paths disabled by default so -gpu cannot
-// silently reintroduce the pre-65e492b incoherence.
+// Dense CUDA Q8_0 now uses the parity-safe prequantized activation path.
+// The legacy fused/Vulkan/routed-expert kernels still consume F32 activations
+// and bypass Q8_K expert quantization / exact Q2_K traversal, so keep them
+// disabled by default.
 func gpuNonParityKernelsAllowed() bool {
 	return os.Getenv("DS4_UNSAFE_GPU_NONPARITY") == "1"
 }
 
 // gpuMatvecQ8_0 attempts GPU dispatch for a Q8_0 matvec.
 func (e *Engine) gpuMatvecQ8_0(out []float32, tensorName string, x []float32, inDim, outDim int) bool {
-	if e.GPU == nil || !gpuNonParityKernelsAllowed() {
+	if e.GPU == nil {
 		return false
 	}
 
@@ -217,18 +224,31 @@ func (ce *CUDAEngine) matvecQ8_0(out []float32, tensorName string, x []float32, 
 		return false
 	}
 
-	// Ensure activation buffer
-	if ce.actBuf == nil || ce.actBuf.Size < inDim*4 {
-		if ce.actBuf != nil {
-			ce.actBuf.Free()
+	nBlocks := (inDim + 31) / 32
+	rowBytes := nBlocks * BlockQ8_0Size
+
+	// Ensure prequantized activation buffers.
+	xqLen := nBlocks * 32
+	if ce.actQPtr == 0 || ce.actQSize < xqLen {
+		if ce.actQPtr != 0 {
+			gpu.CuMemFreeRaw(ce.actQPtr)
+		}
+		if err := gpu.CuMemAllocRaw(&ce.actQPtr, uint64(xqLen)); err != nil {
+			return false
+		}
+		ce.actQSize = xqLen
+	}
+	if ce.actScaleBuf == nil || ce.actScaleBuf.Size < nBlocks*4 {
+		if ce.actScaleBuf != nil {
+			ce.actScaleBuf.Free()
 		}
 		var err error
-		ce.actBuf, err = gpu.Malloc(inDim)
+		ce.actScaleBuf, err = gpu.Malloc(nBlocks)
 		if err != nil {
 			return false
 		}
 	}
-	// Ensure output buffer
+	// Ensure output buffer.
 	if ce.outBuf == nil || ce.outBuf.Size < outDim*4 {
 		if ce.outBuf != nil {
 			ce.outBuf.Free()
@@ -240,12 +260,14 @@ func (ce *CUDAEngine) matvecQ8_0(out []float32, tensorName string, x []float32, 
 		}
 	}
 
-	ce.actBuf.Upload(x[:inDim])
+	xq := make([]int8, xqLen)
+	xscale := make([]float32, nBlocks)
+	xsum := make([]float32, nBlocks)
+	quantizeQ8_0Activation(x[:inDim], xq, xscale, xsum)
+	gpu.CuMemcpyHtoDRaw(ce.actQPtr, unsafe.Pointer(&xq[0]), uint64(len(xq)))
+	ce.actScaleBuf.Upload(xscale)
 
-	nBlocks := inDim / 32
-	rowBytes := nBlocks * BlockQ8_0Size
-
-	if err := gpu.CUDAMatvecQ8_0(ce.outBuf, ce.actBuf, wtPtr, inDim, outDim, rowBytes); err != nil {
+	if err := gpu.CUDAMatvecQ8_0Prequant(ce.outBuf, ce.actQPtr, ce.actScaleBuf.Ptr, wtPtr, inDim, outDim, rowBytes); err != nil {
 		return false
 	}
 	ce.outBuf.Download(out[:outDim])
@@ -263,6 +285,13 @@ func (ce *CUDAEngine) Close() {
 	}
 	if ce.actBuf != nil {
 		ce.actBuf.Free()
+	}
+	if ce.actQPtr != 0 {
+		gpu.CuMemFreeRaw(ce.actQPtr)
+		ce.actQPtr = 0
+	}
+	if ce.actScaleBuf != nil {
+		ce.actScaleBuf.Free()
 	}
 	if ce.outBuf != nil {
 		ce.outBuf.Free()

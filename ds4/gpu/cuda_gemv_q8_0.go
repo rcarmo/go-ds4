@@ -148,6 +148,136 @@ done:
 var cudaGemvQ8_0 CUfunction
 var cudaGemvQ8_0Ready bool
 
+// DS4 Q8_0 GEMV with C-parity prequantized activations.
+// Activation is supplied as xq int8[ceil(inDim/32)*32] plus xscale f32[nBlocks].
+// Computes Σ_b f16(wd_b) * xscale_b * dot_i8(wq_b, xq_b), matching dotQ8_0Prequant.
+const DS4GemvQ8_0PrequantPTX = `.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry gemv_q8_0_prequant(
+    .param .u64 param_xq,
+    .param .u64 param_xscale,
+    .param .u64 param_wt,
+    .param .u64 param_out,
+    .param .u32 param_nBlocks,
+    .param .u32 param_outDim,
+    .param .u32 param_rowBytes
+) {
+    .reg .u32 %r<20>;
+    .reg .u64 %rd<24>;
+    .reg .f32 %f<12>;
+    .reg .f16 %h0;
+    .reg .pred %p<4>;
+    .reg .s32 %si0, %si1, %si2;
+
+    .shared .f32 sdata[256];
+
+    mov.u32 %r0, %ctaid.x;    // row
+    mov.u32 %r1, %tid.x;      // tid
+
+    ld.param.u32 %r2, [param_outDim];
+    setp.ge.u32 %p0, %r0, %r2;
+    @%p0 bra done;
+
+    ld.param.u32 %r3, [param_nBlocks];
+    ld.param.u32 %r4, [param_rowBytes];
+    ld.param.u64 %rd0, [param_xq];
+    ld.param.u64 %rd1, [param_xscale];
+    ld.param.u64 %rd2, [param_wt];
+
+    mul.wide.u32 %rd3, %r0, %r4;
+    add.u64 %rd4, %rd2, %rd3;  // row base
+
+    mov.f32 %f0, 0f00000000;
+    mov.u32 %r5, %r1;
+block_loop:
+    setp.ge.u32 %p1, %r5, %r3;
+    @%p1 bra reduce;
+
+    mul.lo.u32 %r6, %r5, 34;
+    cvt.u64.u32 %rd5, %r6;
+    add.u64 %rd6, %rd4, %rd5;  // block base
+    ld.global.b16 %h0, [%rd6];
+    cvt.f32.f16 %f1, %h0;
+
+    // combined scale = weight f16 scale * activation scale[b]
+    mul.wide.u32 %rd7, %r5, 4;
+    add.u64 %rd8, %rd1, %rd7;
+    ld.global.f32 %f2, [%rd8];
+    mul.f32 %f1, %f1, %f2;
+
+    add.u64 %rd9, %rd6, 2;     // weight int8 base
+    shl.b32 %r7, %r5, 5;       // b*32
+    cvt.u64.u32 %rd10, %r7;
+    add.u64 %rd11, %rd0, %rd10; // xq base
+
+    mov.s32 %si0, 0;
+    mov.u32 %r8, 0;
+dot_loop:
+    setp.ge.u32 %p2, %r8, 32;
+    @%p2 bra dot_done;
+
+    cvt.u64.u32 %rd12, %r8;
+    add.u64 %rd13, %rd9, %rd12;
+    add.u64 %rd14, %rd11, %rd12;
+    ld.global.s8 %si1, [%rd13];
+    ld.global.s8 %si2, [%rd14];
+    mad.lo.s32 %si0, %si1, %si2, %si0;
+    add.u32 %r8, %r8, 1;
+    bra dot_loop;
+dot_done:
+    cvt.rn.f32.s32 %f3, %si0;
+    fma.rn.f32 %f0, %f1, %f3, %f0;
+
+    add.u32 %r5, %r5, 256;
+    bra block_loop;
+
+reduce:
+    mov.u64 %rd15, sdata;
+    mul.lo.u32 %r10, %r1, 4;
+    cvt.u64.u32 %rd16, %r10;
+    add.u64 %rd17, %rd15, %rd16;
+    st.shared.f32 [%rd17], %f0;
+    bar.sync 0;
+
+    mov.u32 %r11, 128;
+reduce_loop:
+    setp.eq.u32 %p3, %r11, 0;
+    @%p3 bra store;
+    setp.ge.u32 %p2, %r1, %r11;
+    @%p2 bra reduce_skip;
+    add.u32 %r12, %r1, %r11;
+    mul.lo.u32 %r13, %r12, 4;
+    cvt.u64.u32 %rd18, %r13;
+    add.u64 %rd19, %rd15, %rd18;
+    ld.shared.f32 %f4, [%rd19];
+    ld.shared.f32 %f5, [%rd17];
+    add.f32 %f5, %f5, %f4;
+    st.shared.f32 [%rd17], %f5;
+reduce_skip:
+    bar.sync 0;
+    shr.u32 %r11, %r11, 1;
+    bra reduce_loop;
+
+store:
+    setp.ne.u32 %p2, %r1, 0;
+    @%p2 bra done;
+    mov.u64 %rd15, sdata;
+    ld.shared.f32 %f7, [%rd15];
+    ld.param.u64 %rd20, [param_out];
+    mul.wide.u32 %rd21, %r0, 4;
+    add.u64 %rd22, %rd20, %rd21;
+    st.global.f32 [%rd22], %f7;
+
+done:
+    ret;
+}
+`
+
+var cudaGemvQ8_0Prequant CUfunction
+var cudaGemvQ8_0PrequantReady bool
+
 func InitCUDAGemvQ8_0() bool {
 	if cudaGemvQ8_0Ready {
 		return true
@@ -164,6 +294,25 @@ func InitCUDAGemvQ8_0() bool {
 	cudaGemvQ8_0 = fn
 	cudaGemvQ8_0Ready = true
 	fmt.Println("[gpu] DS4 Q8_0 GEMV kernel compiled (CUDA PTX)")
+	return true
+}
+
+func InitCUDAGemvQ8_0Prequant() bool {
+	if cudaGemvQ8_0PrequantReady {
+		return true
+	}
+	if !Available() {
+		return false
+	}
+	EnsureContext()
+	fn, err := LoadPTX(DS4GemvQ8_0PrequantPTX, "gemv_q8_0_prequant")
+	if err != nil {
+		fmt.Printf("[gpu] Q8_0 prequant GEMV PTX load failed: %v\n", err)
+		return false
+	}
+	cudaGemvQ8_0Prequant = fn
+	cudaGemvQ8_0PrequantReady = true
+	fmt.Println("[gpu] DS4 Q8_0 prequant GEMV kernel compiled (CUDA PTX)")
 	return true
 }
 
@@ -189,6 +338,30 @@ func CUDAMatvecQ8_0(output, activation *Buffer, weightPtr CUdeviceptr, inDim, ou
 	}
 
 	return LaunchKernel(cudaGemvQ8_0, uint32(outDim), 1, 1, 256, 1, 1, 256*4, args...)
+}
+
+func CUDAMatvecQ8_0Prequant(output *Buffer, xqPtr, xscalePtr CUdeviceptr, weightPtr CUdeviceptr, inDim, outDim, rowBytes int) error {
+	if !cudaGemvQ8_0PrequantReady {
+		return fmt.Errorf("Q8_0 prequant kernel not compiled")
+	}
+	EnsureContext()
+
+	nBlocks := uint32((inDim + 31) / 32)
+	outDimU := uint32(outDim)
+	rowBytesU := uint32(rowBytes)
+	outPtr := output.Ptr
+
+	args := []unsafe.Pointer{
+		unsafe.Pointer(&xqPtr),
+		unsafe.Pointer(&xscalePtr),
+		unsafe.Pointer(&weightPtr),
+		unsafe.Pointer(&outPtr),
+		unsafe.Pointer(&nBlocks),
+		unsafe.Pointer(&outDimU),
+		unsafe.Pointer(&rowBytesU),
+	}
+
+	return LaunchKernel(cudaGemvQ8_0Prequant, uint32(outDim), 1, 1, 256, 1, 1, 256*4, args...)
 }
 
 // SwiGLU PTX kernel: dst[i] = silu(a[i]) * b[i] = a[i] * sigmoid(a[i]) * b[i]

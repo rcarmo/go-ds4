@@ -71,7 +71,7 @@ All GPU backends load via `purego.Dlopen` at runtime — no CGo, no build-time G
 
 | Kernel | PTX File | Description |
 |---|---|---|
-| `gemv_q8_0_f16scale` | `cuda_gemv_q8_0.go` | Legacy unsafe Q8_0 GEMV: F16 scale decode + int8×f32 dot (not C prequant parity) |
+| `gemv_q8_0_prequant` | `cuda_gemv_q8_0.go` | Parity-safe Q8_0 GEMV: C-style activation prequant (`xq` + `xscale`) + F16 scale decode |
 | `iq2xxs_gemv_opt` | `cuda_gemv_iq2_opt.go` | Legacy unsafe IQ2_XXS GEMV: shared F32 activation tiling (not Q8_K parity) |
 | `q2k_gemv` | `cuda_gemv_q2k.go` | Legacy unsafe Q2_K GEMV: F32 activation path (not C Q8_K/Q2 traversal parity) |
 | `swiglu` | `cuda_gemv_q8_0.go` | Fused SiLU×mul: `ex2.approx` + `rcp.approx` for fast sigmoid |

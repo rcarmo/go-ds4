@@ -29,29 +29,27 @@ Or via the server:
 
 ### Default correctness mode
 
-After the CPU/C parity fixes, the old CUDA/Vulkan Q8_0 and routed expert kernels are **disabled by default** because they do not implement the same math:
+Normal `UseGPU: true` now enables the parity-safe CUDA Q8_0 dense path:
 
-- Q8_0 dense kernels consume F32 activations, while the parity path uses C-style Q8_0 activation prequantization.
+- Activations are quantized on CPU with the same C-style Q8_0 prequantization used by the coherent CPU path.
+- CUDA consumes `xq int8[] + xscale float32[]` and computes `Σ f16(wd) * xscale * dot_i8(wq, xq)`, matching `dotQ8_0Prequant`.
+- Q8_0 projections with outDim ≥ 2048 are uploaded and dispatched on GPU, including `output.weight`, `attn_q_b`, grouped `attn_output_b` (8192 → 4096), and shared expert projections.
+
+The old routed expert/fused/Vulkan kernels are still disabled by default because they do not yet implement the same expert math:
+
 - Expert kernels consume F32 activations and apply router weights after the Q2_K down path, while the parity path uses Q8_K activation quantization, clamps/weights before Q8_K hidden quantization, and the exact ds4.c Q2_K shift traversal.
-- Fused Q8_0 `attn_q_a + attn_kv` inherits the same Q8_0 mismatch.
-
-With normal `UseGPU: true`, GPU initialization is refused and the engine falls back to CPU so generation remains coherent.
+- Fused Q8_0 `attn_q_a + attn_kv` inherits the old F32-activation Q8_0 mismatch.
 
 ### Unsafe legacy GPU mode
 
 Set `DS4_UNSAFE_GPU_NONPARITY=1` to re-enable the old experimental kernels for benchmarking only. In that mode:
 
-- **Q8_0 projections** with outDim ≥ 4096 may run on GPU:
-  - `output.weight` (4096 → 129280)
-  - `attn_q_b.weight` (1024 → 32768)
-  - `attn_output_b.weight` (8192 → 4096)
-  - `ffn_down_shexp.weight` (2048 → 4096)
-- **IQ2_XXS/Q2_K routed expert cache** may run on GPU.
-- **SwiGLU** may run on GPU.
+- Legacy fused Q8_0 `attn_q_a + attn_kv` may run on GPU.
+- Legacy **IQ2_XXS/Q2_K routed expert cache** may run on GPU.
+- Legacy **SwiGLU** may run on GPU.
 
 ### Still CPU in correctness mode
 
-- Q8_0 dense projections
 - IQ2_XXS/Q2_K routed experts
 - RMSNorm, RoPE, softmax
 - KV cache operations
@@ -62,13 +60,12 @@ Set `DS4_UNSAFE_GPU_NONPARITY=1` to re-enable the old experimental kernels for b
 
 | Component | Size | Notes |
 |---|---|---|
-| CUDA/Vulkan buffers | 0 MB | Default correctness mode refuses GPU init |
-| Q8_0 dense projections | 3.2 GB | Unsafe legacy mode only |
+| Q8_0 dense projections | ~6.0 GB | Default CUDA parity path |
 | Expert cache (demand) | 0–4.5 GB | Unsafe legacy mode only |
 | Batched expert buffers | 27 MB | Unsafe legacy mode only |
 | IQ2 grid table | 256 KB | Unsafe legacy mode only |
 | Transient buffers | ~10 MB | Activation, output, intermediate |
-| **Total** | **0 MB default / 3.5–8 GB unsafe** | Fits in 12 GB GPU |
+| **Total** | **~6 GB default / 6–10 GB unsafe** | Fits in 12 GB GPU |
 
 ## Performance Characteristics
 
