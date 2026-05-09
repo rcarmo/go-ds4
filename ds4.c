@@ -1170,8 +1170,11 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
 }
 
 /* Open and map the GGUF once.  Metal needs a shared mapping for no-copy
- * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress. */
-static void model_open(ds4_model *m, const char *path, bool metal_mapping) {
+ * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress.
+ * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
+ * walks the huge tensor payload. */
+static void model_open(ds4_model *m, const char *path, bool metal_mapping,
+                       bool prefetch_cpu) {
     memset(m, 0, sizeof(*m));
     m->fd = -1;
 
@@ -1215,7 +1218,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping) {
     parse_metadata(m, &c);
     parse_tensors(m, &c);
 
-    if (!metal_mapping) model_prefetch_cpu_mapping(m);
+    if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
 }
 
 static void print_size(uint64_t bytes) {
@@ -13998,8 +14001,8 @@ static void tokenize_span(const ds4_vocab *vocab, const char *p, size_t n, token
     free(tmp);
 }
 
-void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out) {
-    ds4_vocab *vocab = &e->vocab;
+static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
+                                         token_vec *out) {
     if (!text) text = "";
 
     const char *span = text;
@@ -14017,6 +14020,10 @@ void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out
         p++;
     }
     tokenize_span(vocab, span, (size_t)(p - span), out);
+}
+
+void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out) {
+    tokenize_rendered_chat_vocab(&e->vocab, text, out);
 }
 
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
@@ -14064,20 +14071,24 @@ void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_thi
                    e->vocab.think_start_id : e->vocab.think_end_id);
 }
 
-static void dump_tokens(const ds4_vocab *vocab, const token_vec *tokens) {
-    printf("[");
+static void dump_tokens_fp(FILE *fp, const ds4_vocab *vocab, const token_vec *tokens) {
+    fprintf(fp, "[");
     for (int i = 0; i < tokens->len; i++) {
-        if (i) printf(", ");
-        printf("%d", tokens->v[i]);
+        if (i) fprintf(fp, ", ");
+        fprintf(fp, "%d", tokens->v[i]);
     }
-    printf("]\n");
+    fprintf(fp, "]\n");
 
     for (int i = 0; i < tokens->len; i++) {
         int id = tokens->v[i];
         if (id >= 0 && id < vocab->n_vocab) {
-            printf("%6d  %.*s\n", id, (int)vocab->token[id].len, vocab->token[id].ptr);
+            fprintf(fp, "%6d  %.*s\n", id, (int)vocab->token[id].len, vocab->token[id].ptr);
         }
     }
+}
+
+static void dump_tokens(const ds4_vocab *vocab, const token_vec *tokens) {
+    dump_tokens_fp(stdout, vocab, tokens);
 }
 
 static uint32_t utf8_decode_one(const char *s, uint64_t len, uint64_t *pos) {
@@ -15458,6 +15469,23 @@ void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens) {
     dump_tokens(&e->vocab, tokens);
 }
 
+int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp) {
+    ds4_model model;
+    ds4_vocab vocab;
+    token_vec tokens = {0};
+
+    if (!fp) fp = stdout;
+    model_open(&model, model_path, false, false);
+    vocab_load(&vocab, &model);
+    tokenize_rendered_chat_vocab(&vocab, text ? text : "", &tokens);
+
+    dump_tokens_fp(fp, &vocab, &tokens);
+    token_vec_free(&tokens);
+    vocab_free(&vocab);
+    model_close(&model);
+    return 0;
+}
+
 int ds4_engine_generate_argmax(
         ds4_engine        *e,
         const ds4_tokens  *prompt,
@@ -15688,13 +15716,15 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     ds4_acquire_instance_lock();
 
-    model_open(&e->model, opt->model_path, opt->backend == DS4_BACKEND_METAL);
+    model_open(&e->model, opt->model_path,
+               opt->backend == DS4_BACKEND_METAL, true);
     if (opt->warm_weights) model_warm_weights(&e->model);
     vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
     if (opt->mtp_path && opt->mtp_path[0]) {
-        model_open(&e->mtp_model, opt->mtp_path, opt->backend == DS4_BACKEND_METAL);
+        model_open(&e->mtp_model, opt->mtp_path,
+                   opt->backend == DS4_BACKEND_METAL, true);
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
         e->mtp_ready = true;
         fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
@@ -15943,6 +15973,74 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     s->mtp_draft_valid = false;
     s->graph.mtp_n_raw = 0;
     return 0;
+#endif
+}
+
+/* Return true when canonicalization would replace already-sampled tokens.
+ *
+ * A DS4 session checkpoint is more than a token vector: the Metal graph also
+ * contains raw SWA rows, compressed KV rows, indexer rows, and compressor
+ * frontiers.  Replacing any part of the live tail requires restoring that whole
+ * graph frontier first.  Extending exactly at the live end is safe; rewriting
+ * behind it is not an in-place operation. */
+bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common) {
+    if (live_len < 0 || canonical_len < 0 || common < 0) return true;
+    if (common > live_len || common > canonical_len) return true;
+    return common < live_len;
+}
+
+/* Replace the live suffix after a shared prefix.
+ *
+ * This is used after parsing a generated tool call.  The model may have emitted
+ * DSML in an order that is semantically valid but not byte-for-byte equal to the
+ * canonical prompt we will see on the next request.  Rewriting only the token
+ * checkpoint is not enough: the Metal graph still contains raw and compressed
+ * rows for the old suffix.  Until we have a real graph frontier snapshot at the
+ * rewrite point, any replacement behind the live end reports that a rebuild is
+ * needed without mutating the graph.  The server may still find an older disk KV
+ * checkpoint before falling back to a full replay. */
+ds4_session_rewrite_result ds4_session_rewrite_from_common(
+        ds4_session *s, const ds4_tokens *prompt, int common,
+        char *err, size_t errlen) {
+#ifdef DS4_NO_METAL
+    (void)s;
+    (void)prompt;
+    (void)common;
+    snprintf(err, errlen, "Metal support is not compiled in");
+    return DS4_SESSION_REWRITE_ERROR;
+#else
+    if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
+        snprintf(err, errlen, "prompt exceeds context");
+        return DS4_SESSION_REWRITE_ERROR;
+    }
+    if (!s->checkpoint_valid) {
+        snprintf(err, errlen, "session has no valid checkpoint");
+        return DS4_SESSION_REWRITE_ERROR;
+    }
+    if (common < 0 || common > s->checkpoint.len || common > prompt->len) {
+        snprintf(err, errlen, "invalid rewrite prefix");
+        return DS4_SESSION_REWRITE_ERROR;
+    }
+    for (int i = 0; i < common; i++) {
+        if (s->checkpoint.v[i] != prompt->v[i]) {
+            snprintf(err, errlen, "rewrite prefix does not match live checkpoint");
+            return DS4_SESSION_REWRITE_ERROR;
+        }
+    }
+
+    if (common == s->checkpoint.len) {
+        return ds4_session_sync(s, prompt, err, errlen) == 0 ?
+            DS4_SESSION_REWRITE_OK : DS4_SESSION_REWRITE_ERROR;
+    }
+
+    if (ds4_session_rewrite_requires_rebuild(s->checkpoint.len, prompt->len, common)) {
+        snprintf(err, errlen, "rewrite needs rebuild: common=%d live=%d canonical=%d",
+                 common, s->checkpoint.len, prompt->len);
+        return DS4_SESSION_REWRITE_REBUILD_NEEDED;
+    }
+
+    snprintf(err, errlen, "unexpected canonical rewrite state");
+    return DS4_SESSION_REWRITE_ERROR;
 #endif
 }
 

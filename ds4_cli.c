@@ -140,7 +140,7 @@ static void usage(FILE *fp) {
         "  --inspect\n"
         "      Load the model and print a summary only.\n"
         "  --dump-tokens\n"
-        "      Print the encoded chat prompt tokens.\n"
+        "      Tokenize -p/--prompt-file exactly as written, then exit without inference.\n"
         "  --dump-logprobs FILE\n"
         "      Write greedy continuation top-logprobs as JSON without printing text.\n"
         "  --logprobs-top-k N\n"
@@ -1266,6 +1266,18 @@ static cli_config parse_options(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     cli_config cfg = parse_options(argc, argv);
+    if (cfg.gen.dump_tokens) {
+        if (cfg.gen.prompt == NULL) {
+            fprintf(stderr, "ds4: --dump-tokens requires -p or --prompt-file\n");
+            free(cfg.prompt_owned);
+            return 2;
+        }
+        int rc = ds4_dump_text_tokenization(cfg.engine.model_path,
+                                            cfg.gen.prompt,
+                                            stdout);
+        free(cfg.prompt_owned);
+        return rc;
+    }
     if (!cfg.inspect) {
         log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
         cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
