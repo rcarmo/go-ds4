@@ -67,6 +67,31 @@ Set `DS4_UNSAFE_GPU_NONPARITY=1` to re-enable the old experimental kernels for b
 | Transient buffers | ~10 MB | Activation, output, intermediate |
 | **Total** | **~6 GB default / 6–10 GB unsafe** | Fits in 12 GB GPU |
 
+## Strict CUDA Compact Expert Cache
+
+Strict CUDA uses a compact routed-expert cache inspired by the `feature/mlx-flash` branch:
+
+- selected `gate`, `up`, and `down` expert slices are cached individually in VRAM with LRU eviction;
+- per-token top-k expert batches are assembled with device-to-device copies;
+- host-to-device expert uploads happen only on cache misses;
+- close-time stats report live/peak cache bytes, entries, hits, misses, evictions, H→D bytes, and D→D bytes.
+
+Control the cache with:
+
+```bash
+DS4_CUDA_COMPACT_EXPERT_CACHE_MB=2048   # default
+DS4_CUDA_COMPACT_EXPERT_CACHE_MB=0      # disable cache for A/B tests
+```
+
+The default is deliberately conservative because strict mode already keeps ~6.9 GB of Q8_0 dense weights resident on a 12 GB RTX 3060-class GPU.
+
+Recent 8-token strict greedy smoke on RTX 3060, prompt `Hi`:
+
+| Mode | Prefill | Decode | Total | Cache stats |
+|---|---:|---:|---:|---|
+| cache disabled | 0.7 tok/s | 0.4 tok/s | 25.4s | H→D every selected expert |
+| 2048 MB compact cache | 0.9 tok/s | 0.6 tok/s | 18.9s | 3972 hits, 6090 misses, 5180 evictions, 13.7 GB H→D, 22.6 GB D→D |
+
 ## Performance Characteristics
 
 | Metric | Value |
