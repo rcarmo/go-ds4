@@ -3,6 +3,8 @@ package ds4
 import (
 	"math"
 	"math/rand"
+	"os"
+	"sort"
 	"testing"
 	"unsafe"
 
@@ -334,6 +336,93 @@ func TestCUDAExpertHiddenToDownParity(t *testing.T) {
 			t.Fatalf("row %d got %g want %g diff %g", row, got[row], want[row], diff)
 		}
 	}
+}
+
+func topKIndicesForTest(x []float32, k int) []int {
+	idx := make([]int, len(x))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.Slice(idx, func(i, j int) bool { return x[idx[i]] > x[idx[j]] })
+	return idx[:k]
+}
+
+func TestV4StrictGPUCPUEquivalence(t *testing.T) {
+	if os.Getenv("DS4_RUN_MODEL_PARITY") != "1" {
+		t.Skip("set DS4_RUN_MODEL_PARITY=1 to run full V4 CPU-vs-strict-GPU equivalence")
+	}
+	requireCUDATest(t)
+	modelPath := os.Getenv("DS4_MODEL")
+	if modelPath == "" {
+		for _, candidate := range []string{"gguf/ds4-q2.gguf", "../../gguf/ds4-q2.gguf"} {
+			if _, err := os.Stat(candidate); err == nil {
+				modelPath = candidate
+				break
+			}
+		}
+	}
+	if modelPath == "" {
+		t.Skip("model not available; set DS4_MODEL=/path/to/ds4-q2.gguf")
+	}
+
+	cpuEngine, err := OpenEngineWithOptions(EngineOptions{ModelPath: modelPath})
+	if err != nil {
+		t.Fatalf("open CPU engine: %v", err)
+	}
+	defer cpuEngine.Close()
+	gpuEngine, err := OpenEngineWithOptions(EngineOptions{ModelPath: modelPath, UseGPU: true, StrictGPU: true})
+	if err != nil {
+		t.Fatalf("open strict GPU engine: %v", err)
+	}
+	defer gpuEngine.Close()
+
+	tokens := cpuEngine.Vocab.EncodeChatPrompt("", "tell me why the sky is blue", false)
+	if len(tokens) > 4 {
+		tokens = tokens[:4]
+	}
+	cpuSession := cpuEngine.NewSession(4096)
+	gpuSession := gpuEngine.NewSession(4096)
+	for _, tok := range tokens {
+		cpuSession.Eval(tok)
+		gpuSession.Eval(tok)
+	}
+
+	if got, want := Argmax(gpuSession.Logits), Argmax(cpuSession.Logits); got != want {
+		t.Fatalf("argmax mismatch: gpu=%d cpu=%d", got, want)
+	}
+	cpuTop := topKIndicesForTest(cpuSession.Logits, 10)
+	gpuTop := topKIndicesForTest(gpuSession.Logits, 10)
+	seen := map[int]bool{}
+	for _, idx := range cpuTop {
+		seen[idx] = true
+	}
+	overlap := 0
+	for _, idx := range gpuTop {
+		if seen[idx] {
+			overlap++
+		}
+	}
+	if overlap < 8 {
+		t.Fatalf("top-10 overlap too low: %d/10 cpu=%v gpu=%v", overlap, cpuTop, gpuTop)
+	}
+
+	maxDiff := float64(0)
+	rmse := float64(0)
+	maxIdx := 0
+	for i := range cpuSession.Logits {
+		d := float64(cpuSession.Logits[i] - gpuSession.Logits[i])
+		ad := math.Abs(d)
+		if ad > maxDiff {
+			maxDiff = ad
+			maxIdx = i
+		}
+		rmse += d * d
+	}
+	rmse = math.Sqrt(rmse / float64(len(cpuSession.Logits)))
+	if rmse > 0.35 || maxDiff > 2.0 {
+		t.Fatalf("logit drift too high: rmse=%g max=%g at %d cpu=%g gpu=%g", rmse, maxDiff, maxIdx, cpuSession.Logits[maxIdx], gpuSession.Logits[maxIdx])
+	}
+	t.Logf("strict GPU equivalence OK: tokens=%d argmax=%d top10_overlap=%d/10 rmse=%g max=%g", len(tokens), Argmax(cpuSession.Logits), overlap, rmse, maxDiff)
 }
 
 func TestCUDAVecDotIQ2XXSQ8KParity(t *testing.T) {

@@ -81,6 +81,29 @@ Set `DS4_UNSAFE_GPU_NONPARITY=1` to re-enable the old experimental kernels for b
 | **Total per layer (batched, 4 experts)** | **~100 µs** |
 | **Total per token (43 layers)** | **~4.3 ms** |
 
+## Correctness Contract
+
+`-gpu-strict` is the correctness harness for V4 GPU work. It means:
+
+- No silent CPU fallback for GPU-covered V4 paths.
+- Deterministic strict-GPU execution.
+- Kernel-level parity tests for Q8_0 prequant, Q2_K×Q8_K, IQ2_XXS×Q8_K, and fused expert SwiGLU→Q8_K→down.
+- Full-model CPU-vs-strict-GPU equivalence is bounded numerical equivalence, not bit identity:
+  - greedy argmax must match,
+  - top-10 logits must overlap by at least 8/10,
+  - RMSE must remain below 0.35,
+  - max logit drift must remain below 2.0 for the checked prefix.
+
+Run the full model check explicitly:
+
+```bash
+DS4_RUN_MODEL_PARITY=1 TMPDIR=/workspace/tmp go test ./pkg/ds4 -run TestV4StrictGPUCPUEquivalence -v
+```
+
+Set `DS4_MODEL=/path/to/model.gguf` to override the default `gguf/ds4-q2.gguf`.
+
+Bit-for-bit CPU/GPU identity is not the production goal: it requires serial CPU-order kernels and disables the parallel reductions that make GPU useful. Strict mode instead locks down deterministic bounded equivalence plus direct quant-kernel parity.
+
 ## Limitations
 
 1. **Single-token decode**: GPU dispatch overhead (~100µs/layer) limits speedup at single-token granularity. GPU wins more on prefill (multiple tokens).
