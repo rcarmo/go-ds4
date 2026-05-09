@@ -38,6 +38,13 @@ func (ce *CUDAEngine) strict() bool { return ce != nil && ce.strictMode }
 
 // InitGPU initializes GPU acceleration (CUDA or Vulkan).
 func (e *Engine) InitGPU() error {
+	if metalEngine, err := e.initMetalGPU(); err == nil {
+		e.GPU = metalEngine
+		return nil
+	} else if os.Getenv("DS4_GPU_BACKEND") == "metal" {
+		return err
+	}
+
 	// Try CUDA first (NVIDIA)
 	if gpu.Init() {
 		ce := &CUDAEngine{
@@ -227,6 +234,9 @@ func (e *Engine) GPUReady() bool {
 	case *gpu.GPUEngine:
 		return g.Ready()
 	}
+	if ready, ok := metalGPUReady(e.GPU); ok {
+		return ready
+	}
 	return false
 }
 
@@ -250,6 +260,9 @@ func (e *Engine) gpuMatvecQ8_0(out []float32, tensorName string, x []float32, in
 		return g.matvecQ8_0(out, tensorName, x, inDim, outDim)
 	case *gpu.GPUEngine:
 		return g.MatvecQ8_0GPU(out, tensorName, x, inDim, outDim)
+	}
+	if ok, handled := metalGPUMatvecQ8_0(e.GPU, out, tensorName, x, inDim, outDim); handled {
+		return ok
 	}
 	return false
 }
@@ -322,6 +335,9 @@ func (ce *CUDAEngine) matvecQ8_0Ptr(out []float32, wtPtr gpu.CUdeviceptr, x []fl
 }
 
 func (e *Engine) gpuMatvecQ8_0Grouped(out []float32, tensorName string, x []float32, inDim, outDim, groupSize int) bool {
+	if ok, handled := metalGPUMatvecQ8_0Grouped(e.GPU, out, tensorName, x, inDim, outDim, groupSize); handled {
+		return ok
+	}
 	ce, ok := e.GPU.(*CUDAEngine)
 	if !ok || !ce.ready {
 		return false
@@ -408,6 +424,9 @@ func (e *Engine) gpuExpertForward(
 	ds *DecodeState, layer *LayerWeights,
 	experts []expertScore, il int,
 ) []bool {
+	if handled, ok := metalGPUExpertForward(e.GPU, ds, layer, experts, il); ok {
+		return handled
+	}
 	ce, ok := e.GPU.(*CUDAEngine)
 	if !ok || !ce.ready || ce.expertCache == nil {
 		return nil

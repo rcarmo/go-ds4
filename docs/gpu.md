@@ -4,11 +4,16 @@
 
 - **NVIDIA GPU** with CUDA driver (any version, compute capability ≥ 8.0 for PTX sm_80)
 - **libcuda.so.1** available at runtime (installed with NVIDIA driver, no CUDA toolkit needed)
-- No CGo — GPU bindings use `purego.Dlopen` to load the CUDA driver API at runtime
+- No CGo for CUDA/Vulkan — GPU bindings use `purego.Dlopen` to load the CUDA driver API at runtime
 
 For Vulkan (fallback, portable):
 - **libvulkan.so.1** available at runtime
 - Any Vulkan-capable GPU (NVIDIA, AMD, Intel, ARM Mali)
+
+For macOS Metal:
+- Build with `CGO_ENABLED=1 go build -tags metal`.
+- Select with `DS4_GPU_BACKEND=metal`.
+- See [Metal experiments](metal.md) for the constrained-memory path, current measurements, and limitations.
 
 ## Usage
 

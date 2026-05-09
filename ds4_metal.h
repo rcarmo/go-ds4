@@ -15,6 +15,13 @@
  */
 typedef struct ds4_metal_tensor ds4_metal_tensor;
 
+typedef struct {
+    uint64_t offset;
+    uint64_t bytes;
+} ds4_metal_model_range;
+
+#define DS4_METAL_MAX_HOT_MODEL_RANGES 2048u
+
 int ds4_metal_init(void);
 void ds4_metal_cleanup(void);
 
@@ -36,6 +43,10 @@ int ds4_metal_synchronize(void);
 
 int ds4_metal_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_metal_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
+int ds4_metal_set_hot_model_ranges(const void *model_map, uint64_t model_size,
+                                   const ds4_metal_model_range *ranges, uint32_t n_ranges);
+void ds4_metal_set_model_streaming(bool enabled);
+int ds4_metal_model_streaming_enabled(void);
 void ds4_metal_set_quality(bool quality);
 void ds4_metal_print_memory_report(const char *label);
 
@@ -146,6 +157,19 @@ int ds4_metal_shared_gate_up_swiglu_q8_0_tensor(
         uint64_t                in_dim,
         uint64_t                out_dim,
         const ds4_metal_tensor *x);
+
+int ds4_metal_shared_gate_up_swiglu_q8_0_batch_tensor(
+        ds4_metal_tensor       *gate,
+        ds4_metal_tensor       *up,
+        ds4_metal_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_metal_tensor *x,
+        uint32_t                n_tokens);
 
 int ds4_metal_matmul_f16_tensor(
         ds4_metal_tensor       *out,
@@ -600,7 +624,8 @@ int ds4_metal_router_select_batch_tensor(
         bool                    hash_mode,
         const ds4_metal_tensor *logits,
         const ds4_metal_tensor *tokens,
-        uint32_t                n_tokens);
+        uint32_t                n_tokens,
+        uint32_t                n_select);
 
 int ds4_metal_routed_moe_one_tensor(
         ds4_metal_tensor       *out,

@@ -124,11 +124,13 @@ func OpenEngineWithOptions(opts EngineOptions) (*Engine, error) {
 // Close releases the model memory mapping, streamer, and GPU resources.
 func (e *Engine) Close() {
 	if e.GPU != nil {
-		switch g := e.GPU.(type) {
-		case *CUDAEngine:
-			g.Close()
-		case *gpu.GPUEngine:
-			g.Close()
+		if !metalGPUClose(e.GPU) {
+			switch g := e.GPU.(type) {
+			case *CUDAEngine:
+				g.Close()
+			case *gpu.GPUEngine:
+				g.Close()
+			}
 		}
 		e.GPU = nil
 	}
@@ -171,6 +173,20 @@ func (e *Engine) NewSession(ctxSize int) *Session {
 
 // Eval processes one token: runs the full forward pass and produces logits.
 func (s *Session) Eval(token int) {
+	s.eval(token, true)
+}
+
+// Prefill processes prompt tokens, computing logits only for the final token.
+func (s *Session) Prefill(tokens []int) {
+	if ok, handled := metalGPUPrefill(s.Engine.GPU, s, tokens); handled && ok {
+		return
+	}
+	for i, token := range tokens {
+		s.eval(token, i == len(tokens)-1)
+	}
+}
+
+func (s *Session) eval(token int, logits bool) {
 	if token < 0 || token >= len(s.Logits) {
 		return // skip invalid tokens
 	}
@@ -221,8 +237,9 @@ func (s *Session) Eval(token int) {
 		)
 	}
 
-	// Output logits
-	outputLogits(s.Decode, s.Logits, s.Decode.CurHC, s.Engine.Weights)
+	if logits {
+		outputLogits(s.Decode, s.Logits, s.Decode.CurHC, s.Engine.Weights)
+	}
 
 	s.Pos++
 }
@@ -232,10 +249,7 @@ func (s *Session) Eval(token int) {
 func (s *Session) Generate(prompt []int, n int, temperature float32, topK int,
 	emit func(token int)) {
 
-	// Prefill: eval all prompt tokens
-	for _, t := range prompt {
-		s.Eval(t)
-	}
+	s.Prefill(prompt)
 
 	// Decode
 	for i := 0; i < n; i++ {

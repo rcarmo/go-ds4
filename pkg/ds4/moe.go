@@ -63,7 +63,7 @@ func layerFFNDecode(
 	strictGPU := false
 	if ds.Engine != nil {
 		if e, ok := ds.Engine.(*Engine); ok {
-			strictGPU = e.StrictGPU
+			strictGPU = e.StrictGPU || metalGPUSerializes(e.GPU)
 		}
 	}
 
@@ -210,26 +210,38 @@ func routeExperts(ds *DecodeState, normed []float32, layer *LayerWeights, il, to
 		return top
 	}
 
-	// Later routing: selection is based on probs + optional bias, but final
-	// expert weights use unbiased probs for the selected experts.
-	selection := make([]float32, nExp)
-	for e := 0; e < nExp; e++ {
-		selection[e] = probs[e]
-	}
+	// Later routing: select top-K using probs + optional bias, but final expert
+	// weights use unbiased probs for the selected experts. Avoid a per-layer
+	// selection allocation and full sort over all experts during decode.
+	topK := ds.RouteScores[:nExperts]
+	var bias []float32
 	if layer.FfnExpProbsB != nil {
-		bias := tensorF32Unsafe(layer.FfnExpProbsB)
-		for e := 0; e < nExp; e++ {
-			selection[e] += bias[e]
+		bias = tensorF32Unsafe(layer.FfnExpProbsB)
+	}
+	for eid := 0; eid < nExperts; eid++ {
+		score := probs[eid]
+		if bias != nil {
+			score += bias[eid]
 		}
+		topK[eid] = expertScore{idx: eid, score: score}
+	}
+	sort.Slice(topK, func(i, j int) bool { return topK[i].score > topK[j].score })
+	for eid := nExperts; eid < nExp; eid++ {
+		score := probs[eid]
+		if bias != nil {
+			score += bias[eid]
+		}
+		if !(score > topK[nExperts-1].score) {
+			continue
+		}
+		j := nExperts - 1
+		for j > 0 && score > topK[j-1].score {
+			topK[j] = topK[j-1]
+			j--
+		}
+		topK[j] = expertScore{idx: eid, score: score}
 	}
 
-	scores := ds.RouteScores[:nExp]
-	for i := range scores[:nExp] {
-		scores[i] = expertScore{idx: i, score: selection[i]}
-	}
-	sort.Slice(scores, func(i, j int) bool { return scores[i].score > scores[j].score })
-
-	topK := scores[:nExperts]
 	sum := float32(0)
 	for i := range topK {
 		eid := topK[i].idx
@@ -469,8 +481,8 @@ func sharedExpertForward(ds *DecodeState, layer *LayerWeights) {
 			sharedFFN = d
 		}
 	}
-	gate := make([]float32, sharedFFN)
-	up := make([]float32, sharedFFN)
+	gate := ds.SharedGate[:sharedFFN]
+	up := ds.SharedUp[:sharedFFN]
 	if cfg.NHC > 0 {
 		matvecQ8_0GPULayer(gate, layer.FfnGateShexp, ds.FfnNormed, cfg.NEmbd, sharedFFN, ds, "ffn_gate_shexp.weight")
 		matvecQ8_0GPULayer(up, layer.FfnUpShexp, ds.FfnNormed, cfg.NEmbd, sharedFFN, ds, "ffn_up_shexp.weight")

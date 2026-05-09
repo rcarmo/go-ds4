@@ -52,6 +52,14 @@
 - 43 syncs/token (down from 344)
 - **~2.09 tok/s** (~20% over CPU)
 
+### Phase 9: Experimental Metal streaming
+- mmap-backed model views and dense-first hot residency on macOS
+- 24 GB experimental memory envelope on a 36 GB M3 Max Mac
+- 12 GB hot resident range, 4 GB stream cache, 8 GB compact expert cache
+- Fresh-prompt Metal prefill graph for supported dense/shared work
+- Best representative constrained run: **2.5 tok/s prefill, 3.0 tok/s decode**
+- See [Metal experiments](metal.md) for the current table and conclusions
+
 ## Key Decisions
 
 | Decision | Rationale |
@@ -64,6 +72,7 @@
 | Batched expert DtoD concat | 4 kernel launches/layer instead of 12; one sync instead of 4 |
 | GPU SwiGLU kernel | Eliminates CPU round-trip between gate/up and down projections |
 | Logical ring KV cache | O(1) push vs O(N) memmove for sliding window |
+| mmap-backed streaming | Allows model sections to be faulted and evicted under a RAM budget |
 
 ## What Didn't Work
 
@@ -74,3 +83,4 @@
 | Static expert cache (top-16 by index) | 0% hit rate | Routing selects experts 69, 209, 235, etc. |
 | Per-expert GPU dispatch | 1.31 tok/s | 344 syncs/token overwhelms kernel speedup |
 | Full VRAM expert upload (6.9 GB) | No faster | Most uploaded tensors had outDim < threshold |
+| Synchronized compact-expert Metal prefill | Slower | Extra synchronization outweighed the smaller working set |

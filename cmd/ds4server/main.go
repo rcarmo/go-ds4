@@ -175,10 +175,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Tokenize
 	tokens := s.engine.Vocab.EncodeChatPrompt(system, userMsg, false)
 
-	// Prefill
-	for _, t := range tokens {
-		s.session.Eval(t)
-	}
+	s.session.Prefill(tokens)
 	promptTokens := len(tokens)
 
 	if req.Stream {

@@ -56,7 +56,7 @@
 
 // func DotQ8_0F32(wq8 unsafe.Pointer, x unsafe.Pointer, nBlocks int) float32
 //
-// Per Q8_0 block (36 bytes): scale(f32) + int8[32]
+// Per Q8_0 block (34 bytes): scale(f16) + int8[32]
 // Dequant: SXTL int8→int16→int32, SCVTF→float32, FMUL scale, FMLA with x
 TEXT ·DotQ8_0F32(SB), NOSPLIT, $0-28
     MOVD    wq8+0(FP), R0
@@ -69,12 +69,13 @@ TEXT ·DotQ8_0F32(SB), NOSPLIT, $0-28
     CBZ     R2, q8f32_done
 
 q8f32_blk:
-    // Load and broadcast scale
-    FMOVS   (R0), F30
+    // Load and broadcast f16 scale.
+    VLD1    (R0), [V30.H8]
+    FCVTL_4S(30, 30)
     VDUP    V30.S[0], V30.S4
 
-    // Load 32 int8 from R0+4, process in 4 groups of 8
-    ADD     $4, R0, R3
+    // Load 32 int8 from R0+2, process in 4 groups of 8
+    ADD     $2, R0, R3
 
     // Group 0: int8[0:8] → int16[0:8] → int32[0:4] and [4:8]
     VLD1    (R3), [V2.B16]          // load 16 bytes
@@ -134,7 +135,7 @@ q8f32_blk:
     VLD1.P  16(R1), [V5.S4]
     VFMLA   V4.S4, V5.S4, V1.S4
 
-    ADD     $36, R0, R0          // next block
+    ADD     $34, R0, R0          // next block
     SUB     $1, R2, R2
     CBNZ    R2, q8f32_blk
 

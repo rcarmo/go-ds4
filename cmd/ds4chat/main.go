@@ -65,9 +65,7 @@ func main() {
 
 		// Prefill
 		t1 := time.Now()
-		for _, t := range tokens {
-			session.Eval(t)
-		}
+		session.Prefill(tokens)
 		prefillDur := time.Since(t1)
 
 		// Decode

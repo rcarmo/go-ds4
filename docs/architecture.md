@@ -2,7 +2,7 @@
 
 ## Overview
 
-go-ds4 is a pure Go inference engine for DeepSeek V4 Flash, a 128GB MoE language model with 43 transformer layers, 256 routed experts, and a novel MLA (Multi-head Latent Attention) mechanism. It runs on CPU (AVX2/NEON SIMD) and optionally NVIDIA GPU (CUDA PTX), all without CGo.
+go-ds4 is a Go inference engine for DeepSeek V4 Flash, a 128GB MoE language model with 43 transformer layers, 256 routed experts, and a novel MLA (Multi-head Latent Attention) mechanism. The default CPU/CUDA/Vulkan build runs without CGo. An experimental macOS Metal backend is available behind the `metal` build tag and uses CGo for constrained-memory streaming experiments.
 
 ## Inference Flow
 
@@ -57,7 +57,9 @@ Note: DS4's Q8_0 uses **F16 scales** (34-byte blocks), not the standard ggml Q8_
 
 ### Backend Selection
 ```
-if NVIDIA GPU + libcuda.so.1 available:
+if Metal build tag + DS4_GPU_BACKEND=metal:
+    → Metal bridge (experimental, CGo, mmap/streaming experiments)
+elif NVIDIA GPU + libcuda.so.1 available:
     → CUDA PTX (6 hand-written kernels)
 elif Vulkan + libvulkan.so.1 available:
     → Vulkan SPIR-V (2 compiled shaders)
@@ -65,7 +67,7 @@ else:
     → CPU SIMD (AVX2 or NEON assembly)
 ```
 
-All GPU backends load via `purego.Dlopen` at runtime — no CGo, no build-time GPU dependencies.
+CUDA and Vulkan load via `purego.Dlopen` at runtime, with no CGo or build-time GPU dependencies. The Metal backend is intentionally separate: it is compiled only with `-tags metal` and calls the local Objective-C Metal bridge via CGo.
 
 ### CUDA PTX Kernels
 
