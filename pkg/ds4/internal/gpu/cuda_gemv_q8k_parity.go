@@ -323,8 +323,28 @@ iq_group_loop:
     add.u32 %r10, %r10, 2;
     cvt.u64.u32 %rd9, %r10;
     add.u64 %rd10, %rd6, %rd9;
-    ld.global.u32 %r11, [%rd10];     // grid indices
-    ld.global.u32 %r12, [%rd10+4];   // signs + scale
+    // IQ2 blocks are 66 bytes, so aux words are not always 4-byte aligned.
+    // Assemble little-endian u32 values from bytes to avoid misaligned global loads.
+    ld.global.u8 %r40, [%rd10];
+    ld.global.u8 %r41, [%rd10+1];
+    ld.global.u8 %r42, [%rd10+2];
+    ld.global.u8 %r43, [%rd10+3];
+    shl.b32 %r41, %r41, 8;
+    shl.b32 %r42, %r42, 16;
+    shl.b32 %r43, %r43, 24;
+    or.b32 %r11, %r40, %r41;
+    or.b32 %r11, %r11, %r42;
+    or.b32 %r11, %r11, %r43;
+    ld.global.u8 %r44, [%rd10+4];
+    ld.global.u8 %r45, [%rd10+5];
+    ld.global.u8 %r46, [%rd10+6];
+    ld.global.u8 %r47, [%rd10+7];
+    shl.b32 %r45, %r45, 8;
+    shl.b32 %r46, %r46, 16;
+    shl.b32 %r47, %r47, 24;
+    or.b32 %r12, %r44, %r45;
+    or.b32 %r12, %r12, %r46;
+    or.b32 %r12, %r12, %r47;
     shr.u32 %r13, %r12, 28;
     shl.b32 %r13, %r13, 1;
     add.u32 %r13, %r13, 1;           // ls

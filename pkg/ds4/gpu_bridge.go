@@ -57,10 +57,19 @@ func (e *Engine) InitGPU() error {
 			fmt.Printf("[gpu] Uploaded %d Q8_0 tensors (%.1f MB) to GPU VRAM\n", uploaded, float64(totalBytes)/(1024*1024))
 
 			if !gpuNonParityKernelsAllowed() {
-				const cachedPerLayer = 16
+				cachedPerLayer := 16
+				if e.StrictGPU {
+					// Strict mode validates kernels, not cache hit-rate. Keep expert weights
+					// transient to avoid masking kernel bugs with VRAM exhaustion.
+					cachedPerLayer = 0
+				}
 				if cache, err := gpu.NewExpertCache(cachedPerLayer); err == nil {
 					ce.expertCache = cache
-					fmt.Printf("[gpu] Expert cache ready: %d slots/layer (Q8_K parity, demand-filled)\n", cachedPerLayer)
+					if e.StrictGPU {
+						fmt.Println("[gpu] Expert buffers ready (Q8_K parity, transient strict uploads)")
+					} else {
+						fmt.Printf("[gpu] Expert cache ready: %d slots/layer (Q8_K parity, demand-filled)\n", cachedPerLayer)
+					}
 					if s, err := gpu.StreamCreate(); err == nil {
 						ce.stream = s
 					}
@@ -167,6 +176,12 @@ func (e *Engine) uploadCUDAWeights(ce *CUDAEngine) (int, int64) {
 			upload{p + "attn_kv.weight", l.AttnKV, NHeadDim},
 			upload{p + "attn_output_a.weight", l.AttnOutputA, NLoraO * NOutGroup},
 			upload{p + "attn_output_b.weight", l.AttnOutputB, NEmbd},
+			upload{p + "attn_compressor_kv.weight", l.CompressorKV, detectOutDim(l.CompressorKV, NEmbd)},
+			upload{p + "attn_compressor_gate.weight", l.CompressorGate, detectOutDim(l.CompressorGate, NEmbd)},
+			upload{p + "indexer_attn_q_b.weight", l.IndexerQB, NIndexerHead * NIndexerHeadDim},
+			upload{p + "indexer_proj.weight", l.IndexerProj, NIndexerHead},
+			upload{p + "indexer_compressor_kv.weight", l.IndexerCompKV, detectOutDim(l.IndexerCompKV, NEmbd)},
+			upload{p + "indexer_compressor_gate.weight", l.IndexerCompGate, detectOutDim(l.IndexerCompGate, NEmbd)},
 			upload{p + "ffn_gate_shexp.weight", l.FfnGateShexp, NFFExp},
 			upload{p + "ffn_up_shexp.weight", l.FfnUpShexp, NFFExp},
 			upload{p + "ffn_down_shexp.weight", l.FfnDownShexp, NEmbd},
@@ -388,11 +403,13 @@ func (e *Engine) gpuExpertForward(
 	}
 
 	nExp := len(experts)
-	expertIdxs := make([]int, nExp)
-	for i, exp := range experts {
-		expertIdxs[i] = exp.idx
+	if !e.StrictGPU {
+		expertIdxs := make([]int, nExp)
+		for i, exp := range experts {
+			expertIdxs[i] = exp.idx
+		}
+		e.cacheExpertsOnDemand(ce, il, expertIdxs)
 	}
-	e.cacheExpertsOnDemand(ce, il, expertIdxs)
 
 	gateRowBytes := (NEmbd / 256) * BlockIQ2XXSSize
 	upRowBytes := gateRowBytes
@@ -426,13 +443,38 @@ func (e *Engine) gpuExpertForward(
 
 	gpuHandled := make([]bool, nExp)
 	for slot, exp := range experts {
-		if !ce.expertCache.IsCached(il, exp.idx) {
-			if e.StrictGPU {
-				panic(fmt.Sprintf("strict GPU: expert %d layer %d was not cached", exp.idx, il))
+		var gatePtr, upPtr, downPtr gpu.CUdeviceptr
+		var transientPtrs []gpu.CUdeviceptr
+		if e.StrictGPU {
+			gateBase := layer.FfnGateExps[exp.idx*gateRowBytes*NFFExp : (exp.idx+1)*gateRowBytes*NFFExp]
+			upBase := layer.FfnUpExps[exp.idx*upRowBytes*NFFExp : (exp.idx+1)*upRowBytes*NFFExp]
+			downBase := layer.FfnDownExps[exp.idx*downRowBytes*NEmbd : (exp.idx+1)*downRowBytes*NEmbd]
+			for _, item := range []struct {
+				data []byte
+				ptr  *gpu.CUdeviceptr
+			}{{gateBase, &gatePtr}, {upBase, &upPtr}, {downBase, &downPtr}} {
+				if err := gpu.CuMemAllocRaw(item.ptr, uint64(len(item.data))); err != nil {
+					for _, ptr := range transientPtrs {
+						gpu.CuMemFreeRaw(ptr)
+					}
+					panic(fmt.Sprintf("strict GPU: failed transient expert alloc layer %d expert %d: %v", il, exp.idx, err))
+				}
+				transientPtrs = append(transientPtrs, *item.ptr)
+				gpu.CuMemcpyHtoDRaw(*item.ptr, unsafe.Pointer(&item.data[0]), uint64(len(item.data)))
 			}
-			continue
+		} else {
+			if !ce.expertCache.IsCached(il, exp.idx) {
+				continue
+			}
+			gatePtr, upPtr, downPtr, _ = ce.expertCache.Get(il, exp.idx)
 		}
-		gatePtr, upPtr, downPtr, _ := ce.expertCache.Get(il, exp.idx)
+		if len(transientPtrs) > 0 {
+			defer func(ptrs []gpu.CUdeviceptr) {
+				for _, ptr := range ptrs {
+					gpu.CuMemFreeRaw(ptr)
+				}
+			}(transientPtrs)
+		}
 
 		if err := gpu.CUDAMatvecIQ2Q8K(outBuf, ce.expertQ8Ptr, gatePtr, NEmbd, NFFExp, gateRowBytes, ce.stream); err != nil {
 			if e.StrictGPU {
