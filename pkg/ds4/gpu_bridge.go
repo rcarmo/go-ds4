@@ -10,27 +10,28 @@ import (
 
 // CUDAEngine holds CUDA GPU state for DS4 inference acceleration.
 type CUDAEngine struct {
-	ready        bool
-	strictMode   bool
-	weightPtrs   map[string]gpu.CUdeviceptr
-	actBuf       *gpu.Buffer
-	outBuf       *gpu.Buffer
-	actQPtr      gpu.CUdeviceptr
-	actQSize     int
-	actScaleBuf  *gpu.Buffer
-	expertQ8Ptr  gpu.CUdeviceptr
-	expertQ8Size int
-	midQ8Ptr     gpu.CUdeviceptr
-	midQ8Size    int
-	expertPool   *gpu.ExpertPool
-	expertCache  *gpu.ExpertCache
-	batchBufs    *gpu.BatchedExpertBufs
-	stream       gpu.CUstream
-	fusedLayers  [NLayer]*gpu.FusedLayerBufs
-	attnQBuf     *gpu.Buffer // [NHead*NHeadDim] Q vectors
-	attnKVBuf    *gpu.Buffer // [NSWA*NHeadDim] KV cache
-	attnSinkBuf  *gpu.Buffer // [NHead] sinks
-	attnOutBuf   *gpu.Buffer // [NHead*NHeadDim] attention output // fused Q8_0 projections per layer
+	ready              bool
+	strictMode         bool
+	weightPtrs         map[string]gpu.CUdeviceptr
+	actBuf             *gpu.Buffer
+	outBuf             *gpu.Buffer
+	actQPtr            gpu.CUdeviceptr
+	actQSize           int
+	actScaleBuf        *gpu.Buffer
+	expertQ8Ptr        gpu.CUdeviceptr
+	expertQ8Size       int
+	midQ8Ptr           gpu.CUdeviceptr
+	midQ8Size          int
+	expertPool         *gpu.ExpertPool
+	expertCache        *gpu.ExpertCache
+	compactExpertCache *gpu.CompactExpertCache
+	batchBufs          *gpu.BatchedExpertBufs
+	stream             gpu.CUstream
+	fusedLayers        [NLayer]*gpu.FusedLayerBufs
+	attnQBuf           *gpu.Buffer // [NHead*NHeadDim] Q vectors
+	attnKVBuf          *gpu.Buffer // [NSWA*NHeadDim] KV cache
+	attnSinkBuf        *gpu.Buffer // [NHead] sinks
+	attnOutBuf         *gpu.Buffer // [NHead*NHeadDim] attention output // fused Q8_0 projections per layer
 }
 
 func (ce *CUDAEngine) strict() bool { return ce != nil && ce.strictMode }
@@ -72,7 +73,9 @@ func (e *Engine) InitGPU() error {
 						} else {
 							return fmt.Errorf("strict GPU batched expert buffers: %w", berr)
 						}
-						fmt.Println("[gpu] Batched expert buffers ready (Q8_K parity, strict uploads)")
+						budget := gpu.CompactExpertCacheBudgetFromEnv(2048)
+						ce.compactExpertCache = gpu.NewCompactExpertCache(budget)
+						fmt.Printf("[gpu] Batched expert buffers ready (Q8_K parity); compact expert cache %.1f MB\n", float64(budget)/(1024*1024))
 					} else {
 						fmt.Printf("[gpu] Expert cache ready: %d slots/layer (Q8_K parity, demand-filled)\n", cachedPerLayer)
 					}
@@ -376,6 +379,11 @@ func (ce *CUDAEngine) Close() {
 	if ce.expertPool != nil {
 		ce.expertPool.Free()
 	}
+	if ce.compactExpertCache != nil {
+		fmt.Printf("[gpu] %s\n", ce.compactExpertCache.StatsString())
+		ce.compactExpertCache.Free()
+		ce.compactExpertCache = nil
+	}
 	if ce.expertCache != nil {
 		ce.expertCache.Free()
 		if ce.batchBufs != nil {
@@ -561,9 +569,24 @@ func (e *Engine) gpuExpertForwardStrictBatched(ds *DecodeState, layer *LayerWeig
 		gateBase := layer.FfnGateExps[exp.idx*gateRowBytes*NFFExp : (exp.idx+1)*gateRowBytes*NFFExp]
 		upBase := layer.FfnUpExps[exp.idx*upRowBytes*NFFExp : (exp.idx+1)*upRowBytes*NFFExp]
 		downBase := layer.FfnDownExps[exp.idx*downRowBytes*NEmbd : (exp.idx+1)*downRowBytes*NEmbd]
-		gpu.CuMemcpyHtoDRaw(gpu.CUdeviceptr(uint64(bb.GateBuf)+uint64(slot*len(gateBase))), unsafe.Pointer(&gateBase[0]), uint64(len(gateBase)))
-		gpu.CuMemcpyHtoDRaw(gpu.CUdeviceptr(uint64(bb.UpBuf)+uint64(slot*len(upBase))), unsafe.Pointer(&upBase[0]), uint64(len(upBase)))
-		gpu.CuMemcpyHtoDRaw(gpu.CUdeviceptr(uint64(bb.DownBuf)+uint64(slot*len(downBase))), unsafe.Pointer(&downBase[0]), uint64(len(downBase)))
+		gateDst := gpu.CUdeviceptr(uint64(bb.GateBuf) + uint64(slot*len(gateBase)))
+		upDst := gpu.CUdeviceptr(uint64(bb.UpBuf) + uint64(slot*len(upBase)))
+		downDst := gpu.CUdeviceptr(uint64(bb.DownBuf) + uint64(slot*len(downBase)))
+		if ce.compactExpertCache != nil {
+			if err := ce.compactExpertCache.CopyTo(gateDst, il, exp.idx, gpu.CompactExpertGate, gateBase); err != nil {
+				panic(fmt.Sprintf("strict GPU: compact gate cache layer %d expert %d: %v", il, exp.idx, err))
+			}
+			if err := ce.compactExpertCache.CopyTo(upDst, il, exp.idx, gpu.CompactExpertUp, upBase); err != nil {
+				panic(fmt.Sprintf("strict GPU: compact up cache layer %d expert %d: %v", il, exp.idx, err))
+			}
+			if err := ce.compactExpertCache.CopyTo(downDst, il, exp.idx, gpu.CompactExpertDown, downBase); err != nil {
+				panic(fmt.Sprintf("strict GPU: compact down cache layer %d expert %d: %v", il, exp.idx, err))
+			}
+		} else {
+			gpu.CuMemcpyHtoDRaw(gateDst, unsafe.Pointer(&gateBase[0]), uint64(len(gateBase)))
+			gpu.CuMemcpyHtoDRaw(upDst, unsafe.Pointer(&upBase[0]), uint64(len(upBase)))
+			gpu.CuMemcpyHtoDRaw(downDst, unsafe.Pointer(&downBase[0]), uint64(len(downBase)))
+		}
 	}
 	if err := gpu.CUDAMatvecIQ2Q8K(bb.GateOut, ce.expertQ8Ptr, bb.GateBuf, NEmbd, nExp*NFFExp, gateRowBytes, ce.stream); err != nil {
 		panic(fmt.Sprintf("strict GPU: batched IQ2 gate failed layer %d: %v", il, err))
