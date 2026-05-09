@@ -51,6 +51,7 @@ The Go Metal backend currently uses:
 - Batched shared-expert gate/up/SwiGLU work in the graph path.
 - Corrected 4-wide router layout for `-fast` top-4 runs.
 - An opt-in mapped routed gate/up pair kernel with route-weighted SwiGLU into the half-precision down RHS.
+- An opt-in mapped routed down kernel that atomically accumulates selected expert outputs directly into `routedOut`, skipping the separate routed-down tensor sum.
 
 The prefill graph is still incomplete compared with the ideal target. The remaining expensive section is the routed MoE path, especially route, compact, gather, and expert compute coordination.
 
@@ -65,6 +66,7 @@ Token rates are measured from first token rather than process execution time.
 | Metal graph, top-4 `-fast` | 132 tok | 1.9 tok/s | 1.9 tok/s | 11.7 GiB | 11.75 GiB | 4 GiB cap, 294 evictions | 2.5 GiB live | Longer prompt did not amortize better |
 | Metal graph, top-4 `-fast` | 84 tok | 3.3 tok/s | 3.7 tok/s | 11.8 GiB | 11.75 GiB | 4 GiB cap, 358 evictions | 3.4 GiB live | Default mapped gate, mapped up, fused activation |
 | Metal graph, top-4 `-fast`, pair SwiGLU | 84 tok | 3.1 tok/s | 3.4 tok/s | 11.7 GiB | 11.75 GiB | 4 GiB cap, 358 evictions | 3.4 GiB live | Opt-in fused gate/up pair regressed, not default |
+| Metal graph, top-4 `-fast`, down+sum fusion | 84 tok | 3.1 tok/s | 3.2 tok/s | 11.7 GiB | 11.75 GiB | 4 GiB cap, 358 evictions | 3.4 GiB live | Opt-in atomic down accumulation; within run noise, not default |
 
 ## Optional Switches
 
@@ -88,10 +90,16 @@ DS4_METAL_ROUTED_MM_PAIR_SWIGLU_FUSION=1
 
 Enables the experimental mapped routed gate/up pair kernel. It computes gate and up in one dispatch and writes route-weighted SwiGLU directly into the half-precision down RHS. On the 84-token top-4 test it regressed from 3.3 tok/s to 3.1 tok/s, so it is not enabled by default.
 
+```bash
+DS4_METAL_ROUTED_MM_DOWN_SUM_FUSION=1
+```
+
+Enables the experimental mapped routed down+sum kernel. It zeros `routedOut`, then has each selected expert's down projection atomically accumulate into the token-major output. This removes the separate routed-down sum kernels without adding a command-buffer boundary, but the atomic writes made the result noisy rather than clearly faster in the 84-token top-4 test.
+
 ## Current Conclusions
 
 The constrained Metal path can stay inside the 24 GB envelope on a 36 GB M3 Max Mac, which validates the memory approach. The speed is not yet good enough for a practical chat experience.
 
 The current bottleneck is not raw RSS. The bigger issues are routed MoE overhead, compact/gather traffic, synchronization around streamed views, and not enough GPU-side fusion across route, gather, expert compute, and scatter. Increasing resident size helps avoid evictions, but the best measured split still leaves performance dominated by the routed expert path.
 
-The next viable optimization work should focus on deeper GPU-side routed MoE fusion and reducing Go-to-Metal call boundaries during prefill.
+Normal prefill already runs most layer work inside one Metal command batch; profiling modes intentionally break that batch to time individual stages. The remaining boundary work is mostly about reducing per-stage encoders and intermediate memory traffic inside that batch rather than eliminating many full command-buffer commits.
