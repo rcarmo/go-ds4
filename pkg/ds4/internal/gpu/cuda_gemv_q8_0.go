@@ -193,7 +193,7 @@ const DS4GemvQ8_0PrequantPTX = `.version 7.0
     mov.u32 %r5, %r1;
 block_loop:
     setp.ge.u32 %p1, %r5, %r3;
-    @%p1 bra reduce;
+    @%p1 bra store_direct;
 
     mul.lo.u32 %r6, %r5, 34;
     cvt.u64.u32 %rd5, %r6;
@@ -230,8 +230,15 @@ dot_done:
     cvt.rn.f32.s32 %f3, %si0;
     fma.rn.f32 %f0, %f1, %f3, %f0;
 
-    add.u32 %r5, %r5, 256;
+    add.u32 %r5, %r5, 1;
     bra block_loop;
+
+store_direct:
+    ld.param.u64 %rd20, [param_out];
+    mul.wide.u32 %rd21, %r0, 4;
+    add.u64 %rd22, %rd20, %rd21;
+    st.global.f32 [%rd22], %f0;
+    bra done;
 
 reduce:
     mov.u64 %rd15, sdata;
@@ -361,7 +368,7 @@ func CUDAMatvecQ8_0Prequant(output *Buffer, xqPtr, xscalePtr CUdeviceptr, weight
 		unsafe.Pointer(&rowBytesU),
 	}
 
-	return LaunchKernel(cudaGemvQ8_0Prequant, uint32(outDim), 1, 1, 256, 1, 1, 256*4, args...)
+	return LaunchKernel(cudaGemvQ8_0Prequant, uint32(outDim), 1, 1, 1, 1, 1, 0, args...)
 }
 
 // SwiGLU PTX kernel: dst[i] = silu(a[i]) * b[i] = a[i] * sigmoid(a[i]) * b[i]
