@@ -20,12 +20,12 @@ import (
 type DiskStreamer struct {
 	file     *os.File
 	mu       sync.Mutex
-	bufPool  sync.Pool     // reusable []byte buffers
-	maxBufMB int           // max buffer size in MB
+	bufPool  sync.Pool // reusable []byte buffers
+	maxBufMB int       // max buffer size in MB
 
 	// Cache: keep the last layer's expert data warm
-	cachedLayer  int
-	cachedData   map[string][]byte // tensor_name → data
+	cachedLayer int
+	cachedData  map[string][]byte // tensor_name → data
 }
 
 // NewDiskStreamer opens the model file for streaming reads.
@@ -132,7 +132,7 @@ func (ds *DiskStreamer) ReturnBuffer(buf []byte) {
 // StreamingWeights wraps a GGUFModel + DiskStreamer for hybrid access:
 // non-expert weights via mmap, expert weights via disk streaming.
 type StreamingWeights struct {
-	Weights  *Weights      // mmap-backed (non-expert tensors valid, expert tensors nil)
+	Weights  *Weights // mmap-backed (non-expert tensors valid, expert tensors nil)
 	Streamer *DiskStreamer
 	Model    *GGUFModel
 
@@ -183,10 +183,10 @@ func (sw *StreamingWeights) LoadStreamingExpert(il, slot, expertIdx int) (gate, 
 // StreamingEstimate returns the estimated memory usage for streaming mode.
 func StreamingEstimate(ctxSize int) (mmapMB, bufferMB, totalMB float64) {
 	s := EstimateMemory(ctxSize)
-	mmapMB = s.NonExpertMB   // non-expert weights stay mmap'd
+	mmapMB = s.NonExpertMB // non-expert weights stay mmap'd
 	// Buffer: 6 experts × 3 matrices × max size per expert
 	bufferPerExpert := float64(NFFExp*NEmbd*BlockIQ2XXSSize)/float64(QK_K)*2 + // gate+up IQ2
-		float64(NEmbd*NFFExp*BlockQ2KSize)/float64(QK_K)                        // down Q2_K
+		float64(NEmbd*NFFExp*BlockQ2KSize)/float64(QK_K) // down Q2_K
 	bufferMB = float64(NExpertUsed) * bufferPerExpert / (1024 * 1024)
 	totalMB = mmapMB + bufferMB + s.KVCacheMB
 	return

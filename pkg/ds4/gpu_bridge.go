@@ -5,27 +5,31 @@ import (
 	"os"
 	"unsafe"
 
-	"github.com/rcarmo/go-ds4/ds4/gpu"
+	"github.com/rcarmo/go-ds4/pkg/ds4/internal/gpu"
 )
 
 // CUDAEngine holds CUDA GPU state for DS4 inference acceleration.
 type CUDAEngine struct {
-	ready       bool
-	weightPtrs  map[string]gpu.CUdeviceptr
-	actBuf      *gpu.Buffer
-	outBuf      *gpu.Buffer
-	actQPtr     gpu.CUdeviceptr
-	actQSize    int
-	actScaleBuf *gpu.Buffer
-	expertPool  *gpu.ExpertPool
-	expertCache *gpu.ExpertCache
-	batchBufs   *gpu.BatchedExpertBufs
-	stream      gpu.CUstream
-	fusedLayers [NLayer]*gpu.FusedLayerBufs
-	attnQBuf    *gpu.Buffer // [NHead*NHeadDim] Q vectors
-	attnKVBuf   *gpu.Buffer // [NSWA*NHeadDim] KV cache
-	attnSinkBuf *gpu.Buffer // [NHead] sinks
-	attnOutBuf  *gpu.Buffer // [NHead*NHeadDim] attention output // fused Q8_0 projections per layer
+	ready        bool
+	weightPtrs   map[string]gpu.CUdeviceptr
+	actBuf       *gpu.Buffer
+	outBuf       *gpu.Buffer
+	actQPtr      gpu.CUdeviceptr
+	actQSize     int
+	actScaleBuf  *gpu.Buffer
+	expertQ8Ptr  gpu.CUdeviceptr
+	expertQ8Size int
+	midQ8Ptr     gpu.CUdeviceptr
+	midQ8Size    int
+	expertPool   *gpu.ExpertPool
+	expertCache  *gpu.ExpertCache
+	batchBufs    *gpu.BatchedExpertBufs
+	stream       gpu.CUstream
+	fusedLayers  [NLayer]*gpu.FusedLayerBufs
+	attnQBuf     *gpu.Buffer // [NHead*NHeadDim] Q vectors
+	attnKVBuf    *gpu.Buffer // [NSWA*NHeadDim] KV cache
+	attnSinkBuf  *gpu.Buffer // [NHead] sinks
+	attnOutBuf   *gpu.Buffer // [NHead*NHeadDim] attention output // fused Q8_0 projections per layer
 }
 
 // InitGPU initializes GPU acceleration (CUDA or Vulkan).
@@ -36,6 +40,10 @@ func (e *Engine) InitGPU() error {
 			weightPtrs: make(map[string]gpu.CUdeviceptr),
 		}
 		if gpu.InitCUDAGemvQ8_0Prequant() {
+			gpu.InitCUDAGemvQ2KQ8K()
+			gridSlice := (*[256 * 128 * 8]int8)(unsafe.Pointer(&iq2xxsSignedGrid[0]))
+			gpu.InitCUDAGemvIQ2(gridSlice[:])
+			gpu.InitCUDAGemvIQ2Q8K()
 			ce.ready = true
 			e.GPU = ce
 			fmt.Printf("[gpu] CUDA Q8_0 prequant parity path ready on %s\n", gpu.DeviceName())
@@ -45,20 +53,27 @@ func (e *Engine) InitGPU() error {
 			fmt.Printf("[gpu] Uploaded %d Q8_0 tensors (%.1f MB) to GPU VRAM\n", uploaded, float64(totalBytes)/(1024*1024))
 
 			if !gpuNonParityKernelsAllowed() {
-				fmt.Println("[gpu] routed expert/fused/Vulkan kernels remain disabled until their Q8_K/Q2 parity ports are enabled")
+				const cachedPerLayer = 16
+				if cache, err := gpu.NewExpertCache(cachedPerLayer); err == nil {
+					ce.expertCache = cache
+					fmt.Printf("[gpu] Expert cache ready: %d slots/layer (Q8_K parity, demand-filled)\n", cachedPerLayer)
+					if s, err := gpu.StreamCreate(); err == nil {
+						ce.stream = s
+					}
+				} else {
+					fmt.Printf("[gpu] expert cache alloc failed: %v\n", err)
+				}
+				fmt.Println("[gpu] legacy fused/Vulkan kernels remain disabled unless DS4_UNSAFE_GPU_NONPARITY=1")
 				return nil
 			}
 
 			fmt.Println("[gpu] unsafe non-parity CUDA expert/fused kernels enabled by DS4_UNSAFE_GPU_NONPARITY=1")
-			// Init IQ2/Q2K kernels too
+			// Init legacy IQ2/Q2K kernels too
 			gpu.InitCUDAGemvQ2K()
 			gpu.InitCUDASwiGLU()
 			gpu.InitCUDAGemvIQ2Opt()
 			gpu.InitCUDAGemvQ2KOpt()
 			gpu.InitCUDAAttn()
-			// Init IQ2 kernel with grid table
-			gridSlice := (*[256 * 128 * 8]int8)(unsafe.Pointer(&iq2xxsSignedGrid[0]))
-			gpu.InitCUDAGemvIQ2(gridSlice[:])
 
 			// Allocate expert pool (4 slots for FastExperts, 6 otherwise)
 			nSlots := NExpertUsed
@@ -296,6 +311,14 @@ func (ce *CUDAEngine) Close() {
 	if ce.outBuf != nil {
 		ce.outBuf.Free()
 	}
+	if ce.expertQ8Ptr != 0 {
+		gpu.CuMemFreeRaw(ce.expertQ8Ptr)
+		ce.expertQ8Ptr = 0
+	}
+	if ce.midQ8Ptr != 0 {
+		gpu.CuMemFreeRaw(ce.midQ8Ptr)
+		ce.midQ8Ptr = 0
+	}
 	if ce.expertPool != nil {
 		ce.expertPool.Free()
 	}
@@ -323,14 +346,11 @@ func (e *Engine) gpuExpertForward(
 	ds *DecodeState, layer *LayerWeights,
 	experts []expertScore, il int,
 ) []bool {
-	if !gpuNonParityKernelsAllowed() {
-		return nil
-	}
 	ce, ok := e.GPU.(*CUDAEngine)
 	if !ok || !ce.ready || ce.expertCache == nil {
 		return nil
 	}
-	if !gpu.CudaGemvIQ2Ready() || !gpu.CudaGemvQ2KReady() || !gpu.CudaSwiGLUReady() {
+	if !gpu.CudaGemvIQ2Q8KReady() || !gpu.CudaGemvQ2KQ8KReady() {
 		return nil
 	}
 
@@ -341,26 +361,35 @@ func (e *Engine) gpuExpertForward(
 	}
 	e.cacheExpertsOnDemand(ce, il, expertIdxs)
 
-	// Check how many are cached
-	nCached := 0
-	for _, exp := range experts {
-		if ce.expertCache.IsCached(il, exp.idx) {
-			nCached++
-		}
-	}
-	if nCached == 0 {
-		return nil
-	}
-
 	gateRowBytes := (NEmbd / 256) * BlockIQ2XXSSize * NFFExp
 	upRowBytes := gateRowBytes
 	downRowBytes := (NFFExp / 256) * BlockQ2KSize * NEmbd
 
-	actBuf := ce.expertCache.ActBuf(il)
-	outBuf := ce.expertCache.OutBuf(il)
-	midBuf := ce.expertCache.MidBuf(il)
+	actBuf := ce.expertCache.ActBuf(il) // reused as down output [NEmbd] float32
+	outBuf := ce.expertCache.OutBuf(il) // gate [NFFExp] float32
+	midBuf := ce.expertCache.MidBuf(il) // up [NFFExp] float32
 
-	actBuf.UploadAsync(ds.FfnNormed, ce.stream)
+	inQ8Len := (NEmbd / QK_K) * BlockQ8KSize
+	if ce.expertQ8Ptr == 0 || ce.expertQ8Size < inQ8Len {
+		if ce.expertQ8Ptr != 0 {
+			gpu.CuMemFreeRaw(ce.expertQ8Ptr)
+		}
+		if err := gpu.CuMemAllocRaw(&ce.expertQ8Ptr, uint64(inQ8Len)); err != nil {
+			return nil
+		}
+		ce.expertQ8Size = inQ8Len
+	}
+	midQ8Len := (NFFExp / QK_K) * BlockQ8KSize
+	if ce.midQ8Ptr == 0 || ce.midQ8Size < midQ8Len {
+		if ce.midQ8Ptr != 0 {
+			gpu.CuMemFreeRaw(ce.midQ8Ptr)
+		}
+		if err := gpu.CuMemAllocRaw(&ce.midQ8Ptr, uint64(midQ8Len)); err != nil {
+			return nil
+		}
+		ce.midQ8Size = midQ8Len
+	}
+	gpu.CuMemcpyHtoDRaw(ce.expertQ8Ptr, unsafe.Pointer(&ds.RoutedXQ[0]), uint64(inQ8Len))
 
 	gpuHandled := make([]bool, nExp)
 	for slot, exp := range experts {
@@ -369,18 +398,49 @@ func (e *Engine) gpuExpertForward(
 		}
 		gatePtr, upPtr, downPtr, _ := ce.expertCache.Get(il, exp.idx)
 
-		gpu.CUDAMatvecIQ2OptStream(outBuf, actBuf, gatePtr, NEmbd, NFFExp, gateRowBytes, ce.stream)
-		gpu.CUDAMatvecIQ2OptStream(midBuf, actBuf, upPtr, NEmbd, NFFExp, upRowBytes, ce.stream)
-		gpu.CUDASwiGLUStream(outBuf, outBuf, midBuf, NFFExp, ce.stream)
-		gpu.CUDAMatvecQ2KOptStream(actBuf, outBuf, downPtr, NFFExp, NEmbd, downRowBytes, ce.stream)
-
+		if err := gpu.CUDAMatvecIQ2Q8K(outBuf, ce.expertQ8Ptr, gatePtr, NEmbd, NFFExp, gateRowBytes, ce.stream); err != nil {
+			continue
+		}
+		if err := gpu.CUDAMatvecIQ2Q8K(midBuf, ce.expertQ8Ptr, upPtr, NEmbd, NFFExp, upRowBytes, ce.stream); err != nil {
+			continue
+		}
 		gpu.StreamSync(ce.stream)
-		result := ds.ExpertOut[:NEmbd]
+
+		gate := ds.ExpertGate[slot*NFFExp : (slot+1)*NFFExp]
+		up := ds.ExpertUp[slot*NFFExp : (slot+1)*NFFExp]
+		outBuf.Download(gate)
+		midBuf.Download(up)
+
+		limit := ds.Cfg().SwiGLUClampExp
+		if limit > 1.0e-6 {
+			for i := 0; i < NFFExp; i++ {
+				if gate[i] > limit {
+					gate[i] = limit
+				}
+				if up[i] > limit {
+					up[i] = limit
+				} else if up[i] < -limit {
+					up[i] = -limit
+				}
+			}
+		}
+		swiGLU(gate, gate, up)
+		for i := 0; i < NFFExp; i++ {
+			gate[i] *= exp.score
+		}
+		midQ := ds.ExpertMidQ[slot*midQ8Len : (slot+1)*midQ8Len]
+		quantizeQ8KPadded(gate, midQ)
+		gpu.CuMemcpyHtoDRaw(ce.midQ8Ptr, unsafe.Pointer(&midQ[0]), uint64(midQ8Len))
+
+		if err := gpu.CUDAMatvecQ2KQ8K(actBuf, ce.midQ8Ptr, downPtr, NFFExp, NEmbd, downRowBytes, ce.stream); err != nil {
+			continue
+		}
+		gpu.StreamSync(ce.stream)
+		result := ds.ExpertOut[slot*NEmbd : (slot+1)*NEmbd]
 		actBuf.Download(result)
 		for i := 0; i < NEmbd; i++ {
-			ds.RoutedOut[i] += exp.score * result[i]
+			ds.RoutedOut[i] += result[i]
 		}
-		actBuf.UploadAsync(ds.FfnNormed, ce.stream)
 		gpuHandled[slot] = true
 	}
 	return gpuHandled

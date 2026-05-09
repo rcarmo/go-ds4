@@ -101,4 +101,4 @@ All kernels target `sm_80` (Ampere) and use:
 - `ex2.approx` + `rcp.approx` for fast SiLU sigmoid
 - CUDA stream dispatch for all kernels + async memcpy
 
-Source: all PTX is embedded as Go string constants in `ds4/gpu/cuda_gemv_*.go`. No external `.ptx` files or nvcc dependency.
+Source: all PTX is embedded as Go string constants in `pkg/ds4/internal/gpu/cuda_gemv_*.go`. No external `.ptx` files or nvcc dependency.

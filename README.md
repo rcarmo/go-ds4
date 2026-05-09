@@ -36,7 +36,7 @@ go run ./cmd/ds4server/ -model gguf/ds4-q2.gguf -listen :8080 -fast
 ## API
 
 ```go
-import "github.com/rcarmo/go-ds4/ds4"
+import "github.com/rcarmo/go-ds4/pkg/ds4"
 
 engine, _ := ds4.OpenEngineWithOptions(ds4.EngineOptions{
     ModelPath:   "gguf/ds4-q2.gguf",
@@ -151,9 +151,9 @@ The GPU pipeline:
 - Chat template encoding
 
 ### From [rcarmo/go-pherence](https://github.com/rcarmo/go-pherence)
-- `ds4/simd/` package: AVX2+FMA and NEON assembly for Sdot, Saxpy, RMSNorm, VecSiLUMul
-- `ds4/gpu/` Vulkan backend: purego dlopen, buffer management, SPIR-V dispatch pipeline
-- `ds4/gpu/` CUDA backend: purego dlopen libcuda.so.1, PTX module load, kernel launch
+- `pkg/ds4/internal/simd/` package: AVX2+FMA and NEON assembly for Sdot, Saxpy, RMSNorm, VecSiLUMul
+- `pkg/ds4/internal/gpu/` Vulkan backend: purego dlopen, buffer management, SPIR-V dispatch pipeline
+- `pkg/ds4/internal/gpu/` CUDA backend: purego dlopen libcuda.so.1, PTX module load, kernel launch
 
 ### Original to this project
 - DS4 Q8_0 34-byte block AVX2 kernel (VCVTPH2PS F16 scale + VPMOVSXBD + FMA)
@@ -198,8 +198,8 @@ The 86 GB model is served via mmap with configurable memory control:
 ## Testing
 
 ```bash
-go test ./ds4/...
-go test ./ds4/gpu/...
+go test ./pkg/ds4/...
+go test ./pkg/ds4/internal/gpu/...
 ```
 
 ## Project Structure

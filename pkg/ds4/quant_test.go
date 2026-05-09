@@ -5,7 +5,7 @@ import (
 	"testing"
 	"unsafe"
 
-	"github.com/rcarmo/go-ds4/ds4/simd"
+	"github.com/rcarmo/go-ds4/pkg/ds4/internal/simd"
 )
 
 func TestF16Roundtrip(t *testing.T) {

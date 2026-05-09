@@ -5,7 +5,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/rcarmo/go-ds4/ds4"
+	"github.com/rcarmo/go-ds4/pkg/ds4"
 )
 
 func main() {

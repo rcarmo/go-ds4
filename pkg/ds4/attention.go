@@ -4,7 +4,7 @@ import (
 	"math"
 	"unsafe"
 
-	"github.com/rcarmo/go-ds4/ds4/simd"
+	"github.com/rcarmo/go-ds4/pkg/ds4/internal/simd"
 )
 
 // DecodeState holds pre-allocated buffers for single-token decode.

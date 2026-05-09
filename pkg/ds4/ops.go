@@ -7,7 +7,7 @@ import (
 	"sync"
 	"unsafe"
 
-	"github.com/rcarmo/go-ds4/ds4/simd"
+	"github.com/rcarmo/go-ds4/pkg/ds4/internal/simd"
 )
 
 // rmsNorm computes RMSNorm(x, w) in-place: x = w * x / rms(x).

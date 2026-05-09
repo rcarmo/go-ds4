@@ -4,7 +4,7 @@ import (
 	"math"
 	"unsafe"
 
-	"github.com/rcarmo/go-ds4/ds4/simd"
+	"github.com/rcarmo/go-ds4/pkg/ds4/internal/simd"
 )
 
 // F16 conversion — matches ds4.c f16_to_f32 / f32_to_f16.

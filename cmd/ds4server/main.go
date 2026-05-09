@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rcarmo/go-ds4/ds4"
+	"github.com/rcarmo/go-ds4/pkg/ds4"
 )
 
 // OpenAI API types

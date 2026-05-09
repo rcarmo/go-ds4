@@ -3,7 +3,7 @@ package ds4
 import (
 	"unsafe"
 
-	"github.com/rcarmo/go-ds4/ds4/simd"
+	"github.com/rcarmo/go-ds4/pkg/ds4/internal/simd"
 )
 
 // vecDotQ2KQ8K_avx2 pre-scales Q2 values by their group scale,

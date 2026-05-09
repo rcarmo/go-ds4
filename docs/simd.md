@@ -6,7 +6,7 @@ All quantized dot product hot paths use hand-written assembly for amd64 (AVX2+FM
 
 ## Kernel Inventory
 
-### `ds4/simd/` — Core Vector Operations
+### `pkg/ds4/internal/simd/` — Core Vector Operations
 
 | Function | amd64 | arm64 | Description |
 |---|---|---|---|
@@ -16,7 +16,7 @@ All quantized dot product hot paths use hand-written assembly for amd64 (AVX2+FM
 | `RMSNormNoScale` | AVX2 | NEON | RMSNorm without scale weights |
 | `VecSiLUMul` | Fast exp | Fast exp | dst = silu(a) × b |
 
-### `ds4/simd/quant_amd64.s` — DS4 Q8_0
+### `pkg/ds4/internal/simd/quant_amd64.s` — DS4 Q8_0
 
 | Function | Instructions | Notes |
 |---|---|---|
@@ -24,7 +24,7 @@ All quantized dot product hot paths use hand-written assembly for amd64 (AVX2+FM
 
 Key detail: DS4 Q8_0 uses **F16 scales** (2 bytes + 32 int8 = 34 bytes/block), not the standard ggml F32 scale (36 bytes). The kernel uses `VCVTPH2PS` (F16C extension, available on all AVX2 CPUs) for scale decode.
 
-### `ds4/simd/quant_q2k_amd64.s` — Q2_K
+### `pkg/ds4/internal/simd/quant_q2k_amd64.s` — Q2_K
 
 | Function | Instructions | Notes |
 |---|---|---|
@@ -32,7 +32,7 @@ Key detail: DS4 Q8_0 uses **F16 scales** (2 bytes + 32 int8 = 34 bytes/block), n
 
 Extracts 2-bit values via shift+mask into XMM, interleaves into sequential order, then signed×signed multiply via the unsigned offset trick.
 
-### `ds4/simd/quant_iq2_amd64.s` — IQ2_XXS
+### `pkg/ds4/internal/simd/quant_iq2_amd64.s` — IQ2_XXS
 
 | Function | Instructions | Notes |
 |---|---|---|
@@ -40,7 +40,7 @@ Extracts 2-bit values via shift+mask into XMM, interleaves into sequential order
 
 Loads 4 grid pointers (4×8 bytes) directly into one YMM register without intermediate buffer copy. Uses the unsigned offset trick (+128) for signed×signed dot, with correction via VPMOVSXBW sum.
 
-### `ds4/simd/quant_amd64.s` — DotI8
+### `pkg/ds4/internal/simd/quant_amd64.s` — DotI8
 
 | Function | Instructions | Notes |
 |---|---|---|

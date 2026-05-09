@@ -3,7 +3,7 @@ package ds4
 import (
 	"math"
 
-	"github.com/rcarmo/go-ds4/ds4/simd"
+	"github.com/rcarmo/go-ds4/pkg/ds4/internal/simd"
 )
 
 // compressorDecodeOne updates compressor rolling state for one token and

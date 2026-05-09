@@ -218,7 +218,7 @@ func VulkanInit() bool {
 		engineVersion      uint32
 		apiVersion         uint32
 	}{
-		sType:      0,                     // VK_STRUCTURE_TYPE_APPLICATION_INFO
+		sType:      0,         // VK_STRUCTURE_TYPE_APPLICATION_INFO
 		apiVersion: (1 << 22), // Vulkan 1.3
 	}
 

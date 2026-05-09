@@ -8,7 +8,7 @@ import (
 	"math/rand/v2"
 	"unsafe"
 
-	"github.com/rcarmo/go-ds4/ds4/gpu"
+	"github.com/rcarmo/go-ds4/pkg/ds4/internal/gpu"
 )
 
 // Session holds the mutable inference state for one generation timeline.

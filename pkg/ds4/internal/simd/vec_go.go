@@ -1,7 +1,5 @@
 package simd
 
-
-
 // vecSiLUMulGo is the Go implementation called by the asm stubs.
 // Uses fast exp approximation instead of math.Exp.
 func vecSiLUMulGo(dst, a, b []float32) {

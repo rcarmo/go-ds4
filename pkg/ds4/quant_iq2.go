@@ -3,25 +3,28 @@ package ds4
 import (
 	"unsafe"
 
-	"github.com/rcarmo/go-ds4/ds4/simd"
+	"github.com/rcarmo/go-ds4/pkg/ds4/internal/simd"
 )
 
 // VecDotIQ2XXSQ8K computes the dot product of IQ2_XXS weights with Q8_K activations.
 // This is the hot path for routed expert gate/up projections.
 //
 // IQ2_XXS block (66 bytes per 256 elements):
-//   d: uint16 (F16 scale)
-//   qs: uint16[32] — packed: each group of 4 uint16 encodes 32 values:
-//     - qs[0..3] as 2 uint32 (aux32):
-//       - aux8[0], aux8[1]: grid indices (0-255) → 8 values each
-//       - aux32[1] bits 0-6, 7-13: sign indices (0-127) for the two grids
-//       - aux32[1] bits 14-20, 21-27: sign indices for next two grids
-//       - aux32[1] bits 28-31: 4-bit scale (ls = 2*nibble + 1)
+//
+//	d: uint16 (F16 scale)
+//	qs: uint16[32] — packed: each group of 4 uint16 encodes 32 values:
+//	  - qs[0..3] as 2 uint32 (aux32):
+//	    - aux8[0], aux8[1]: grid indices (0-255) → 8 values each
+//	    - aux32[1] bits 0-6, 7-13: sign indices (0-127) for the two grids
+//	    - aux32[1] bits 14-20, 21-27: sign indices for next two grids
+//	    - aux32[1] bits 28-31: 4-bit scale (ls = 2*nibble + 1)
 //
 // Q8_K block (292 bytes per 256 elements):
-//   d: float32 scale
-//   qs: int8[256] quantized values
-//   bsums: int16[16] partial sums
+//
+//	d: float32 scale
+//	qs: int8[256] quantized values
+//	bsums: int16[16] partial sums
+//
 // VecDotIQ2XXSQ8K computes IQ2_XXS · Q8_K using SIMD integer dot products.
 func VecDotIQ2XXSQ8K(n int, xIQ2 []byte, yQ8K []byte) float32 {
 	return VecDotIQ2XXSQ8K_SIMD(n, xIQ2, yQ8K)
@@ -42,8 +45,8 @@ func vecDotIQ2XXSQ8K_scalar(n int, xIQ2 []byte, yQ8K []byte) float32 {
 		yd := *(*float32)(unsafe.Pointer(&yQ8K[yOff]))
 
 		scale := d * yd
-		q2 := xIQ2[xOff+2:]  // uint16 array as bytes
-		q8 := yQ8K[yOff+4:]  // int8 array
+		q2 := xIQ2[xOff+2:] // uint16 array as bytes
+		q8 := yQ8K[yOff+4:] // int8 array
 
 		bsum := int32(0)
 

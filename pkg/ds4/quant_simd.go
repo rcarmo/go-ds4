@@ -3,7 +3,7 @@ package ds4
 import (
 	"unsafe"
 
-	"github.com/rcarmo/go-ds4/ds4/simd"
+	"github.com/rcarmo/go-ds4/pkg/ds4/internal/simd"
 )
 
 // VecDotQ2KQ8K_SIMD is unused — replaced by vecDotQ2KQ8K_scalar (which uses AVX2 DotQ2Group16).
