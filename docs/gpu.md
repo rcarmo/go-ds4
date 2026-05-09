@@ -79,18 +79,20 @@ Strict CUDA uses a compact routed-expert cache inspired by the `feature/mlx-flas
 Control the cache with:
 
 ```bash
-DS4_CUDA_COMPACT_EXPERT_CACHE_MB=2048   # default
-DS4_CUDA_COMPACT_EXPERT_CACHE_MB=0      # disable cache for A/B tests
+DS4_CUDA_COMPACT_EXPERT_CACHE_MB=0      # default: disabled
+DS4_CUDA_COMPACT_EXPERT_CACHE_MB=2048   # opt-in 2 GiB cache for A/B tests
 ```
 
-The default is deliberately conservative because strict mode already keeps ~6.9 GB of Q8_0 dense weights resident on a 12 GB RTX 3060-class GPU.
+The cache is currently opt-in. On a 12 GB RTX 3060-class GPU strict mode already keeps ~6.9 GB of Q8_0 dense weights resident, and a 2 GiB compact expert cache thrashes heavily for short prompts. On cache misses it uploads to resident cache and then D→D copies into the batch buffer, so low hit-rate runs can be slower than direct H→D assembly.
 
-Recent 8-token strict greedy smoke on RTX 3060, prompt `Hi`:
+Post-upstream-merge 8-token strict greedy smoke on RTX 3060, prompt `Hi`, two repeated runs:
 
 | Mode | Prefill | Decode | Total | Cache stats |
 |---|---:|---:|---:|---|
-| cache disabled | 0.7 tok/s | 0.4 tok/s | 25.4s | H→D every selected expert |
-| 2048 MB compact cache | 0.9 tok/s | 0.6 tok/s | 18.9s | 3972 hits, 6090 misses, 5180 evictions, 13.7 GB H→D, 22.6 GB D→D |
+| cache disabled | 0.6 tok/s | 0.9–1.0 tok/s | 16.7–17.8s | direct H→D for every selected expert |
+| 2048 MB compact cache | 0.8–0.9 tok/s | 0.5–0.7 tok/s | 17.9–22.7s | ~3.8–3.9k hits, ~6.2k misses, ~5.3k evictions, ~14 GB H→D, 22.6 GB D→D |
+
+Conclusion: the previous single-run 2048 MB cache win was not stable. The implementation remains useful for experiments and larger-cache systems, but it is not the default performance path on 12 GB CUDA until hit rate improves or miss handling avoids double-copy cost.
 
 ## Performance Characteristics
 

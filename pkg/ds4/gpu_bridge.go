@@ -73,7 +73,7 @@ func (e *Engine) InitGPU() error {
 						} else {
 							return fmt.Errorf("strict GPU batched expert buffers: %w", berr)
 						}
-						budget := gpu.CompactExpertCacheBudgetFromEnv(2048)
+						budget := gpu.CompactExpertCacheBudgetFromEnv(0)
 						ce.compactExpertCache = gpu.NewCompactExpertCache(budget)
 						fmt.Printf("[gpu] Batched expert buffers ready (Q8_K parity); compact expert cache %.1f MB\n", float64(budget)/(1024*1024))
 					} else {
